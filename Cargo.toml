@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "swarmclaw",
+    "swarmclaw-sdk",
+    "skills-library/filesystem",
+    "skills-library/shell",
+]
+resolver = "2"

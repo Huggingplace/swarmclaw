@@ -1,0 +1,51 @@
+name: swarmclaw
+display_name: "HuggingPlace SwarmClaw"
+description: "High-performance Rust AI agent with zero-copy messaging and WASM extensibility."
+version: 0.1.0
+author: "HuggingPlace"
+visibility: "public"
+
+infrastructure:
+  build_context: "."
+  dockerfile: "Dockerfile"
+  resources:
+    cpu: 1
+    memory_mb: 512
+    gpu_required: false
+  storage:
+    - path: "/app/workspace"
+      size_gb: 1
+      description: "Persistent workspace for agent configuration and file storage."
+
+env:
+  - name: "OPENAI_API_KEY"
+    description: "Your OpenAI API Key"
+    required: true
+  - name: "OPENCLAW_WORKSPACE"
+    default: "/app/workspace"
+
+lifecycle:
+  type: "service"
+
+cli_extension:
+  namespace: "swarmclaw"
+  help_text: "Manage your SwarmClaw AI Agent"
+  commands:
+    - name: "status"
+      description: "Check the status of the agent"
+      action: "exec"
+      command: "swarmclaw status"
+    - name: "skills"
+      description: "List installed skills"
+      action: "exec"
+      command: "swarmclaw skills"
+
+docs: |
+  # HuggingPlace SwarmClaw
+  
+  This is the high-performance Rust implementation of the OpenClaw AI agent.
+  It is optimized for low-latency and high-density deployments on the Mothership Platform.
+  
+  ## Getting Started
+  Once deployed, the agent will monitor its `/app/workspace` directory for `AGENTS.md`.
+  You can interact with it via the Mothership CLI or its own gRPC/Webhook interfaces.

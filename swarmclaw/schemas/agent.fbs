@@ -1,0 +1,29 @@
+namespace RustClaw;
+
+enum Role : byte { System, User, Assistant, Tool }
+
+table ToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+table Message {
+  role: Role;
+  content: string;
+  tool_calls: [ToolCall];
+  timestamp: ulong;
+}
+
+table AgentState {
+  id: string;
+  history: [Message];
+  variables: [KeyValue];
+}
+
+table KeyValue {
+  key: string;
+  value: string;
+}
+
+root_type AgentState;
