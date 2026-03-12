@@ -17,6 +17,7 @@ SwarmClaw is built to be the "Brain" of the Mothership ecosystem. While Mothersh
 - **`swarmclaw-sdk/`**: The Rust SDK for building Zero-Copy WASM skills.
 - **`skills-library/`**: Standard securely sandboxed tools (Filesystem, Shell, etc.).
 - **`docs/`**: Core protocol specifications:
+    - [What is SwarmClaw?](docs/WHAT_IS_SWARMCLAW.md)
     - [Minion WebRTC Protocol](docs/MINION_INTERFACE.md)
     - [Fleet Scaling Strategy](docs/FLEET_STRATEGY.md)
 - **`assets/`**: Brand artwork and concept designs.
