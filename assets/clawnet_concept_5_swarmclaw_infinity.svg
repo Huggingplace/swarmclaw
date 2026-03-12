@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <!-- Concept 5: Swarmclaw resting on the Infinity Net -->
+  <style>
+    .outline { stroke: #4C566A; stroke-width: 14; stroke-linejoin: round; stroke-linecap: round; }
+    .wing { fill: #FFFFFF; }
+    .wing-inner { fill: #ECEFF4; }
+    .claw-main { fill: #FF8882; } /* Coral Red */
+    .eye { fill: #2E3440; }
+    .blush { fill: #FF6B6B; opacity: 0.5; }
+    .infinity { fill: none; stroke: #88C0D0; stroke-width: 24; stroke-linecap: round; stroke-linejoin: round; }
+    .infinity-glow { fill: none; stroke: #E5E9F0; stroke-width: 8; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+
+  <!-- The Infinity Network (Acting as a perch/nest) -->
+  <!-- Back loop of infinity -->
+  <path d="M 200 300 C 120 230, 40 230, 40 300 C 40 370, 120 370, 200 300" class="infinity outline" />
+  <path d="M 200 300 C 120 230, 40 230, 40 300 C 40 370, 120 370, 200 300" class="infinity-glow" />
+
+  <path d="M 200 300 C 280 230, 360 230, 360 300 C 360 370, 280 370, 200 300" class="infinity outline" />
+  <path d="M 200 300 C 280 230, 360 230, 360 300 C 360 370, 280 370, 200 300" class="infinity-glow" />
+
+  <!-- Left Wing (Fluffy Feathers - slightly folded down since it's resting) -->
+  <path d="M 180 180 Q 110 80 40 140 Q 30 190 70 200 Q 30 230 70 250 Q 110 270 140 230 Q 130 260 180 230 Z" class="wing outline" />
+  <path d="M 140 140 Q 100 110 60 150" class="outline" fill="none" stroke-width="8" />
+
+  <!-- Right Wing (Fluffy Feathers - slightly folded down) -->
+  <path d="M 220 180 Q 290 80 360 140 Q 370 190 330 200 Q 370 230 330 250 Q 290 270 260 230 Q 270 260 220 230 Z" class="wing outline" />
+  <path d="M 260 140 Q 300 110 340 150" class="outline" fill="none" stroke-width="8" />
+
+  <!-- The Claw (Chunky, bubbly crab/lobster style body, sitting low) -->
+  <path d="M 140 180 C 140 100, 260 100, 260 180 C 260 240, 270 300, 240 310 C 210 320, 210 250, 210 250 C 210 250, 190 320, 160 310 C 130 300, 140 240, 140 180 Z" class="claw-main outline" />
+
+  <!-- Big Kawaii Anime Eyes -->
+  <circle cx="175" cy="180" r="14" class="eye" />
+  <circle cx="225" cy="180" r="14" class="eye" />
+  
+  <!-- Eye Sparkles (Anime style) -->
+  <circle cx="170" cy="175" r="5" fill="white" />
+  <circle cx="180" cy="185" r="2" fill="white" />
+  <circle cx="220" cy="175" r="5" fill="white" />
+  <circle cx="230" cy="185" r="2" fill="white" />
+
+  <!-- Cute Mouth -->
+  <path d="M 192 195 Q 200 205 208 195" class="outline" fill="none" stroke-width="6" />
+
+  <!-- Blush -->
+  <circle cx="150" cy="195" r="10" class="blush" />
+  <circle cx="250" cy="195" r="10" class="blush" />
+
+  <!-- Pincer separation lines to make it look like a plush claw -->
+  <path d="M 160 260 Q 155 280 160 310" class="outline" fill="none" stroke-width="8" />
+  <path d="M 240 260 Q 245 280 240 310" class="outline" fill="none" stroke-width="8" />
+
+  <!-- Network Sparkles -->
+  <circle cx="100" cy="270" r="5" fill="white" />
+  <circle cx="300" cy="330" r="4" fill="white" />
+</svg>

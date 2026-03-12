@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <!-- Concept 6: Arcade Angel -->
+  <style>
+    .outline { stroke: #2E3440; stroke-width: 12; stroke-linecap: round; stroke-linejoin: round; }
+    .wing-fill { fill: #FFFFFF; }
+    .wing-shadow { fill: #E5E9F0; }
+    .claw-base { fill: #88C0D0; }
+    .claw-pincer { fill: #81A1C1; }
+    .highlight { fill: #FFFFFF; opacity: 0.5; }
+    .halo { fill: none; stroke: #EBCB8B; stroke-width: 10; stroke-linecap: round; }
+  </style>
+
+  <!-- Halo -->
+  <ellipse cx="200" cy="70" rx="40" ry="15" class="halo" />
+
+  <!-- Left Angel Wing -->
+  <path d="M 180 160 C 130 120, 80 120, 50 160 C 40 180, 50 210, 80 220 C 60 230, 50 260, 70 280 C 100 290, 130 260, 140 230 C 140 270, 170 280, 190 250 Z" class="wing-fill outline" />
+  
+  <!-- Right Angel Wing -->
+  <path d="M 220 160 C 270 120, 320 120, 350 160 C 360 180, 350 210, 320 220 C 340 230, 350 260, 330 280 C 300 290, 270 260, 260 230 C 260 270, 230 280, 210 250 Z" class="wing-fill outline" />
+
+  <!-- Claw Base (Main Body) -->
+  <circle cx="200" cy="160" r="40" class="claw-base outline" />
+  
+  <!-- Cute Eyes on the Base -->
+  <circle cx="185" cy="155" r="6" fill="#2E3440" />
+  <circle cx="215" cy="155" r="6" fill="#2E3440" />
+  
+  <!-- Cute little smile -->
+  <path d="M 193 170 Q 200 178 207 170" stroke="#2E3440" stroke-width="4" stroke-linecap="round" fill="none" />
+
+  <!-- Left Pincer -->
+  <path d="M 170 185 C 140 230, 140 280, 170 320 C 190 300, 180 250, 190 220 Z" class="claw-pincer outline" />
+  
+  <!-- Right Pincer -->
+  <path d="M 230 185 C 260 230, 260 280, 230 320 C 210 300, 220 250, 210 220 Z" class="claw-pincer outline" />
+
+  <!-- Base Highlight -->
+  <path d="M 175 140 A 20 20 0 0 1 205 135 A 30 30 0 0 0 175 160 Z" class="highlight" />
+</svg>

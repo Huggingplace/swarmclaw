@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <!-- Concept 4: The Puffy Winged Pincer -->
+  <style>
+    .wing { fill: #F5E0DC; } /* Soft Rosewater */
+    .claw { fill: #FAB387; } /* Soft Orange */
+    .eye { fill: #11111b; }
+  </style>
+  
+  <!-- Left Puffy Wing -->
+  <path d="M 180 180 C 120 180, 80 140, 80 100 C 80 60, 140 40, 160 80 C 180 40, 240 60, 240 100" class="wing" transform="translate(-40, 20)" />
+  
+  <!-- Right Puffy Wing -->
+  <path d="M 220 180 C 280 180, 320 140, 320 100 C 320 60, 260 40, 240 80 C 220 40, 160 60, 160 100" class="wing" transform="translate(40, 20)" />
+
+  <!-- Cute Rounded Claw Body -->
+  <rect x="170" y="160" width="60" height="60" rx="30" class="claw" />
+  
+  <!-- Friendly Pincer "Feet" -->
+  <path d="M 175 210 Q 160 250 180 270" stroke="#FAB387" stroke-width="12" stroke-linecap="round" fill="none" />
+  <path d="M 225 210 Q 240 250 220 270" stroke="#FAB387" stroke-width="12" stroke-linecap="round" fill="none" />
+  
+  <!-- Tiny blush/eyes for the "personality" -->
+  <circle cx="185" cy="185" r="3" class="eye" />
+  <circle cx="215" cy="185" r="3" class="eye" />
+</svg>

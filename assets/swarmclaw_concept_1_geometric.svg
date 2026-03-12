@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <defs>
+    <linearGradient id="wingGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#1F6FEB" />
+      <stop offset="100%" stop-color="#58A6FF" />
+    </linearGradient>
+    <linearGradient id="clawGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#CE412B" />
+      <stop offset="100%" stop-color="#FF7B72" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Left Wing -->
+  <path d="M 180 200 L 140 100 L 40 80 L 100 160 L 60 220 L 160 220 Z" fill="url(#wingGrad)" />
+  
+  <!-- Right Wing -->
+  <path d="M 220 200 L 260 100 L 360 80 L 300 160 L 340 220 L 240 220 Z" fill="url(#wingGrad)" />
+  
+  <!-- Central Claw (Rustclaw) -->
+  <path d="M 160 180 L 200 120 L 240 180 L 220 320 L 200 360 L 180 320 Z" fill="url(#clawGrad)" />
+  
+  <!-- Highlight / Cutout -->
+  <path d="M 200 140 L 220 200 L 200 300 L 180 200 Z" fill="#0D1117" />
+</svg>

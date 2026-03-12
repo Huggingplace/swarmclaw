@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#2EA043" stop-opacity="1" />
+      <stop offset="100%" stop-color="#238636" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <style>
+    .node { fill: #3FB950; }
+    .claw { fill: #F0F6FC; }
+    .claw-dark { fill: #8B949E; }
+  </style>
+
+  <!-- Left Swarm Wing -->
+  <circle cx="150" cy="140" r="12" class="node" />
+  <circle cx="110" cy="120" r="10" class="node" />
+  <circle cx="70" cy="100" r="8" class="node" />
+  
+  <circle cx="130" cy="180" r="10" class="node" />
+  <circle cx="80" cy="160" r="8" class="node" />
+  <circle cx="40" cy="140" r="6" class="node" />
+
+  <circle cx="160" cy="220" r="8" class="node" />
+  <circle cx="110" cy="210" r="6" class="node" />
+  <circle cx="60" cy="190" r="4" class="node" />
+
+  <!-- Right Swarm Wing -->
+  <circle cx="250" cy="140" r="12" class="node" />
+  <circle cx="290" cy="120" r="10" class="node" />
+  <circle cx="330" cy="100" r="8" class="node" />
+  
+  <circle cx="270" cy="180" r="10" class="node" />
+  <circle cx="320" cy="160" r="8" class="node" />
+  <circle cx="360" cy="140" r="6" class="node" />
+
+  <circle cx="240" cy="220" r="8" class="node" />
+  <circle cx="290" cy="210" r="6" class="node" />
+  <circle cx="340" cy="190" r="4" class="node" />
+
+  <!-- Central Claw Core -->
+  <path d="M 180 150 C 180 150, 160 250, 190 320 L 200 360 L 210 320 C 240 250, 220 150, 220 150 L 200 180 Z" class="claw" />
+  
+  <!-- Mechanical inner joint -->
+  <circle cx="200" cy="200" r="15" fill="#0D1117" />
+  <circle cx="200" cy="200" r="8" class="claw-dark" />
+</svg>

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <!-- Concept 7: Kawaii Plush Angel Claw -->
+  <style>
+    .outline { stroke: #4C566A; stroke-width: 14; stroke-linejoin: round; stroke-linecap: round; }
+    .wing { fill: #FFFFFF; }
+    .wing-inner { fill: #ECEFF4; }
+    .claw-main { fill: #FF8882; } /* Coral Red */
+    .eye { fill: #2E3440; }
+    .blush { fill: #FF6B6B; opacity: 0.5; }
+  </style>
+
+  <!-- Left Wing (Fluffy Feathers) -->
+  <path d="M 180 220 Q 130 100 60 140 Q 30 180 80 200 Q 40 230 70 260 Q 110 280 140 240 Q 130 280 180 260 Z" class="wing outline" />
+  <!-- Left Wing inner fluff line -->
+  <path d="M 140 180 Q 110 130 70 160" class="outline" fill="none" stroke-width="8" />
+
+  <!-- Right Wing (Fluffy Feathers) -->
+  <path d="M 220 220 Q 270 100 340 140 Q 370 180 320 200 Q 360 230 330 260 Q 290 280 260 240 Q 270 280 220 260 Z" class="wing outline" />
+  <!-- Right Wing inner fluff line -->
+  <path d="M 260 180 Q 290 130 330 160" class="outline" fill="none" stroke-width="8" />
+
+  <!-- The Claw (Chunky, bubbly crab/lobster style body) -->
+  <path d="M 140 200 C 140 120, 260 120, 260 200 C 260 260, 280 340, 240 360 C 210 370, 210 280, 210 280 C 210 280, 190 370, 160 360 C 120 340, 140 260, 140 200 Z" class="claw-main outline" />
+
+  <!-- Big Kawaii Anime Eyes -->
+  <circle cx="175" cy="210" r="14" class="eye" />
+  <circle cx="225" cy="210" r="14" class="eye" />
+  
+  <!-- Eye Sparkles (Anime style) -->
+  <circle cx="170" cy="205" r="5" fill="white" />
+  <circle cx="180" cy="215" r="2" fill="white" />
+  <circle cx="220" cy="205" r="5" fill="white" />
+  <circle cx="230" cy="215" r="2" fill="white" />
+
+  <!-- Cute Mouth -->
+  <path d="M 192 225 Q 200 235 208 225" class="outline" fill="none" stroke-width="6" />
+
+  <!-- Blush -->
+  <circle cx="150" cy="225" r="10" class="blush" />
+  <circle cx="250" cy="225" r="10" class="blush" />
+
+  <!-- Pincer separation lines to make it look like a plush claw -->
+  <path d="M 160 300 Q 150 330 160 360" class="outline" fill="none" stroke-width="8" />
+  <path d="M 240 300 Q 250 330 240 360" class="outline" fill="none" stroke-width="8" />
+</svg>

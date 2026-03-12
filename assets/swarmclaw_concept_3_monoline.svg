@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <style>
+    .line {
+      fill: none;
+      stroke: #C9D1D9;
+      stroke-width: 8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .claw-point {
+      fill: #C9D1D9;
+    }
+  </style>
+
+  <!-- Left Wing Curve -->
+  <path d="M 200 150 Q 150 100 80 120 Q 120 160 160 200 Q 100 220 50 240 Q 120 250 180 280" class="line" />
+  
+  <!-- Right Wing Curve -->
+  <path d="M 200 150 Q 250 100 320 120 Q 280 160 240 200 Q 300 220 350 240 Q 280 250 220 280" class="line" />
+
+  <!-- Central Claw Descent -->
+  <path d="M 200 150 L 200 330" class="line" />
+  
+  <!-- Claw Talon -->
+  <path d="M 185 310 L 200 360 L 215 310 Z" class="claw-point" />
+</svg>
