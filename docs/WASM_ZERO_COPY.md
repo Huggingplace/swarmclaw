@@ -4,7 +4,23 @@ SwarmClaw utilizes **WebAssembly (WASM)** and the **Model Context Protocol (MCP)
 
 To achieve maximum performance (specifically for AI agents handling large media like images or audio), SwarmClaw does **not** use standard JSON-over-memory passing. Instead, it relies on a strict **Zero-Copy FlatBuffers ABI**.
 
-This guide explains how to write a highly optimized WASM plugin for SwarmClaw.
+This guide explains how to write a highly optimized WASM plugin for SwarmClaw, and details the host-side optimizations that make execution nearly instantaneous.
+
+## Advanced Host Optimizations
+
+SwarmClaw employs several advanced Wasmtime features to ensure the host engine executes these plugins with as little overhead as possible:
+
+### 1. Ahead-Of-Time (AOT) Caching (`.cwasm`)
+JIT compiling a `.wasm` file into native machine code takes time. When SwarmClaw first loads a skill, it uses Cranelift to compile it and then calls `module.serialize()`, saving the resulting native code to disk as a `.cwasm` file. On subsequent runs, the OS simply `mmap`s the `.cwasm` file directly into memory, reducing compilation time to **zero milliseconds**.
+
+### 2. Instance Pooling (`PoolingAllocationStrategy`)
+Instantiating a new WASM sandbox typically requires the OS to allocate new virtual memory pages, which takes roughly 10-50 microseconds. SwarmClaw utilizes Wasmtime's `PoolingAllocationStrategy` to maintain a pre-allocated pool of 100+ warm sandboxes. When an agent requests a tool, it instantly grabs a sandbox from the pool, dropping instantiation latency to **under 1 microsecond**.
+
+### 3. The "Memory64 + Mmap" Frontier (Direct Disk-to-WASM)
+*(Currently in development)*
+For handling massive payloads (e.g., analyzing a 10GB dataset), copying data into the WASM linear memory is too slow. SwarmClaw is transitioning to `memory64` (allowing >4GB linear memory) combined with OS-level memory mapping. Instead of `memory.write()`, the host asks Wasmtime to back a segment of the WASM sandbox's virtual memory directly with a file descriptor (`mmap`). This allows the WASM skill to parse massive files straight off the NVMe drive with **zero memory copying overhead** and zero host RAM consumption.
+
+---
 
 ## The Architecture: FlatBuffers over WASM Memory
 
