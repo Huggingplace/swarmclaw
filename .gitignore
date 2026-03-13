@@ -1,4 +1,18 @@
+# Rust
 /target
 **/*.rs.bk
-*.swp
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project Specific
+*.log
+.env
+swarmclaw_local.db

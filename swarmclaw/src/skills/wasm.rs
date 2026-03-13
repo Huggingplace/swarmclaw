@@ -4,9 +4,10 @@ use crate::skills::Skill;
 use std::sync::Arc;
 use std::path::PathBuf;
 use anyhow::{Result, Context};
-use wasmtime::{Engine, Module, Store, Linker, Caller, Memory};
+use wasmtime::{Engine, Config, Module, Store, Linker, Caller, Memory, InstanceAllocationStrategy, PoolingAllocationConfig};
 use wasi_common::WasiCtx;
 use serde_json::Value;
+use std::fs;
 
 // Import the generated FlatBuffers code
 #[allow(dead_code, unused_imports)]
@@ -70,6 +71,7 @@ impl Tool for WasmTool {
             0
         })?;
 
+        // Instantiate (this is extremely fast if using pooling allocation strategy)
         let instance = linker.instantiate(&mut store, &self.module)?;
         
         let memory = instance.get_memory(&mut store, "memory")
@@ -119,9 +121,33 @@ pub struct WasmSkill {
 
 impl WasmSkill {
     pub fn new(path: PathBuf) -> Result<Self> {
-        let engine = Engine::default();
-        let module = Module::from_file(&engine, &path)
-            .context("Failed to load WASM module")?;
+        let mut config = Config::new();
+        
+        // 1. Configure Instance Pooling for instant sandbox spin-ups
+        let mut pool = PoolingAllocationConfig::default();
+        pool.total_component_instances(100);
+        pool.total_core_instances(100);
+        pool.total_memories(100);
+        pool.total_tables(100);
+        
+        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+        let engine = Engine::new(&config).context("Failed to create Wasmtime Engine with pooling")?;
+        
+        // 2. Ahead-Of-Time (AOT) Compilation Cache
+        let cwasm_path = path.with_extension("cwasm");
+        let module = if cwasm_path.exists() {
+            // Load pre-compiled native code instantly (zero parsing)
+            unsafe { Module::deserialize_file(&engine, &cwasm_path).context("Failed to deserialize .cwasm")? }
+        } else {
+            // JIT compile the raw .wasm file
+            let m = Module::from_file(&engine, &path).context("Failed to load and compile WASM module")?;
+            
+            // Save the compiled native code to disk for the next boot
+            if let Ok(serialized) = m.serialize() {
+                let _ = fs::write(&cwasm_path, serialized);
+            }
+            m
+        };
         
         let name = path.file_stem()
             .and_then(|s| s.to_str())
