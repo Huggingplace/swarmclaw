@@ -47,6 +47,12 @@ Original OpenClaw runs sub-agents as local child processes. We have a massive ad
     *   Mothership provisions a temporary Spot VM, deploys a clone of the `swarmclaw` container, passes the sub-task as an env var, and executes it.
     *   The primary agent uses the SQLite Outbox to "pause" its state. When the sub-agent finishes, it fires a Webhook back to the primary agent's `axum` server with the results, resuming the conversation.
 
+### The Wasmtime + Spot Instance Synergy
+Because Mothership leverages Spot Instances (which are 90% cheaper but can be killed with 30-second notice), SwarmClaw's Wasmtime architecture is critical for maximizing ROI:
+*   **Instant Cold Starts:** When a replacement Spot VM boots, Wasmtime mmaps the `.cwasm` AOT cache, bringing the new sub-agent online and executing skills in milliseconds, completely bypassing the 30-60 second boot times of traditional Docker/Python containers.
+*   **Deterministic Epoch Interruption:** When the cloud provider signals a termination, Wasmtime's "Epoch Interruption" forcefully and safely halts the WASM skill at the next CPU instruction. This allows the SwarmClaw agent to cleanly save its state to the `LocalStore` and exit gracefully before the VM is destroyed, preventing corrupted artifacts.
+*   **Extreme Density:** Because Wasmtime uses Instance Pooling and shares compiled code across sandboxes, Mothership can safely pack hundreds of concurrent SwarmClaw agents onto a single, cheap 2-core Spot Instance.
+
 ---
 
 ## 4. Interactive UI Components (Discord/Slack v2)
