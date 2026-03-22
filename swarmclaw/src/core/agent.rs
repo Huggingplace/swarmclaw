@@ -125,7 +125,28 @@ impl Agent {
                             break;
                         }
                         Some(Err(e)) => {
-                            eprintln!("\nStream error: {}", e);
+                            let err_msg = format!("⚠️ Engine Error: {}", e);
+                            eprintln!("\n{}", err_msg);
+
+                            if let Some((platform, channel_id, token, app_id)) = &channel_info {
+                                let payload = serde_json::json!({
+                                    "content": err_msg,
+                                    "sender_id": "System"
+                                }).to_string();
+
+                                let outbox_msg = OutboxMessage {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    platform: platform.clone(),
+                                    channel_id: channel_id.clone(),
+                                    token: token.clone(),
+                                    app_id: app_id.clone(),
+                                    payload,
+                                    ui_components: None,
+                                    created_at: now_secs() as i64,
+                                    sync_status: "pending".to_string(),
+                                };
+                                let _ = enqueue_message(outbox_msg);
+                            }
                             break;
                         }
                         _ => {} // Handle tool calls in a future iteration

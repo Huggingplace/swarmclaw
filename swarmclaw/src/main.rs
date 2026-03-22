@@ -264,7 +264,7 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                                     info!("Starting ClawNet gateway...");
                                     use swarmclaw::gateways::clawnet::ClawNetGateway;
                                     use swarmclaw::gateways::ChatGateway;
-                                    let clawnet = ClawNetGateway::new(ws_url, agent_id_str.clone());
+                                    let clawnet = ClawNetGateway::new(ws_url, agent_id_str.clone(), agent_shared.clone());
                                     tokio::spawn(async move {
                                         if let Err(e) = clawnet.start().await {
                                             warn!("ClawNet gateway error: {}", e);

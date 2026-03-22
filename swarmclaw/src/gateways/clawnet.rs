@@ -1,4 +1,5 @@
 use crate::gateways::ChatGateway;
+use crate::core::Agent;
 use async_trait::async_trait;
 use anyhow::{Result, Context};
 use tracing::{info, error, warn, debug};
@@ -6,7 +7,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use webrtc::{
     api::APIBuilder,
     data_channel::data_channel_message::DataChannelMessage,
@@ -22,11 +23,12 @@ use webrtc::{
 pub struct ClawNetGateway {
     ws_url: String,
     agent_id: String,
+    agent: Arc<TokioMutex<Agent>>,
 }
 
 impl ClawNetGateway {
-    pub fn new(ws_url: String, agent_id: String) -> Self {
-        Self { ws_url, agent_id }
+    pub fn new(ws_url: String, agent_id: String, agent: Arc<TokioMutex<Agent>>) -> Self {
+        Self { ws_url, agent_id, agent }
     }
 }
 
@@ -65,8 +67,9 @@ impl ChatGateway for ClawNetGateway {
         };
 
         // We will store the PeerConnection here once a client offers to connect
-        let pc_mutex: Arc<Mutex<Option<Arc<RTCPeerConnection>>>> = Arc::new(Mutex::new(None));
+        let pc_mutex: Arc<TokioMutex<Option<Arc<RTCPeerConnection>>>> = Arc::new(TokioMutex::new(None));
         let agent_id_clone = self.agent_id.clone();
+        let agent_ref = self.agent.clone();
         
         // Announce presence
         let connect_msg = json!({
@@ -123,21 +126,67 @@ impl ChatGateway for ClawNetGateway {
 
                                 // Setup Data Channel handler
                                 let aid_dc = agent_id_clone.clone();
+                                let agent_dc = agent_ref.clone();
                                 pc_clone.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
                                     info!("New DataChannel {} {}", d.label(), d.id());
                                     
                                     let d2 = d.clone();
                                     let aid = aid_dc.clone();
+                                    let agent_inner = agent_dc.clone();
                                     Box::pin(async move {
                                         d2.on_message(Box::new(move |msg: DataChannelMessage| {
                                             let msg_str = String::from_utf8(msg.data.to_vec()).unwrap_or_default();
                                             info!("Message from DataChannel: '{}'", msg_str);
                                             
-                                            // Echo response back over P2P Data Channel!
-                                            let response = format!("Echo over P2P from {}: {}", aid, msg_str);
                                             let d3 = d.clone();
+                                            let agent_inner_inner = agent_inner.clone();
+                                            let aid_inner = aid.clone();
+                                            
                                             Box::pin(async move {
-                                                let _ = d3.send_text(response).await;
+                                                let mut agent_lock = agent_inner_inner.lock().await;
+                                                
+                                                // Add user message to history
+                                                use crate::core::state::{Message as AgentMessage, Role};
+                                                agent_lock.state.history.push(AgentMessage {
+                                                    role: Role::User,
+                                                    content: msg_str.clone(),
+                                                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                });
+
+                                                // Use a custom stream handler that pipes chunks to DataChannel
+                                                let d4 = d3.clone();
+                                                let mut full_response = String::new();
+                                                
+                                                match agent_lock.llm.stream(&agent_lock.state.history, &Default::default(), &[]).await {
+                                                    Ok(mut stream) => {
+                                                        while let Some(chunk) = stream.next().await {
+                                                            match chunk {
+                                                                Ok(crate::llm::ChatChunk::Content(delta)) => {
+                                                                    full_response.push_str(&delta);
+                                                                    let _ = d4.send_text(delta).await;
+                                                                }
+                                                                Ok(crate::llm::ChatChunk::Done) => break,
+                                                                Err(e) => {
+                                                                    let err_msg = format!("⚠️ Engine Error: {}", e);
+                                                                    let _ = d4.send_text(err_msg).await;
+                                                                    break;
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let err_msg = format!("⚠️ Engine Error: {}", e);
+                                                        let _ = d4.send_text(err_msg).await;
+                                                    }
+                                                }
+                                                
+                                                // Record assistant message
+                                                agent_lock.state.history.push(AgentMessage {
+                                                    role: Role::Assistant,
+                                                    content: full_response,
+                                                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                });
                                             })
                                         }));
                                     })
@@ -173,15 +222,74 @@ impl ChatGateway for ClawNetGateway {
                             }
                         },
                         "message" => {
-                            // Legacy HTTP/WS text fallback
                             if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
                                 info!("Received legacy WS message on ClawNet: {}", content);
-                                let response = json!({
-                                    "type": "message",
-                                    "sender_id": self.agent_id,
-                                    "content": format!("Echo from Agent (Fallback): {}", content)
+                                
+                                let content_owned = content.to_string();
+                                let agent_inner = agent_ref.clone();
+                                let tx_ws_clone = tx_ws.clone();
+                                let aid = self.agent_id.clone();
+                                
+                                tokio::spawn(async move {
+                                    let mut agent_lock = agent_inner.lock().await;
+                                    
+                                    use crate::core::state::{Message as AgentMessage, Role};
+                                    agent_lock.state.history.push(AgentMessage {
+                                        role: Role::User,
+                                        content: content_owned,
+                                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                    });
+
+                                    let mut full_response = String::new();
+                                    
+                                    match agent_lock.llm.stream(&agent_lock.state.history, &Default::default(), &[]).await {
+                                        Ok(mut stream) => {
+                                            while let Some(chunk) = stream.next().await {
+                                                match chunk {
+                                                    Ok(crate::llm::ChatChunk::Content(delta)) => {
+                                                        full_response.push_str(&delta);
+                                                    }
+                                                    Ok(crate::llm::ChatChunk::Done) => break,
+                                                    Err(e) => {
+                                                        let err_msg = format!("⚠️ Engine Error: {}", e);
+                                                        let response = json!({
+                                                            "type": "message",
+                                                            "sender_id": aid,
+                                                            "content": err_msg
+                                                        });
+                                                        let _ = tx_ws_clone.send(Message::Text(response.to_string().into()));
+                                                        break;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let err_msg = format!("⚠️ Engine Error: {}", e);
+                                            let response = json!({
+                                                "type": "message",
+                                                "sender_id": aid,
+                                                "content": err_msg
+                                            });
+                                            let _ = tx_ws_clone.send(Message::Text(response.to_string().into()));
+                                        }
+                                    }
+
+                                    if !full_response.is_empty() {
+                                        let response = json!({
+                                            "type": "message",
+                                            "sender_id": aid,
+                                            "content": full_response.clone()
+                                        });
+                                        let _ = tx_ws_clone.send(Message::Text(response.to_string().into()));
+                                        
+                                        agent_lock.state.history.push(AgentMessage {
+                                            role: Role::Assistant,
+                                            content: full_response,
+                                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                        });
+                                    }
                                 });
-                                let _ = tx_ws.send(Message::Text(response.to_string().into()));
                             }
                         }
                         _ => {}
