@@ -94,12 +94,22 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     info!("Selected agent: {}", config.name.as_deref().unwrap_or("unknown"));
 
     // LLM Setup
-    let api_key = env::var("OPENAI_API_KEY").unwrap_or_else(|_| {
-        warn!("OPENAI_API_KEY not set. Using dummy key.");
-        "dummy".to_string()
-    });
+    let api_key = env::var("API_KEY")
+        .or_else(|_| env::var("OPENAI_API_KEY"))
+        .unwrap_or_else(|_| {
+            warn!("API_KEY not set. Using dummy key.");
+            "dummy".to_string()
+        });
 
-    let llm_provider = Arc::new(OpenAIProvider::new(api_key));
+    let provider_name = env::var("LLM_PROVIDER").unwrap_or_else(|_| "OpenAI".to_string());
+    info!("Using LLM Provider: {}", provider_name);
+    
+    let llm_provider: Arc<dyn swarmclaw::llm::LLMProvider> = match provider_name.as_str() {
+        "Anthropic" => Arc::new(swarmclaw::llm::anthropic::AnthropicProvider::new(api_key)),
+        "Gemini" => Arc::new(swarmclaw::llm::gemini::GeminiProvider::new(api_key)),
+        "Local / Custom" | "Ollama" => Arc::new(swarmclaw::llm::ollama::OllamaProvider::new(env::var("OLLAMA_HOST").unwrap_or_default())),
+        _ => Arc::new(OpenAIProvider::new(api_key)),
+    };
     
     // Ensure Model is available (if local)
     if let Some(model_name) = &config.model {

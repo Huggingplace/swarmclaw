@@ -1,4 +1,7 @@
 pub mod openai;
+pub mod anthropic;
+pub mod gemini;
+pub mod ollama;
 
 use async_trait::async_trait;
 use crate::core::state::Message;
