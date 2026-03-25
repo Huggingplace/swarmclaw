@@ -6,13 +6,14 @@ use serde::Serialize;
 use serde_json::json;
 use reqwest::Client;
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
+use eventsource_stream::Eventsource;
 
 pub struct OpenAIProvider {
     client: Client,
-    api_key: String,
+    api_key: Mutex<String>,
     base_url: String,
 }
 
@@ -20,7 +21,7 @@ impl OpenAIProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             client: Client::new(),
-            api_key,
+            api_key: Mutex::new(api_key),
             base_url: "https://api.openai.com/v1".to_string(),
         }
     }
@@ -34,11 +35,54 @@ impl OpenAIProvider {
 #[derive(Serialize)]
 struct OpenAIRequestMessage<'a> {
     role: &'a Role,
-    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+impl OpenAIProvider {
+    fn convert_messages(messages: &[Message]) -> Vec<OpenAIRequestMessage> {
+        let mut api_messages = Vec::new();
+        for msg in messages {
+            if msg.role == Role::Tool {
+                // Tools need special handling in OpenAI (tool_call_id)
+                api_messages.push(OpenAIRequestMessage {
+                    role: &Role::Tool,
+                    content: Some(&msg.content),
+                    tool_calls: None,
+                    tool_call_id: msg.tool_call_id.as_deref(), // Assume we add this to Message
+                });
+            } else if msg.role == Role::Assistant && msg.tool_calls.is_some() {
+                 api_messages.push(OpenAIRequestMessage {
+                    role: &Role::Assistant,
+                    content: if msg.content.is_empty() { None } else { Some(&msg.content) },
+                    tool_calls: msg.tool_calls.clone(),
+                    tool_call_id: None,
+                });
+            } else {
+                api_messages.push(OpenAIRequestMessage {
+                    role: &msg.role,
+                    content: Some(&msg.content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+        api_messages
+    }
 }
 
 #[async_trait]
 impl LLMProvider for OpenAIProvider {
+    fn update_api_key(&self, key: String) {
+        if let Ok(mut api_key) = self.api_key.lock() {
+            *api_key = key;
+        }
+    }
+
     async fn complete_with_tools(
         &self, 
         messages: &[Message], 
@@ -48,10 +92,7 @@ impl LLMProvider for OpenAIProvider {
         let model = options.model.as_deref().unwrap_or("gpt-3.5-turbo");
         let temperature = options.temperature.unwrap_or(0.7);
 
-        let api_messages: Vec<OpenAIRequestMessage> = messages.iter().map(|m| OpenAIRequestMessage {
-            role: &m.role,
-            content: &m.content,
-        }).collect();
+        let api_messages = Self::convert_messages(messages);
 
         let mut request_body = json!({
             "model": model,
@@ -74,9 +115,10 @@ impl LLMProvider for OpenAIProvider {
             request_body["tools"] = json!(api_tools);
         }
 
+        let api_key = self.api_key.lock().unwrap().clone();
         let response = self.client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .json(&request_body)
             .send()
             .await
@@ -131,10 +173,7 @@ impl LLMProvider for OpenAIProvider {
         let model = options.model.as_deref().unwrap_or("gpt-3.5-turbo");
         let temperature = options.temperature.unwrap_or(0.7);
 
-        let api_messages: Vec<OpenAIRequestMessage> = messages.iter().map(|m| OpenAIRequestMessage {
-            role: &m.role,
-            content: &m.content,
-        }).collect();
+        let api_messages = Self::convert_messages(messages);
 
         let mut request_body = json!({
             "model": model,
@@ -158,9 +197,10 @@ impl LLMProvider for OpenAIProvider {
             request_body["tools"] = json!(api_tools);
         }
 
+        let api_key = self.api_key.lock().unwrap().clone();
         let response = self.client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .json(&request_body)
             .send()
             .await
@@ -171,22 +211,15 @@ impl LLMProvider for OpenAIProvider {
             anyhow::bail!("OpenAI API error: {}", error_text);
         }
 
-        let stream = response.bytes_stream().flat_map(|item| {
+        let stream = response.bytes_stream().eventsource().flat_map(|event_res| {
             let mut chunks = Vec::new();
-            match item {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for line in text.lines() {
-                        if line.is_empty() { continue; }
-                        if !line.starts_with("data: ") { continue; }
-                        
-                        let data = &line["data: ".len()..];
-                        if data == "[DONE]" {
-                            chunks.push(Ok(ChatChunk::Done));
-                            break;
-                        }
-
-                        match serde_json::from_str::<serde_json::Value>(data) {
+            match event_res {
+                Ok(event) => {
+                    let data = event.data;
+                    if data == "[DONE]" {
+                        chunks.push(Ok(ChatChunk::Done));
+                    } else if !data.is_empty() {
+                        match serde_json::from_str::<serde_json::Value>(&data) {
                             Ok(v) => {
                                 let choice = &v["choices"][0];
                                 let delta = &choice["delta"];
@@ -207,7 +240,7 @@ impl LLMProvider for OpenAIProvider {
                                 }
                             }
                             Err(e) => {
-                                chunks.push(Err(anyhow::anyhow!("Failed to parse SSE data: {}", e)));
+                                chunks.push(Err(anyhow::anyhow!("Failed to parse SSE data: {} (raw: {})", e, data)));
                             }
                         }
                     }

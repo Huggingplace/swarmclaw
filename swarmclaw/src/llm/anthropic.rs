@@ -5,14 +5,13 @@ use anyhow::{Result, Context};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 
-#[derive(Clone)]
 pub struct AnthropicProvider {
     client: Client,
-    api_key: String,
+    api_key: Mutex<String>,
     base_url: String,
 }
 
@@ -20,7 +19,7 @@ impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             client: Client::new(),
-            api_key,
+            api_key: Mutex::new(api_key),
             base_url: "https://api.anthropic.com/v1".to_string(),
         }
     }
@@ -28,6 +27,12 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LLMProvider for AnthropicProvider {
+    fn update_api_key(&self, key: String) {
+        if let Ok(mut api_key) = self.api_key.lock() {
+            *api_key = key;
+        }
+    }
+
     async fn complete_with_tools(
         &self, 
         _messages: &[Message], 
@@ -71,9 +76,10 @@ impl LLMProvider for AnthropicProvider {
             "stream": true,
         });
 
+        let api_key = self.api_key.lock().unwrap().clone();
         let response = self.client
             .post(format!("{}/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&request_body)

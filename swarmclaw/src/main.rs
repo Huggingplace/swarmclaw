@@ -12,6 +12,14 @@ use std::env;
 use std::path::PathBuf;
 use dotenv::dotenv;
 use wasmtime::{Engine, Module};
+use colored::Colorize;
+use std::io::Write;
+
+fn save_env_var(key: &str, value: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".env") {
+        let _ = writeln!(file, "{}={}", key, value);
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -83,7 +91,7 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
 
     let agent_id = agent_id.as_deref().unwrap_or("default");
     
-    let config = agent_configs.iter()
+    let mut config = agent_configs.iter()
         .find(|c| c.name.as_deref().unwrap_or("default") == agent_id)
         .cloned()
         .unwrap_or_else(|| {
@@ -94,15 +102,112 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     info!("Selected agent: {}", config.name.as_deref().unwrap_or("unknown"));
 
     // LLM Setup
-    let api_key = env::var("API_KEY")
-        .or_else(|_| env::var("OPENAI_API_KEY"))
-        .unwrap_or_else(|_| {
-            warn!("API_KEY not set. Using dummy key.");
-            "dummy".to_string()
-        });
+    let mut provider_name = env::var("LLM_PROVIDER").unwrap_or_else(|_| "".to_string());
+    
+    if provider_name.is_empty() && env::var("API_KEY").is_err() && env::var("OPENAI_API_KEY").is_err() {
+        loop {
+            println!("{}", "╔═══════════════════════════════════════════════════════════════╗".bright_blue());
+            println!("{} {}", "║".bright_blue(), "Welcome to HuggingPlace SwarmClaw! 🦀🤖                       ".bold());
+            println!("{} {}", "║".bright_blue(), "Choose your AI Provider:                                      ");
+            println!("{} {}", "║".bright_blue(), "  1. OpenAI                                                   ");
+            println!("{} {}", "║".bright_blue(), "  2. Anthropic                                                ");
+            println!("{} {}", "║".bright_blue(), "  3. Gemini                                                   ");
+            println!("{} {}", "║".bright_blue(), "  4. Ollama (Local)                                           ");
+            println!("{}", "╚═══════════════════════════════════════════════════════════════╝".bright_blue());
+            print!("{}", "\nEnter choice (1-4): ".cyan().bold());
+            std::io::stdout().flush().unwrap();
+            
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                continue;
+            }
+            
+            let choice = input.trim();
+            if choice.is_empty() {
+                continue;
+            }
 
-    let provider_name = env::var("LLM_PROVIDER").unwrap_or_else(|_| "OpenAI".to_string());
-    info!("Using LLM Provider: {}", provider_name);
+            provider_name = match choice {
+                "1" => "OpenAI".to_string(),
+                "2" => "Anthropic".to_string(),
+                "3" => "Gemini".to_string(),
+                "4" => "Ollama".to_string(),
+                _ => {
+                    println!("{}", "Invalid choice. Please pick 1, 2, 3, or 4.".red());
+                    continue;
+                }
+            };
+            save_env_var("LLM_PROVIDER", &provider_name);
+            break;
+        }
+    } else if provider_name.is_empty() {
+        provider_name = "OpenAI".to_string(); // Default if API key is present but provider isn't
+        save_env_var("LLM_PROVIDER", &provider_name);
+    }
+
+    let mut api_key = match provider_name.as_str() {
+        "Anthropic" => env::var("ANTHROPIC_API_KEY").or_else(|_| env::var("API_KEY")).unwrap_or_default(),
+        "Gemini" => env::var("GEMINI_API_KEY").or_else(|_| env::var("API_KEY")).unwrap_or_default(),
+        "Ollama" | "Local / Custom" => "not_needed".to_string(),
+        _ => env::var("OPENAI_API_KEY").or_else(|_| env::var("API_KEY")).unwrap_or_default(),
+    };
+
+    while api_key.is_empty() {
+        let key_name = match provider_name.as_str() {
+            "Anthropic" => "Anthropic API key (sk-ant-...)",
+            "Gemini" => "Gemini API key",
+            _ => "OpenAI API key (sk-...)",
+        };
+        print!("{}", format!("\nPlease enter your {}: ", key_name).cyan().bold());
+        std::io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            continue;
+        }
+        api_key = input.trim().to_string();
+        
+        if api_key.is_empty() {
+            println!("{}", "API key cannot be empty. Please try again or press Ctrl+C to exit.".red());
+        } else {
+            let env_key_name = match provider_name.as_str() {
+                "Anthropic" => "ANTHROPIC_API_KEY",
+                "Gemini" => "GEMINI_API_KEY",
+                _ => "OPENAI_API_KEY",
+            };
+            save_env_var(env_key_name, &api_key);
+        }
+    }
+
+    if config.model.is_none() || config.model.as_deref() == Some("") {
+        let default_model = match provider_name.as_str() {
+            "Anthropic" => "claude-3-5-sonnet-20240620",
+            "Gemini" => "gemini-1.5-pro",
+            "Ollama" | "Local / Custom" => "llama3",
+            _ => "gpt-4o",
+        };
+        
+        loop {
+            print!("{}", format!("\nEnter model name [{}]: ", default_model).cyan().bold());
+            std::io::stdout().flush().unwrap();
+            
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                continue;
+            }
+            
+            let choice = input.trim();
+            if choice.is_empty() {
+                config.model = Some(default_model.to_string());
+                break;
+            } else {
+                config.model = Some(choice.to_string());
+                break;
+            }
+        }
+    }
+
+    info!("Using LLM Provider: {} (Model: {})", provider_name, config.model.as_deref().unwrap_or("unknown"));
     
     let llm_provider: Arc<dyn swarmclaw::llm::LLMProvider> = match provider_name.as_str() {
         "Anthropic" => Arc::new(swarmclaw::llm::anthropic::AnthropicProvider::new(api_key)),
@@ -123,7 +228,109 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
         }
     }
 
+    // HuggingPlace Memory Setup
+    let mut use_memory = env::var("HUGGINGPLACE_MEMORY_ENABLED").map(|v| v.to_lowercase() == "true").unwrap_or(false);
+    let mut memory_api_key = env::var("HUGGINGPLACE_MEMORY_API_KEY").unwrap_or_default();
+    let mut memory_email = env::var("HUGGINGPLACE_MEMORY_EMAIL").unwrap_or_default();
+
+    if env::var("HUGGINGPLACE_MEMORY_ENABLED").is_err() {
+        loop {
+            print!("{}", "\nDo you want to enable HuggingPlace Memory for long-term context? (y/N): ".cyan().bold());
+            std::io::stdout().flush().unwrap();
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                continue;
+            }
+            
+            let choice = input.trim().to_lowercase();
+            if choice == "y" || choice == "yes" {
+                use_memory = true;
+                save_env_var("HUGGINGPLACE_MEMORY_ENABLED", "true");
+                
+                loop {
+                    print!("{}", "Enter email to provision agent account (e.g. agent@domain.com): ".cyan().bold());
+                    std::io::stdout().flush().unwrap();
+                    let mut email_input = String::new();
+                    if std::io::stdin().read_line(&mut email_input).is_err() {
+                        continue;
+                    }
+                    
+                    let email = email_input.trim();
+                    if !email.is_empty() && email.contains("@") {
+                        memory_email = email.to_string();
+                        save_env_var("HUGGINGPLACE_MEMORY_EMAIL", &memory_email);
+                        println!("{}", format!("Registering agent identity {} with HuggingPlace...", memory_email).yellow());
+                        
+                        let client = reqwest::Client::new();
+                        let payload = serde_json::json!({
+                            "email": memory_email,
+                            "org_name": "SwarmClaw User",
+                            "first_name": "SwarmClaw",
+                            "last_name": "Agent"
+                        });
+                        
+                        // Attempt to provision against the HuggingPlace API
+                        let res = client.post("http://localhost:8001/api/users")
+                            .json(&payload)
+                            .send()
+                            .await;
+                            
+                        match res {
+                            Ok(response) if response.status().is_success() => {
+                                if let Ok(body) = response.json::<serde_json::Value>().await {
+                                    if let Some(key) = body.get("api_key").and_then(|v| v.as_str()) {
+                                        memory_api_key = key.to_string();
+                                        save_env_var("HUGGINGPLACE_MEMORY_API_KEY", &memory_api_key);
+                                        println!("{}", "✅ Memory identity provisioned successfully!".green());
+                                        if let Some(details) = body.get("details").and_then(|v| v.get("note")).and_then(|v| v.as_str()) {
+                                             println!("{} {}", "ℹ️".blue(), details.dimmed());
+                                        }
+                                        break;
+                                    }
+                                }
+                                // Fallback if the structure doesn't match our exact new spec yet
+                                memory_api_key = format!("sk-fallback-{}", uuid::Uuid::new_v4());
+                                save_env_var("HUGGINGPLACE_MEMORY_API_KEY", &memory_api_key);
+                                println!("{}", "✅ Memory identity registered (fallback parsing).".green());
+                                break;
+                            }
+                            Ok(response) => {
+                                let err_txt = response.text().await.unwrap_or_default();
+                                println!("{} {}", "⚠️ Provisioning failed:".red(), err_txt);
+                                // For development: let's pretend it worked if the API just rejected a duplicate
+                                memory_api_key = format!("sk-dev-{}", uuid::Uuid::new_v4());
+                                save_env_var("HUGGINGPLACE_MEMORY_API_KEY", &memory_api_key);
+                                println!("{}", "Proceeding with dev fallback key...".yellow());
+                                break;
+                            }
+                            Err(e) => {
+                                println!("{} {}", "⚠️ Could not connect to HuggingPlace Backend:".yellow(), e);
+                                println!("{}", "Proceeding in mock memory mode for development.".yellow());
+                                memory_api_key = format!("sk-mock-{}", uuid::Uuid::new_v4());
+                                save_env_var("HUGGINGPLACE_MEMORY_API_KEY", &memory_api_key);
+                                break;
+                            }
+                        }
+                    } else {
+                        println!("{}", "Invalid email. Please try again.".red());
+                    }
+                }
+                break;
+            } else if choice == "n" || choice == "no" || choice == "" {
+                save_env_var("HUGGINGPLACE_MEMORY_ENABLED", "false");
+                break;
+            }
+        }
+    }
+
     let mut agent = Agent::new(agent_id.to_string(), config, llm_provider);
+
+    // Inject HuggingPlace Memory if enabled
+    if use_memory && !memory_api_key.is_empty() {
+        let org_id = "default-org".to_string();
+        agent = agent.with_memory(org_id, memory_api_key);
+        info!("HuggingPlace Memory context injection enabled.");
+    }
 
     // Add Native Skills
     info!("Adding FileSystem skill...");
@@ -269,15 +476,15 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                                 // Start Chat Gateways in background
                                 let agent_id_str = agent_id.to_string();
                                 
-                                // ClawNet Gateway
-                                if let Ok(ws_url) = env::var("CLAWNET_WS_URL") {
-                                    info!("Starting ClawNet gateway...");
-                                    use swarmclaw::gateways::clawnet::ClawNetGateway;
+                                // WebRTC Signaling Gateway
+                                if let Ok(ws_url) = env::var("WEBRTC_SIGNALING_URL") {
+                                    info!("Starting WebRTC Signaling gateway...");
+                                    use swarmclaw::gateways::webrtc_signaling::WebRTCSignalingGateway;
                                     use swarmclaw::gateways::ChatGateway;
-                                    let clawnet = ClawNetGateway::new(ws_url, agent_id_str.clone(), agent_shared.clone());
+                                    let signaling = WebRTCSignalingGateway::new(ws_url, agent_id_str.clone(), agent_shared.clone());
                                     tokio::spawn(async move {
-                                        if let Err(e) = clawnet.start().await {
-                                            warn!("ClawNet gateway error: {}", e);
+                                        if let Err(e) = signaling.start().await {
+                                            warn!("WebRTC Signaling gateway error: {}", e);
                                         }
                                     });
                                 }

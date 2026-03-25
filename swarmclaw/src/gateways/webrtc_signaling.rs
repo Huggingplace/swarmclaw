@@ -20,26 +20,30 @@ use webrtc::{
     peer_connection::RTCPeerConnection,
 };
 
-pub struct ClawNetGateway {
+pub struct WebRTCSignalingGateway {
     ws_url: String,
     agent_id: String,
     agent: Arc<TokioMutex<Agent>>,
 }
 
-impl ClawNetGateway {
+impl WebRTCSignalingGateway {
     pub fn new(ws_url: String, agent_id: String, agent: Arc<TokioMutex<Agent>>) -> Self {
         Self { ws_url, agent_id, agent }
     }
 }
 
 #[async_trait]
-impl ChatGateway for ClawNetGateway {
+impl ChatGateway for WebRTCSignalingGateway {
     async fn start(&self) -> Result<()> {
-        let url = format!("{}&token=agent_{}", self.ws_url, self.agent_id);
-        info!("Connecting to ClawNet WebSocket (Signaling) at {}", url);
+        let url = if self.ws_url.contains('?') {
+            format!("{}&token=agent_{}", self.ws_url, self.agent_id)
+        } else {
+            format!("{}?token=agent_{}", self.ws_url, self.agent_id)
+        };
+        info!("Connecting to WebRTC WebSocket (Signaling) at {}", url);
 
         let (ws_stream, _) = connect_async(&url).await?;
-        info!("Successfully connected to ClawNet Signaling Server");
+        info!("Successfully connected to WebRTC Signaling Server");
 
         let (mut write, mut read) = ws_stream.split();
         let (tx_ws, mut rx_ws) = mpsc::unbounded_channel::<Message>();
@@ -151,6 +155,8 @@ impl ChatGateway for ClawNetGateway {
                                                     role: Role::User,
                                                     content: msg_str.clone(),
                                                     timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                    tool_calls: None,
+                                                    tool_call_id: None,
                                                 });
 
                                                 // Use a custom stream handler that pipes chunks to DataChannel
@@ -186,6 +192,8 @@ impl ChatGateway for ClawNetGateway {
                                                     role: Role::Assistant,
                                                     content: full_response,
                                                     timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                    tool_calls: None,
+                                                    tool_call_id: None,
                                                 });
                                             })
                                         }));
@@ -223,7 +231,7 @@ impl ChatGateway for ClawNetGateway {
                         },
                         "message" => {
                             if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
-                                info!("Received legacy WS message on ClawNet: {}", content);
+                                info!("Received legacy WS message on WebRTC: {}", content);
                                 
                                 let content_owned = content.to_string();
                                 let agent_inner = agent_ref.clone();
@@ -238,6 +246,8 @@ impl ChatGateway for ClawNetGateway {
                                         role: Role::User,
                                         content: content_owned,
                                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                        tool_calls: None,
+                                        tool_call_id: None,
                                     });
 
                                     let mut full_response = String::new();
@@ -287,6 +297,8 @@ impl ChatGateway for ClawNetGateway {
                                             role: Role::Assistant,
                                             content: full_response,
                                             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                            tool_calls: None,
+                                            tool_call_id: None,
                                         });
                                     }
                                 });
@@ -296,11 +308,11 @@ impl ChatGateway for ClawNetGateway {
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    warn!("ClawNet Signaling WebSocket closed by server");
+                    warn!("WebRTC Signaling WebSocket closed by server");
                     break;
                 }
                 Err(e) => {
-                    error!("Error receiving from ClawNet Signaling WebSocket: {}", e);
+                    error!("Error receiving from WebRTC Signaling WebSocket: {}", e);
                     break;
                 }
                 _ => {}

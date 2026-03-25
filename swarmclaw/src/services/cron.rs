@@ -40,6 +40,8 @@ impl CronWorker {
                     role: crate::core::state::Role::System,
                     content: system_prompt,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    tool_calls: None,
+                    tool_call_id: None,
                 });
                 
                 if let Err(e) = agent.think().await {

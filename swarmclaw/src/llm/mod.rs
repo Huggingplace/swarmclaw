@@ -59,4 +59,11 @@ pub trait LLMProvider: Send + Sync {
         options: &CompletionOptions,
         tools: &[Arc<dyn Tool>]
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>>;
+
+    fn update_api_key(&self, _key: String) {}
+    
+    fn is_auth_error(&self, error: &anyhow::Error) -> bool {
+        let err_str = error.to_string().to_lowercase();
+        err_str.contains("api_key") || err_str.contains("api key") || err_str.contains("401") || err_str.contains("unauthorized")
+    }
 }

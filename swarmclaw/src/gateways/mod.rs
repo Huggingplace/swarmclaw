@@ -1,7 +1,7 @@
 pub mod discord;
 pub mod telegram;
 pub mod slack;
-pub mod clawnet;
+pub mod webrtc_signaling;
 
 use async_trait::async_trait;
 use anyhow::Result;

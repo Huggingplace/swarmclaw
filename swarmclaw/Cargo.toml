@@ -47,6 +47,10 @@ once_cell = "1.21.3"
 webrtc = "0.17.1"
 regex = "1.11"
 mothership-media = { path = "../../mothership-media", optional = true }
+rustyline = "17.0.2"
+colored = "3.1.1"
+reqwest-eventsource = "0.5.0"
+eventsource-stream = "0.2.3"
 
 # Workspace internal dependencies (optional for now)
 # mothership-common = { path = "../mothership-common" }
