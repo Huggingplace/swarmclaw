@@ -3,6 +3,7 @@ members = [
     "swarmclaw",
     "swarmclaw-sdk",
     "skills-library/filesystem",
+    "skills-library/google-sheets",
     "skills-library/shell",
 ]
 resolver = "2"

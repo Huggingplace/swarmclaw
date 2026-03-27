@@ -82,6 +82,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
 
     info!("Using workspace: {:?}", workspace_path);
 
+    let google_workspace_service =
+        swarmclaw::services::google_workspace::GoogleWorkspaceService::from_env(&workspace_path)
+            .await?;
+
     // Load agents config
     let agent_configs = loader::load_from_workspace(&workspace_path)
         .unwrap_or_else(|e| {
@@ -445,6 +449,72 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                                 info!("Adding ClawHub skill...");
                                 use swarmclaw::skills::clawhub::ClawHubSkill;
                                 agent.add_skill(Arc::new(ClawHubSkill::new(workspace_path.clone())));
+
+                                let mut has_google_sheets_wasm = false;
+                                let workspace_skills_dir = workspace_path.join("skills");
+                                if let Ok(entries) = std::fs::read_dir(&workspace_skills_dir) {
+                                    use swarmclaw::skills::wasm::WasmSkill;
+
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.extension().and_then(|value| value.to_str()) != Some("wasm") {
+                                            continue;
+                                        }
+
+                                        match WasmSkill::new(path.clone()) {
+                                            Ok(skill) => {
+                                                let skill_name = swarmclaw::skills::Skill::name(&skill).to_string();
+                                                if skill_name == "google_sheets" {
+                                                    has_google_sheets_wasm = true;
+                                                }
+                                                info!("Adding WASM skill '{}' from {}", skill_name, path.display());
+                                                agent.add_skill(Arc::new(skill));
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    "Failed to load WASM skill from {}: {}",
+                                                    path.display(),
+                                                    error
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(service) = google_workspace_service {
+                                    let service_url = service.ui_url();
+                                    let mcp_endpoint = service.mcp_endpoint();
+                                    let service_runner = service.clone();
+
+                                    info!("Starting Google Workspace service at {}", service_url);
+                                    tokio::spawn(async move {
+                                        if let Err(error) = service_runner.start().await {
+                                            warn!("Google Workspace service error: {}", error);
+                                        }
+                                    });
+
+                                    info!("Google Sheets UI available at {}", service_url);
+
+                                    if has_google_sheets_wasm {
+                                        info!(
+                                            "Google Sheets WASM skill detected in workspace; skipping native MCP registration."
+                                        );
+                                    } else {
+                                        use swarmclaw::skills::mcp::McpSkill;
+                                        match McpSkill::connect("google_sheets", &mcp_endpoint).await {
+                                            Ok(skill) => {
+                                                info!("Adding Google Sheets skill...");
+                                                agent.add_skill(Arc::new(skill));
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    "Failed to register Google Sheets MCP skill from {}: {}",
+                                                    mcp_endpoint, error
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             
                                 // Add Delegation Tool (Next-Gen feature)
                                 info!("Adding Delegation tool...");

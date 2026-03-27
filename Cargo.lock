@@ -8723,6 +8723,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "skill-google-sheets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "swarmclaw-sdk",
+]
+
+[[package]]
 name = "skill-shell"
 version = "0.1.0"
 dependencies = [
@@ -9213,6 +9223,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "swarmclaw"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "axum",
@@ -9248,6 +9259,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
  "wasi-common",
  "wasmtime",
