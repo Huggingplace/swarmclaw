@@ -51,6 +51,7 @@ rustyline = "17.0.2"
 colored = "3.1.1"
 reqwest-eventsource = "0.5.0"
 eventsource-stream = "0.2.3"
+crossterm = "0.29.0"
 
 # Workspace internal dependencies (optional for now)
 # mothership-common = { path = "../mothership-common" }

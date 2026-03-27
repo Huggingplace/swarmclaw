@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use futures::StreamExt;
 use tokio::time::interval;
 use colored::Colorize;
+use crossterm::{execute, terminal::{EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType}};
 
 pub struct Agent {
     pub id: String,
@@ -58,13 +59,23 @@ impl Agent {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        println!("{}", format!("🤖 HuggingPlace SwarmClaw initialized (Agent: {})", self.id).green().bold());
-        println!("{}", "Type 'exit' or 'quit' to stop.".dimmed());
-        println!("{}", "--------------------------------------------------".dimmed());
-
-        let mut rl = rustyline::DefaultEditor::new()?;
-        let prompt = format!("{}", "> ".cyan().bold());
         let mut stdout = io::stdout();
+        let _ = execute!(stdout, EnterAlternateScreen, Clear(ClearType::All));
+
+        let banner = r#"
+   _____                                 ____  _                 
+  / ___/      ______ __________ ___     / __ \| |  ____ _      __
+  \__ \ | /| / / __ `/ ___/ __ `__ \   / / / /| | / __ `/ | /| / /
+ ___/ / |/ |/ / /_/ / /  / / / / / /  / /_/ / | |/ /_/ /| |/ |/ / 
+/____/|__/|__/\__,_/_/  /_/ /_/ /_/   \____/  |__\__,_/ |__/|__/  
+        "#;
+        
+        println!("{}", banner.bright_magenta().bold());
+        println!("\n  {}  {}", " SYSTEM ".on_bright_blue().bright_white().bold(), format!("HuggingPlace SwarmClaw initialized (Agent: {})", self.id).bright_white());
+        println!("  {}  {}\n", " SYSTEM ".on_bright_blue().bright_white().bold(), "Type 'exit' or 'quit' to stop.".dimmed());
+        
+        let mut rl = rustyline::DefaultEditor::new()?;
+        let prompt = format!("\n{}  ", " ❯ USER ".on_bright_cyan().black().bold());
 
         loop {
             let readline = rl.readline(&prompt);
@@ -133,6 +144,7 @@ impl Agent {
             }
         }
 
+        let _ = execute!(stdout, LeaveAlternateScreen);
         println!("{}", "Goodbye!".green());
         Ok(())
     }
@@ -217,7 +229,7 @@ impl Agent {
             let mut current_tool_name = String::new();
             let mut current_tool_args = String::new();
 
-            print!("{}", "Assistant: ".magenta().bold());
+            print!("\n{} ", " 🤖 AI ".on_bright_magenta().bright_white().bold());
             stdout.flush()?;
 
             loop {
@@ -342,7 +354,7 @@ impl Agent {
 
             if !tool_calls.is_empty() {
                 for tc in tool_calls {
-                    println!("🛠️  Calling tool: {} (args: {})", tc.name.cyan(), tc.arguments.dimmed());
+                    println!("\n{} {} {}", " 🛠️  TOOL ".on_bright_yellow().black().bold(), tc.name.bright_white().bold(), tc.arguments.dimmed());
                     
                     let tool = tools.iter()
                         .find(|t| t.name() == tc.name)
@@ -364,7 +376,7 @@ impl Agent {
 
                     // Redact tool results
                     let redacted_result = Redactor::redact(&result);
-                    println!("✅ Tool result: {}", redacted_result.dimmed());
+                    println!("{} {}", " ↳ RESULT ".on_bright_black().bright_white().bold(), redacted_result.dimmed());
 
                     self.state.history.push(Message {
                         role: Role::Tool,
@@ -462,7 +474,7 @@ impl Agent {
                     if let Some(content) = &response.content {
                         if !content.is_empty() {
                             let redacted_content = Redactor::redact(content);
-                            println!("Assistant: {}", redacted_content);
+                            println!("\n{} {}", " 🤖 AI ".on_bright_magenta().bright_white().bold(), redacted_content);
                             
                             let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
                             if let Some(tool_calls) = &response.tool_calls {
@@ -498,7 +510,7 @@ impl Agent {
                         }
 
                         for tc in tool_calls {
-                            println!("🛠️  Calling tool: {} (args: {})", tc.name, tc.arguments);
+                            println!("\n{} {} {}", " 🛠️  TOOL ".on_bright_yellow().black().bold(), tc.name.bright_white().bold(), tc.arguments.dimmed());
                             
                             let tool = tools.iter()
                                 .find(|t| t.name() == tc.name)
@@ -520,7 +532,7 @@ impl Agent {
 
                             // Redact tool results
                             let redacted_result = Redactor::redact(&result);
-                            println!("✅ Tool result: {}", redacted_result);
+                            println!("{} {}", " ↳ RESULT ".on_bright_black().bright_white().bold(), redacted_result.dimmed());
 
                             self.state.history.push(Message {
                                 role: Role::Tool,
