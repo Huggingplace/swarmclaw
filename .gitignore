@@ -15,4 +15,5 @@ Thumbs.db
 # Project Specific
 *.log
 .env
+swarmclaw/swarmclaw_local.db
 swarmclaw_local.db
