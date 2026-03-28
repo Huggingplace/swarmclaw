@@ -1,11 +1,11 @@
+use crate::skills::Skill;
+use crate::tools::Tool;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use anyhow::{Result, Context};
-use std::sync::Arc;
-use crate::tools::Tool;
-use crate::skills::Skill;
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // --- Read File Tool ---
 
@@ -44,12 +44,13 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let path_str = args.get("path")
+        let path_str = args
+            .get("path")
             .and_then(|v| v.as_str())
             .context("Missing 'path' argument")?;
 
         let path = self.base_dir.join(path_str);
-        
+
         // Basic sandboxing check
         if !path.starts_with(&self.base_dir) {
             anyhow::bail!("Access denied: Path is outside workspace.");
@@ -59,8 +60,7 @@ impl Tool for ReadFileTool {
             anyhow::bail!("File not found: {}", path_str);
         }
 
-        fs::read_to_string(&path)
-            .context(format!("Failed to read file: {}", path_str))
+        fs::read_to_string(&path).context(format!("Failed to read file: {}", path_str))
     }
 }
 
@@ -105,11 +105,13 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let path_str = args.get("path")
+        let path_str = args
+            .get("path")
             .and_then(|v| v.as_str())
             .context("Missing 'path' argument")?;
 
-        let content = args.get("content")
+        let content = args
+            .get("content")
             .and_then(|v| v.as_str())
             .context("Missing 'content' argument")?;
 
@@ -119,8 +121,7 @@ impl Tool for WriteFileTool {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(&path, content)
-            .context(format!("Failed to write file: {}", path_str))?;
+        fs::write(&path, content).context(format!("Failed to write file: {}", path_str))?;
 
         Ok(format!("Successfully wrote to {}", path_str))
     }

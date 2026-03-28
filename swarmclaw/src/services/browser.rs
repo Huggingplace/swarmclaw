@@ -1,5 +1,5 @@
-use anyhow::{Result, Context};
 use crate::gateways::ChatGateway;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::env;
 
@@ -20,7 +20,7 @@ impl BrowserService {
             let tab = browser.new_tab()?;
             tab.navigate_to(url)?;
             tab.wait_for_element("body")?;
-            
+
             let content = tab.find_element("body")?.get_description()?;
             // Simple extraction: return the description/inner text
             Ok(format!("Page Content: {:?}", content))

@@ -2,8 +2,10 @@
 members = [
     "swarmclaw",
     "swarmclaw-sdk",
+    "skills-library/fetch-convert",
     "skills-library/filesystem",
     "skills-library/google-sheets",
+    "skills-library/search-web",
     "skills-library/shell",
 ]
 resolver = "2"

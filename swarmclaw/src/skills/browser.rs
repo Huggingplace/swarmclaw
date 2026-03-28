@@ -1,11 +1,11 @@
-use async_trait::async_trait;
-use crate::tools::Tool;
 use crate::skills::Skill;
-use std::sync::Arc;
-use serde_json::Value;
-use anyhow::{Result, Context};
+use crate::tools::Tool;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 #[cfg(feature = "headless_chrome")]
 use headless_chrome::{Browser, LaunchOptions};
+use serde_json::Value;
+use std::sync::Arc;
 
 // --- Browser Tool ---
 
@@ -38,7 +38,8 @@ impl Tool for ReadWebsiteTool {
     async fn execute(&self, args: Value) -> Result<String> {
         #[cfg(feature = "headless_chrome")]
         {
-            let url = args.get("url")
+            let url = args
+                .get("url")
                 .and_then(|v| v.as_str())
                 .context("Missing 'url' argument")?;
 
@@ -50,9 +51,9 @@ impl Tool for ReadWebsiteTool {
             let tab = browser.new_tab()?;
             tab.navigate_to(url)?;
             tab.wait_for_element("body")?;
-            
+
             let content = tab.find_element("body")?.get_description()?;
-            
+
             Ok(format!("Page Content (Description): {:?}", content))
         }
         #[cfg(not(feature = "headless_chrome"))]

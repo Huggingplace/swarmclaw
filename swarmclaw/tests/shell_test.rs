@@ -1,6 +1,6 @@
-use huggingplace_swarmclaw::skills::shell::ShellSkill;
-use huggingplace_swarmclaw::skills::Skill;
 use serde_json::json;
+use swarmclaw::skills::shell::ShellSkill;
+use swarmclaw::skills::Skill;
 
 #[tokio::test]
 async fn test_shell_execute_tool() {
@@ -26,7 +26,8 @@ async fn test_shell_execute_ls() {
     let shell_tool = tools.iter().find(|t| t.name() == "shell_execute").unwrap();
 
     let args = json!({
-        "command": "ls"
+        "command": "ls",
+        "cwd": env!("CARGO_MANIFEST_DIR")
     });
 
     let result = shell_tool.execute(args).await.unwrap();

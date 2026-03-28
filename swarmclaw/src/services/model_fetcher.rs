@@ -1,9 +1,9 @@
-use anyhow::{Result, Context};
-use std::path::PathBuf;
-use std::fs;
-use reqwest::Client;
+use anyhow::{Context, Result};
 use futures::StreamExt;
+use reqwest::Client;
+use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 
 pub struct ModelFetcher {
     models_dir: PathBuf,
@@ -35,18 +35,25 @@ impl ModelFetcher {
         // 2. Resolve URL
         // For MVP, we assume model_identifier is either a direct URL or a HuggingFace repo/file ID.
         // If it starts with http, use it. Otherwise, assume HuggingFace GGUF default convention or HuggingPlace.
-        
+
         let url = if model_identifier.starts_with("http") {
             model_identifier.to_string()
         } else {
             // Default to a known quantization from HuggingFace if just a name is given
-            // Example: "TheBloke/Llama-2-7B-Chat-GGUF" -> assumes main file. 
+            // Example: "TheBloke/Llama-2-7B-Chat-GGUF" -> assumes main file.
             // Real implementation needs more robust resolving logic.
-            format!("https://huggingface.co/{}/resolve/main/model.gguf", model_identifier)
+            format!(
+                "https://huggingface.co/{}/resolve/main/model.gguf",
+                model_identifier
+            )
         };
 
         // 3. Download
-        let res = self.client.get(&url).send().await
+        let res = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .context(format!("Failed to fetch model from {}", url))?;
 
         if !res.status().is_success() {
@@ -62,19 +69,26 @@ impl ModelFetcher {
             let chunk = item?;
             file.write_all(&chunk)?;
             downloaded += chunk.len() as u64;
-            
+
             if total_size > 0 {
                 let percent = (downloaded as f64 / total_size as f64) * 100.0;
-                 // Simple progress logging (can be noisy, maybe limit freq)
-                if downloaded % (10 * 1024 * 1024) == 0 { // Log every 10MB
-                    print!("\rDownloading... {:.1}% ({}/{} bytes)", percent, downloaded, total_size);
+                // Simple progress logging (can be noisy, maybe limit freq)
+                if downloaded % (10 * 1024 * 1024) == 0 {
+                    // Log every 10MB
+                    print!(
+                        "\rDownloading... {:.1}% ({}/{} bytes)",
+                        percent, downloaded, total_size
+                    );
                     std::io::stdout().flush()?;
                 }
             }
         }
-        
-        println!("
-✅ Download complete: {:?}", model_path);
+
+        println!(
+            "
+✅ Download complete: {:?}",
+            model_path
+        );
         Ok(model_path)
     }
 }

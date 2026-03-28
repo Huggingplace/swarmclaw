@@ -1,15 +1,15 @@
-pub mod fs;
-pub mod shell;
-pub mod wasm;
-pub mod mcp;
 pub mod browser;
-pub mod media;
+pub mod clawhub;
 pub mod config;
 pub mod fleet;
-pub mod clawhub;
+pub mod fs;
+pub mod mcp;
+pub mod media;
+pub mod shell;
+pub mod wasm;
 
-use async_trait::async_trait;
 use crate::tools::Tool;
+use async_trait::async_trait;
 use std::sync::Arc;
 
 /// A Skill is a collection of Tools grouped by domain

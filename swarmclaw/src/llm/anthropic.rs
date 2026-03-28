@@ -1,13 +1,15 @@
-use crate::llm::{LLMProvider, CompletionOptions, CompletionResponse, ToolCall, ChatChunk};
 use crate::core::state::{Message, Role};
+use crate::llm::{
+    ChatChunk, CompletionOptions, CompletionResponse, LLMProvider, ProviderCapabilities,
+};
 use crate::tools::Tool;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
-use futures::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 pub struct AnthropicProvider {
     client: Client,
@@ -27,6 +29,14 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LLMProvider for AnthropicProvider {
+    fn provider_name(&self) -> &str {
+        "Anthropic"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::streaming_text_only()
+    }
+
     fn update_api_key(&self, key: String) {
         if let Ok(mut api_key) = self.api_key.lock() {
             *api_key = key;
@@ -34,10 +44,10 @@ impl LLMProvider for AnthropicProvider {
     }
 
     async fn complete_with_tools(
-        &self, 
-        _messages: &[Message], 
+        &self,
+        _messages: &[Message],
         _options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>]
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<CompletionResponse> {
         anyhow::bail!("Non-streaming complete_with_tools not implemented for Anthropic")
     }
@@ -46,7 +56,7 @@ impl LLMProvider for AnthropicProvider {
         &self,
         messages: &[Message],
         options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>]
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
         let mut system = String::new();
         let mut anthropic_messages = Vec::new();
@@ -77,7 +87,8 @@ impl LLMProvider for AnthropicProvider {
         });
 
         let api_key = self.api_key.lock().unwrap().clone();
-        let response = self.client
+        let response = self
+            .client
             .post(format!("{}/messages", self.base_url))
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -98,9 +109,13 @@ impl LLMProvider for AnthropicProvider {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     for line in text.lines() {
-                        if line.is_empty() { continue; }
-                        if !line.starts_with("data: ") { continue; }
-                        
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if !line.starts_with("data: ") {
+                            continue;
+                        }
+
                         let data = &line["data: ".len()..];
                         if data == "[DONE]" {
                             chunks.push(Ok(ChatChunk::Done));
@@ -111,7 +126,11 @@ impl LLMProvider for AnthropicProvider {
                             Ok(v) => {
                                 if let Some(type_str) = v.get("type").and_then(|t| t.as_str()) {
                                     if type_str == "content_block_delta" {
-                                        if let Some(text) = v.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                                        if let Some(text) = v
+                                            .get("delta")
+                                            .and_then(|d| d.get("text"))
+                                            .and_then(|t| t.as_str())
+                                        {
                                             chunks.push(Ok(ChatChunk::Content(text.to_string())));
                                         }
                                     } else if type_str == "message_stop" {

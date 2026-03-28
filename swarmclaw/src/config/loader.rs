@@ -1,8 +1,8 @@
-use std::path::Path;
-use std::fs;
-use anyhow::{Context, Result};
 use super::AgentConfig;
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::fs;
+use std::path::Path;
 
 #[derive(Deserialize)]
 struct AgentConfigWrapper {

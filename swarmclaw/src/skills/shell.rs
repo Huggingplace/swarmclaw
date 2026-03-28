@@ -1,11 +1,11 @@
-use async_trait::async_trait;
-use crate::tools::Tool;
 use crate::skills::Skill;
-use std::sync::Arc;
+use crate::tools::Tool;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde_json::Value;
-use anyhow::{Result, Context};
-use tokio::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::Command;
 
 // --- Shell Execute Tool ---
 
@@ -40,12 +40,12 @@ impl Tool for ShellExecuteTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let command_str = args.get("command")
+        let command_str = args
+            .get("command")
             .and_then(|v| v.as_str())
             .context("Missing 'command' argument")?;
 
-        let cwd = args.get("cwd")
-            .and_then(|v| v.as_str());
+        let cwd = args.get("cwd").and_then(|v| v.as_str());
 
         // Use 'sh -c' on Unix, 'cmd /C' on Windows
         let (shell, arg) = if cfg!(target_os = "windows") {
@@ -56,7 +56,7 @@ impl Tool for ShellExecuteTool {
 
         let mut cmd = Command::new(shell);
         cmd.arg(arg).arg(command_str);
-        
+
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -64,7 +64,9 @@ impl Tool for ShellExecuteTool {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .context(format!("Failed to execute command: {}", command_str))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -72,14 +74,20 @@ impl Tool for ShellExecuteTool {
 
         let mut result = String::new();
         if !stdout.is_empty() {
-            result.push_str(&format!("STDOUT:
+            result.push_str(&format!(
+                "STDOUT:
 {}
-", stdout));
+",
+                stdout
+            ));
         }
         if !stderr.is_empty() {
-            result.push_str(&format!("STDERR:
+            result.push_str(&format!(
+                "STDERR:
 {}
-", stderr));
+",
+                stderr
+            ));
         }
         result.push_str(&format!("Exit Code: {}", output.status));
 

@@ -1,21 +1,19 @@
+use crate::core::state::Role;
+use crate::core::{agent::ChannelInfo, Agent};
 use crate::gateways::ChatGateway;
-use crate::core::Agent;
+use anyhow::Result;
 use async_trait::async_trait;
-use anyhow::{Result, Context};
-use tracing::{info, error, warn, debug};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures_util::{StreamExt, SinkExt};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{debug, error, info, info_span, warn, Instrument};
+use uuid::Uuid;
 use webrtc::{
-    api::APIBuilder,
-    data_channel::data_channel_message::DataChannelMessage,
-    data_channel::RTCDataChannel,
-    ice_transport::ice_candidate::RTCIceCandidateInit,
-    ice_transport::ice_server::RTCIceServer,
-    peer_connection::configuration::RTCConfiguration,
-    peer_connection::peer_connection_state::RTCPeerConnectionState,
+    api::APIBuilder, data_channel::data_channel_message::DataChannelMessage,
+    data_channel::RTCDataChannel, ice_transport::ice_candidate::RTCIceCandidateInit,
+    ice_transport::ice_server::RTCIceServer, peer_connection::configuration::RTCConfiguration,
     peer_connection::sdp::session_description::RTCSessionDescription,
     peer_connection::RTCPeerConnection,
 };
@@ -23,12 +21,16 @@ use webrtc::{
 pub struct WebRTCSignalingGateway {
     ws_url: String,
     agent_id: String,
-    agent: Arc<TokioMutex<Agent>>,
+    agent_template: Arc<Agent>,
 }
 
 impl WebRTCSignalingGateway {
-    pub fn new(ws_url: String, agent_id: String, agent: Arc<TokioMutex<Agent>>) -> Self {
-        Self { ws_url, agent_id, agent }
+    pub fn new(ws_url: String, agent_id: String, agent_template: Arc<Agent>) -> Self {
+        Self {
+            ws_url,
+            agent_id,
+            agent_template,
+        }
     }
 }
 
@@ -71,10 +73,11 @@ impl ChatGateway for WebRTCSignalingGateway {
         };
 
         // We will store the PeerConnection here once a client offers to connect
-        let pc_mutex: Arc<TokioMutex<Option<Arc<RTCPeerConnection>>>> = Arc::new(TokioMutex::new(None));
+        let pc_mutex: Arc<TokioMutex<Option<Arc<RTCPeerConnection>>>> =
+            Arc::new(TokioMutex::new(None));
         let agent_id_clone = self.agent_id.clone();
-        let agent_ref = self.agent.clone();
-        
+        let agent_template = self.agent_template.clone();
+
         // Announce presence
         let connect_msg = json!({
             "type": "status",
@@ -92,7 +95,10 @@ impl ChatGateway for WebRTCSignalingGateway {
                         Err(_) => continue,
                     };
 
-                    let sender_id = parsed.get("sender_id").and_then(|s| s.as_str()).unwrap_or("");
+                    let sender_id = parsed
+                        .get("sender_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     if sender_id == self.agent_id {
                         continue; // Ignore our own broadcasted signals
                     }
@@ -103,105 +109,118 @@ impl ChatGateway for WebRTCSignalingGateway {
                         "webrtc_offer" => {
                             info!("Received WebRTC Offer from {}", sender_id);
                             if let Some(sdp_str) = parsed.get("sdp").and_then(|s| s.as_str()) {
-                                let peer_connection = api.new_peer_connection(config.clone()).await?;
+                                let peer_connection =
+                                    api.new_peer_connection(config.clone()).await?;
                                 let pc_clone = Arc::new(peer_connection);
-                                
+
                                 *pc_mutex.lock().await = Some(pc_clone.clone());
 
                                 // Setup ICE Candidate handler
                                 let tx_ws_ice = tx_ws.clone();
                                 let aid_ice = agent_id_clone.clone();
-                                pc_clone.on_ice_candidate(Box::new(move |c: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
-                                    let tx = tx_ws_ice.clone();
-                                    let aid = aid_ice.clone();
-                                    Box::pin(async move {
-                                        if let Some(c) = c {
-                                            if let Ok(json) = c.to_json() {
-                                                let msg = json!({
-                                                    "type": "webrtc_candidate",
-                                                    "sender_id": aid,
-                                                    "candidate": json
-                                                });
-                                                let _ = tx.send(Message::Text(msg.to_string().into()));
+                                pc_clone.on_ice_candidate(Box::new(
+                                    move |c: Option<
+                                        webrtc::ice_transport::ice_candidate::RTCIceCandidate,
+                                    >| {
+                                        let tx = tx_ws_ice.clone();
+                                        let aid = aid_ice.clone();
+                                        Box::pin(async move {
+                                            if let Some(c) = c {
+                                                if let Ok(json) = c.to_json() {
+                                                    let msg = json!({
+                                                        "type": "webrtc_candidate",
+                                                        "sender_id": aid,
+                                                        "candidate": json
+                                                    });
+                                                    let _ = tx.send(Message::Text(
+                                                        msg.to_string().into(),
+                                                    ));
+                                                }
                                             }
-                                        }
-                                    })
-                                }));
+                                        })
+                                    },
+                                ));
 
                                 // Setup Data Channel handler
-                                let aid_dc = agent_id_clone.clone();
-                                let agent_dc = agent_ref.clone();
-                                pc_clone.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
-                                    info!("New DataChannel {} {}", d.label(), d.id());
-                                    
-                                    let d2 = d.clone();
-                                    let aid = aid_dc.clone();
-                                    let agent_inner = agent_dc.clone();
-                                    Box::pin(async move {
-                                        d2.on_message(Box::new(move |msg: DataChannelMessage| {
-                                            let msg_str = String::from_utf8(msg.data.to_vec()).unwrap_or_default();
-                                            info!("Message from DataChannel: '{}'", msg_str);
-                                            
-                                            let d3 = d.clone();
-                                            let agent_inner_inner = agent_inner.clone();
-                                            let aid_inner = aid.clone();
-                                            
-                                            Box::pin(async move {
-                                                let mut agent_lock = agent_inner_inner.lock().await;
-                                                
-                                                // Add user message to history
-                                                use crate::core::state::{Message as AgentMessage, Role};
-                                                agent_lock.state.history.push(AgentMessage {
-                                                    role: Role::User,
-                                                    content: msg_str.clone(),
-                                                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                                                    tool_calls: None,
-                                                    tool_call_id: None,
-                                                });
+                                let agent_dc = agent_template.clone();
+                                let remote_sender_id = sender_id.to_string();
+                                pc_clone.on_data_channel(Box::new(
+                                    move |d: Arc<RTCDataChannel>| {
+                                        info!("New DataChannel {} {}", d.label(), d.id());
 
-                                                // Use a custom stream handler that pipes chunks to DataChannel
-                                                let d4 = d3.clone();
-                                                let mut full_response = String::new();
-                                                
-                                                match agent_lock.llm.stream(&agent_lock.state.history, &Default::default(), &[]).await {
-                                                    Ok(mut stream) => {
-                                                        while let Some(chunk) = stream.next().await {
-                                                            match chunk {
-                                                                Ok(crate::llm::ChatChunk::Content(delta)) => {
-                                                                    full_response.push_str(&delta);
-                                                                    let _ = d4.send_text(delta).await;
-                                                                }
-                                                                Ok(crate::llm::ChatChunk::Done) => break,
-                                                                Err(e) => {
-                                                                    let err_msg = format!("⚠️ Engine Error: {}", e);
-                                                                    let _ = d4.send_text(err_msg).await;
-                                                                    break;
-                                                                }
-                                                                _ => {}
-                                                            }
+                                        let outbound_channel = d.clone();
+                                        let response_channel = outbound_channel.clone();
+                                        let agent_template = agent_dc.clone();
+                                        let remote_sender_id = remote_sender_id.clone();
+                                        Box::pin(async move {
+                                            outbound_channel.on_message(Box::new(
+                                                move |msg: DataChannelMessage| {
+                                                    let msg_str =
+                                                        String::from_utf8(msg.data.to_vec())
+                                                            .unwrap_or_default();
+                                                    info!(
+                                                        "Message from DataChannel: '{}'",
+                                                        msg_str
+                                                    );
+
+                                                    let outbound_channel = response_channel.clone();
+                                                    let agent_template = agent_template.clone();
+                                                    let remote_sender_id = remote_sender_id.clone();
+
+                                                    Box::pin(async move {
+                                                        if msg_str.trim().is_empty() {
+                                                            return;
                                                         }
-                                                    }
-                                                    Err(e) => {
-                                                        let err_msg = format!("⚠️ Engine Error: {}", e);
-                                                        let _ = d4.send_text(err_msg).await;
-                                                    }
-                                                }
-                                                
-                                                // Record assistant message
-                                                agent_lock.state.history.push(AgentMessage {
-                                                    role: Role::Assistant,
-                                                    content: full_response,
-                                                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                                                    tool_calls: None,
-                                                    tool_call_id: None,
-                                                });
-                                            })
-                                        }));
-                                    })
-                                }));
+
+                                                        let request_span = info_span!(
+                                                            "gateway_ingress",
+                                                            request_id = %format!("webrtc-{}", Uuid::new_v4()),
+                                                            platform = "webrtc",
+                                                            transport = "data_channel",
+                                                            sender_id = %remote_sender_id,
+                                                            payload_bytes = msg_str.len()
+                                                        );
+                                                        {
+                                                            let _guard = request_span.enter();
+                                                            info!("Accepted WebRTC data channel message");
+                                                        }
+
+                                                        let response = match run_webrtc_turn(
+                                                            agent_template,
+                                                            &remote_sender_id,
+                                                            &msg_str,
+                                                        )
+                                                        .instrument(request_span)
+                                                        .await
+                                                        {
+                                                            Ok(response) => response,
+                                                            Err(error) => {
+                                                                format!(
+                                                                    "SwarmClaw error: {}",
+                                                                    error
+                                                                )
+                                                            }
+                                                        };
+
+                                                        if let Err(error) = outbound_channel
+                                                            .send_text(response)
+                                                            .await
+                                                        {
+                                                            error!(
+                                                        "Failed to send DataChannel response: {}",
+                                                        error
+                                                    );
+                                                        }
+                                                    })
+                                                },
+                                            ));
+                                        })
+                                    },
+                                ));
 
                                 // Set Remote Description
-                                let sdp = RTCSessionDescription::offer(sdp_str.to_string()).unwrap();
+                                let sdp =
+                                    RTCSessionDescription::offer(sdp_str.to_string()).unwrap();
                                 pc_clone.set_remote_description(sdp).await?;
 
                                 // Create Answer
@@ -216,10 +235,14 @@ impl ChatGateway for WebRTCSignalingGateway {
                                 });
                                 tx_ws.send(Message::Text(answer_msg.to_string().into()))?;
                             }
-                        },
+                        }
                         "webrtc_candidate" => {
                             if let Some(candidate_val) = parsed.get("candidate") {
-                                if let Ok(candidate_init) = serde_json::from_value::<RTCIceCandidateInit>(candidate_val.clone()) {
+                                if let Ok(candidate_init) =
+                                    serde_json::from_value::<RTCIceCandidateInit>(
+                                        candidate_val.clone(),
+                                    )
+                                {
                                     if let Some(pc) = pc_mutex.lock().await.as_ref() {
                                         debug!("Adding ICE Candidate from {}", sender_id);
                                         if let Err(e) = pc.add_ice_candidate(candidate_init).await {
@@ -228,80 +251,57 @@ impl ChatGateway for WebRTCSignalingGateway {
                                     }
                                 }
                             }
-                        },
+                        }
                         "message" => {
                             if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
                                 info!("Received legacy WS message on WebRTC: {}", content);
-                                
+
                                 let content_owned = content.to_string();
-                                let agent_inner = agent_ref.clone();
+                                let sender_id_owned = sender_id.to_string();
+                                let agent_template = agent_template.clone();
                                 let tx_ws_clone = tx_ws.clone();
                                 let aid = self.agent_id.clone();
-                                
-                                tokio::spawn(async move {
-                                    let mut agent_lock = agent_inner.lock().await;
-                                    
-                                    use crate::core::state::{Message as AgentMessage, Role};
-                                    agent_lock.state.history.push(AgentMessage {
-                                        role: Role::User,
-                                        content: content_owned,
-                                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                    });
+                                let request_span = info_span!(
+                                    "gateway_ingress",
+                                    request_id = %format!("webrtc-{}", Uuid::new_v4()),
+                                    platform = "webrtc",
+                                    transport = "websocket",
+                                    sender_id = %sender_id_owned,
+                                    payload_bytes = content_owned.len()
+                                );
 
-                                    let mut full_response = String::new();
-                                    
-                                    match agent_lock.llm.stream(&agent_lock.state.history, &Default::default(), &[]).await {
-                                        Ok(mut stream) => {
-                                            while let Some(chunk) = stream.next().await {
-                                                match chunk {
-                                                    Ok(crate::llm::ChatChunk::Content(delta)) => {
-                                                        full_response.push_str(&delta);
-                                                    }
-                                                    Ok(crate::llm::ChatChunk::Done) => break,
-                                                    Err(e) => {
-                                                        let err_msg = format!("⚠️ Engine Error: {}", e);
-                                                        let response = json!({
-                                                            "type": "message",
-                                                            "sender_id": aid,
-                                                            "content": err_msg
-                                                        });
-                                                        let _ = tx_ws_clone.send(Message::Text(response.to_string().into()));
-                                                        break;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let err_msg = format!("⚠️ Engine Error: {}", e);
-                                            let response = json!({
-                                                "type": "message",
-                                                "sender_id": aid,
-                                                "content": err_msg
-                                            });
-                                            let _ = tx_ws_clone.send(Message::Text(response.to_string().into()));
-                                        }
-                                    }
+                                {
+                                    let _guard = request_span.enter();
+                                    info!("Accepted WebRTC websocket message");
+                                }
 
-                                    if !full_response.is_empty() {
+                                tokio::spawn(
+                                    async move {
+                                        if content_owned.trim().is_empty() {
+                                            return;
+                                        }
+
+                                        let response_text = match run_webrtc_turn(
+                                            agent_template,
+                                            &sender_id_owned,
+                                            &content_owned,
+                                        )
+                                        .await
+                                        {
+                                            Ok(response) => response,
+                                            Err(error) => format!("SwarmClaw error: {}", error),
+                                        };
+
                                         let response = json!({
                                             "type": "message",
                                             "sender_id": aid,
-                                            "content": full_response.clone()
+                                            "content": response_text
                                         });
-                                        let _ = tx_ws_clone.send(Message::Text(response.to_string().into()));
-                                        
-                                        agent_lock.state.history.push(AgentMessage {
-                                            role: Role::Assistant,
-                                            content: full_response,
-                                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                        });
+                                        let _ = tx_ws_clone
+                                            .send(Message::Text(response.to_string().into()));
                                     }
-                                });
+                                    .instrument(request_span),
+                                );
                             }
                         }
                         _ => {}
@@ -324,5 +324,64 @@ impl ChatGateway for WebRTCSignalingGateway {
 
     async fn send(&self, _target_id: &str, _content: &str) -> Result<()> {
         Ok(())
+    }
+}
+
+async fn run_webrtc_turn(
+    agent_template: Arc<Agent>,
+    sender_id: &str,
+    input: &str,
+) -> Result<String> {
+    let session_id = format!("webrtc-{}", normalize_webrtc_sender_id(sender_id));
+    let mut agent = agent_template.spawn_session(session_id);
+    let history_len = agent.state.history.len();
+
+    agent
+        .handle_gateway_turn(
+            input,
+            ChannelInfo::new("internal", sender_id.to_string(), String::new(), None),
+        )
+        .await?;
+
+    Ok(
+        latest_assistant_reply_since(&agent, history_len).unwrap_or_else(|| {
+            "SwarmClaw completed the request, but the model returned no text.".to_string()
+        }),
+    )
+}
+
+fn latest_assistant_reply_since(agent: &Agent, start_len: usize) -> Option<String> {
+    if start_len >= agent.state.history.len() {
+        return None;
+    }
+
+    agent.state.history[start_len..]
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role == Role::Assistant && !message.content.trim().is_empty() {
+                Some(message.content.clone())
+            } else {
+                None
+            }
+        })
+}
+
+fn normalize_webrtc_sender_id(sender_id: &str) -> String {
+    let sanitized = sender_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+
+    if sanitized.is_empty() {
+        "anonymous".to_string()
+    } else {
+        sanitized
     }
 }

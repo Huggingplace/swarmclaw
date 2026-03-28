@@ -1,13 +1,15 @@
-use crate::llm::{LLMProvider, CompletionOptions, CompletionResponse, ToolCall, ChatChunk};
 use crate::core::state::{Message, Role};
+use crate::llm::{
+    ChatChunk, CompletionOptions, CompletionResponse, LLMProvider, ProviderCapabilities,
+};
 use crate::tools::Tool;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
-use futures::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 pub struct GeminiProvider {
     client: Client,
@@ -27,6 +29,14 @@ impl GeminiProvider {
 
 #[async_trait]
 impl LLMProvider for GeminiProvider {
+    fn provider_name(&self) -> &str {
+        "Gemini"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::streaming_text_only()
+    }
+
     fn update_api_key(&self, key: String) {
         if let Ok(mut api_key) = self.api_key.lock() {
             *api_key = key;
@@ -34,10 +44,10 @@ impl LLMProvider for GeminiProvider {
     }
 
     async fn complete_with_tools(
-        &self, 
-        _messages: &[Message], 
+        &self,
+        _messages: &[Message],
         _options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>]
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<CompletionResponse> {
         anyhow::bail!("Non-streaming complete_with_tools not implemented for Gemini")
     }
@@ -46,7 +56,7 @@ impl LLMProvider for GeminiProvider {
         &self,
         messages: &[Message],
         options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>]
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
         let mut contents = Vec::new();
         let mut system = None;
@@ -80,10 +90,14 @@ impl LLMProvider for GeminiProvider {
         });
 
         let model = options.model.as_deref().unwrap_or("gemini-1.5-pro");
-        
+
         let api_key = self.api_key.lock().unwrap().clone();
-        let response = self.client
-            .post(format!("{}/{}:streamGenerateContent?key={}", self.base_url, model, api_key))
+        let response = self
+            .client
+            .post(format!(
+                "{}/{}:streamGenerateContent?key={}",
+                self.base_url, model, api_key
+            ))
             .header("content-type", "application/json")
             .json(&request_body)
             .send()
@@ -113,7 +127,8 @@ impl LLMProvider for GeminiProvider {
                                 let val = &trimmed[start + 9..];
                                 if let Some(end) = val.rfind('"') {
                                     let content = &val[..end];
-                                    let unescaped = content.replace("\\n", "\n").replace("\\\"", "\"");
+                                    let unescaped =
+                                        content.replace("\\n", "\n").replace("\\\"", "\"");
                                     chunks.push(Ok(ChatChunk::Content(unescaped)));
                                     found_text = true;
                                 }

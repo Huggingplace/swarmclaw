@@ -6,8 +6,8 @@ author: "HuggingPlace"
 visibility: "public"
 
 infrastructure:
-  build_context: "."
-  dockerfile: "Dockerfile"
+  build_context: "../.."
+  dockerfile: "swarmclaw_core/swarmclaw/Dockerfile"
   resources:
     cpu: 1
     memory_mb: 512
@@ -18,9 +18,30 @@ infrastructure:
       description: "Persistent workspace for agent configuration and file storage."
 
 env:
+  - name: "LLM_PROVIDER"
+    description: "Model provider: openai, groq, grok, anthropic, gemini, or ollama"
+    default: "openai"
   - name: "OPENAI_API_KEY"
     description: "Your OpenAI API Key"
-    required: true
+    required: false
+  - name: "GROQ_API_KEY"
+    description: "Your Groq API Key"
+    required: false
+  - name: "XAI_API_KEY"
+    description: "Your xAI API Key for Grok"
+    required: false
+  - name: "ANTHROPIC_API_KEY"
+    description: "Your Anthropic API Key"
+    required: false
+  - name: "GEMINI_API_KEY"
+    description: "Your Gemini API Key"
+    required: false
+  - name: "OLLAMA_HOST"
+    description: "Optional Ollama host for local inference"
+    default: "http://localhost:11434"
+  - name: "LLM_BASE_URL"
+    description: "Optional base URL override for OpenAI-compatible providers"
+    required: false
   - name: "OPENCLAW_WORKSPACE"
     default: "/app/workspace"
 

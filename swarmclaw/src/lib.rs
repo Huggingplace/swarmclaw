@@ -1,15 +1,15 @@
 pub mod cli;
-pub mod core;
 pub mod config;
-pub mod runtime;
-pub mod llm;
-pub mod tools;
-pub mod skills;
+pub mod core;
 pub mod gateways;
-pub mod services;
-pub mod worker;
+pub mod llm;
+pub mod runtime;
 pub mod safety;
 pub mod security;
+pub mod services;
+pub mod skills;
+pub mod tools;
+pub mod worker;
 
 // Placeholder for generated FlatBuffers
 pub mod agent_generated;

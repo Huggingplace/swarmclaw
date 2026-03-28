@@ -1,11 +1,11 @@
-use async_trait::async_trait;
-use crate::tools::Tool;
 use crate::skills::Skill;
-use std::sync::Arc;
-use serde_json::Value;
-use anyhow::{Result, Context};
+use crate::tools::Tool;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use reqwest::Client;
+use serde_json::Value;
 use std::env;
+use std::sync::Arc;
 
 // --- Spawn Fleet Tool ---
 
@@ -62,13 +62,22 @@ impl Tool for SpawnFleetTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let count = args.get("count").and_then(|v| v.as_u64()).context("Missing count")? as u32;
-        let command = args.get("command").and_then(|v| v.as_str()).context("Missing command")?;
+        let count = args
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .context("Missing count")? as u32;
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .context("Missing command")?;
         let cpu = args.get("cpu").and_then(|v| v.as_f64()).unwrap_or(1.0);
-        let memory_gb = args.get("memory_gb").and_then(|v| v.as_f64()).unwrap_or(0.5);
+        let memory_gb = args
+            .get("memory_gb")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5);
 
         let url = format!("{}/fleet", self.api_url);
-        
+
         let payload = serde_json::json!({
             "count": count,
             "command": command,
@@ -77,7 +86,9 @@ impl Tool for SpawnFleetTool {
             "memory_gb": memory_gb
         });
 
-        let res = self.client.post(&url)
+        let res = self
+            .client
+            .post(&url)
             .header("X-API-Key", &self.api_key)
             .json(&payload)
             .send()
@@ -93,7 +104,10 @@ impl Tool for SpawnFleetTool {
         let body: Value = res.json().await?;
         let job_id = body["job_id"].as_str().unwrap_or("unknown");
 
-        Ok(format!("Successfully spawned fleet job '{}' with {} agents.", job_id, count))
+        Ok(format!(
+            "Successfully spawned fleet job '{}' with {} agents.",
+            job_id, count
+        ))
     }
 }
 
@@ -110,9 +124,7 @@ impl FleetSkill {
             .unwrap_or_else(|_| "http://localhost:8000/api/v1".to_string());
 
         Some(Self {
-            tools: vec![
-                Arc::new(SpawnFleetTool::new(api_url, api_key)),
-            ],
+            tools: vec![Arc::new(SpawnFleetTool::new(api_url, api_key))],
         })
     }
 }

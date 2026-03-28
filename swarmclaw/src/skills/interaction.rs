@@ -1,19 +1,18 @@
-use async_trait::async_trait;
-use crate::tools::Tool;
-use crate::skills::Skill;
 use crate::outbox::{enqueue_message, OutboxMessage};
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use crate::skills::Skill;
+use crate::tools::Tool;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use anyhow::{Result, Context};
-use uuid::Uuid;
-use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
-pub static PENDING_APPROVALS: Lazy<Mutex<HashMap<String, oneshot::Sender<String>>>> = Lazy::new(|| {
-    Mutex::new(HashMap::new())
-});
+pub static PENDING_APPROVALS: Lazy<Mutex<HashMap<String, oneshot::Sender<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 // --- Request Approval Tool ---
 
@@ -25,7 +24,10 @@ pub struct RequestApprovalTool {
 
 impl RequestApprovalTool {
     pub fn new(platform: String, channel_id: String) -> Self {
-        Self { platform, channel_id }
+        Self {
+            platform,
+            channel_id,
+        }
     }
 }
 
@@ -57,8 +59,14 @@ impl Tool for RequestApprovalTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let message = args.get("message").and_then(|v| v.as_str()).context("Missing message")?;
-        let action_id = args.get("action_id").and_then(|v| v.as_str()).context("Missing action_id")?;
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .context("Missing message")?;
+        let action_id = args
+            .get("action_id")
+            .and_then(|v| v.as_str())
+            .context("Missing action_id")?;
 
         // Construct the interactive UI components (A2UI style)
         let ui_components = serde_json::json!([
@@ -84,6 +92,10 @@ impl Tool for RequestApprovalTool {
             ui_components: Some(ui_components),
             created_at: Utc::now().timestamp(),
             sync_status: "pending".to_string(),
+            attempt_count: 0,
+            last_error: None,
+            last_attempt_at: None,
+            next_attempt_at: None,
         };
 
         enqueue_message(outbox_msg)?;
@@ -95,10 +107,13 @@ impl Tool for RequestApprovalTool {
         }
 
         // Wait for user to reply via ClawNet gateway
-        tracing::info!("Approval request '{}' sent to user. Waiting for response...", action_id);
-        
+        tracing::info!(
+            "Approval request '{}' sent to user. Waiting for response...",
+            action_id
+        );
+
         let result = rx.await.unwrap_or_else(|_| "denied".to_string());
-        
+
         tracing::info!("Received approval response: {}", result);
 
         if result == action_id {
@@ -118,9 +133,7 @@ pub struct InteractionSkill {
 impl InteractionSkill {
     pub fn new(platform: String, channel_id: String) -> Self {
         Self {
-            tools: vec![
-                Arc::new(RequestApprovalTool::new(platform, channel_id)),
-            ],
+            tools: vec![Arc::new(RequestApprovalTool::new(platform, channel_id))],
         }
     }
 }

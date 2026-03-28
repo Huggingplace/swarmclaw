@@ -1,9 +1,9 @@
-use async_trait::async_trait;
-use crate::tools::Tool;
 use crate::skills::Skill;
-use std::sync::Arc;
+use crate::tools::Tool;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde_json::Value;
-use anyhow::{Result, Context};
+use std::sync::Arc;
 
 #[cfg(feature = "image")]
 use image::{DynamicImage, GenericImageView};
@@ -41,17 +41,29 @@ impl Tool for ImageResizeTool {
     async fn execute(&self, args: Value) -> Result<String> {
         #[cfg(feature = "image")]
         {
-            let path = args.get("path").and_then(|v| v.as_str()).context("Missing path")?;
-            let width = args.get("width").and_then(|v| v.as_u64()).context("Missing width")? as u32;
-            let height = args.get("height").and_then(|v| v.as_u64()).context("Missing height")? as u32;
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .context("Missing path")?;
+            let width = args
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .context("Missing width")? as u32;
+            let height = args
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .context("Missing height")? as u32;
 
             let img = image::open(path)?;
             let resized = img.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
-            
+
             let out_path = format!("{}_resized.png", path);
             resized.save(&out_path)?;
 
-            Ok(format!("Successfully resized image and saved to {}", out_path))
+            Ok(format!(
+                "Successfully resized image and saved to {}",
+                out_path
+            ))
         }
         #[cfg(not(feature = "image"))]
         {
@@ -88,16 +100,20 @@ impl Tool for CaptureScreenTool {
     async fn execute(&self, args: Value) -> Result<String> {
         #[cfg(feature = "image")]
         {
-            let save_path = args.get("save_path")
+            let save_path = args
+                .get("save_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("screen_capture.png")
                 .to_string();
 
             let img_bytes = capture_screen().await.context("Failed to capture screen")?;
-            
+
             std::fs::write(&save_path, &img_bytes)?;
 
-            Ok(format!("Screen successfully captured and saved to {}. You can now analyze it.", save_path))
+            Ok(format!(
+                "Screen successfully captured and saved to {}. You can now analyze it.",
+                save_path
+            ))
         }
         #[cfg(not(feature = "image"))]
         {
@@ -136,17 +152,26 @@ impl Tool for SynthesizeSpeechTool {
     async fn execute(&self, args: Value) -> Result<String> {
         #[cfg(feature = "image")]
         {
-            let text = args.get("text").and_then(|v| v.as_str()).context("Missing text")?;
-            let save_path = args.get("output_path")
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .context("Missing text")?;
+            let save_path = args
+                .get("output_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("speech_output.wav")
                 .to_string();
 
-            let audio_bytes = synthesize_speech(text).await.context("Failed to synthesize speech")?;
-            
+            let audio_bytes = synthesize_speech(text)
+                .await
+                .context("Failed to synthesize speech")?;
+
             std::fs::write(&save_path, &audio_bytes)?;
 
-            Ok(format!("Speech successfully synthesized and saved to {}.", save_path))
+            Ok(format!(
+                "Speech successfully synthesized and saved to {}.",
+                save_path
+            ))
         }
         #[cfg(not(feature = "image"))]
         {
@@ -184,11 +209,16 @@ impl Tool for TranscribeAudioTool {
     async fn execute(&self, args: Value) -> Result<String> {
         #[cfg(feature = "image")]
         {
-            let path = args.get("audio_path").and_then(|v| v.as_str()).context("Missing audio_path")?;
-            
+            let path = args
+                .get("audio_path")
+                .and_then(|v| v.as_str())
+                .context("Missing audio_path")?;
+
             let audio_bytes = std::fs::read(path).context("Failed to read audio file")?;
-            let transcript = transcribe_audio(&audio_bytes).await.context("Failed to transcribe audio")?;
-            
+            let transcript = transcribe_audio(&audio_bytes)
+                .await
+                .context("Failed to transcribe audio")?;
+
             Ok(format!("Transcription result:\n\n{}", transcript))
         }
         #[cfg(not(feature = "image"))]

@@ -1,10 +1,10 @@
+use crate::outbox::{enqueue_message, OutboxMessage};
+use crate::tools::Tool;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use anyhow::{Result, Context};
-use crate::tools::Tool;
-use crate::outbox::{enqueue_message, OutboxMessage};
-use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 /// DelegateTaskTool allows an agent to spawn sub-agents via Mothership Fleet
 /// to handle complex or parallel tasks.
@@ -38,21 +38,24 @@ impl Tool for DelegateTaskTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let task = args["task_description"].as_str().context("Missing task_description")?;
+        let task = args["task_description"]
+            .as_str()
+            .context("Missing task_description")?;
         let agent_type = args["agent_type"].as_str().context("Missing agent_type")?;
-        
+
         let sub_agent_id = Uuid::new_v4().to_string();
-        
+
         // In a real implementation, this would call mothership-engine gRPC
         // For now, we simulate the delegation by enqueuing a "system" notification to the outbox
         // and returning a placeholder that indicates the agent is waiting.
-        
+
         let payload = json!({
             "event": "sub_agent_spawned",
             "sub_agent_id": sub_agent_id,
             "task": task,
             "agent_type": agent_type,
-        }).to_string();
+        })
+        .to_string();
 
         let msg = OutboxMessage {
             id: Uuid::new_v4().to_string(),
@@ -64,10 +67,17 @@ impl Tool for DelegateTaskTool {
             ui_components: None,
             created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
             sync_status: "pending".to_string(),
+            attempt_count: 0,
+            last_error: None,
+            last_attempt_at: None,
+            next_attempt_at: None,
         };
 
         enqueue_message(msg)?;
 
-        Ok(format!("Successfully delegated task to sub-agent {}. I am now waiting for the result...", sub_agent_id))
+        Ok(format!(
+            "Successfully delegated task to sub-agent {}. I am now waiting for the result...",
+            sub_agent_id
+        ))
     }
 }

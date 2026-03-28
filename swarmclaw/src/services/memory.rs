@@ -1,11 +1,11 @@
-use anyhow::Result;
 use crate::services::Service;
+use anyhow::Result;
 use async_trait::async_trait;
 
 #[cfg(feature = "lance")]
-use lance::{dataset::WriteMode, Dataset};
-#[cfg(feature = "lance")]
 use arrow_array::{RecordBatch, RecordBatchIterator};
+#[cfg(feature = "lance")]
+use lance::{dataset::WriteMode, Dataset};
 #[cfg(feature = "lance")]
 use std::sync::Arc;
 
@@ -27,13 +27,13 @@ impl MemoryService {
 impl Service for MemoryService {
     async fn init(&self) -> Result<()> {
         println!("Memory service (Vector DB) initialized.");
-        
+
         #[cfg(feature = "lance")]
         {
             // Initialization logic for LanceDB
             println!("LanceDB storage at: {}", self.uri);
         }
-        
+
         Ok(())
     }
 }

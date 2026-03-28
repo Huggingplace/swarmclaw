@@ -1,13 +1,15 @@
-use crate::llm::{LLMProvider, CompletionOptions, CompletionResponse, ToolCall, ChatChunk};
 use crate::core::state::{Message, Role};
+use crate::llm::{
+    ChatChunk, CompletionOptions, CompletionResponse, LLMProvider, ProviderCapabilities,
+};
 use crate::tools::Tool;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::json;
-use std::sync::Arc;
-use futures::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct OllamaProvider {
@@ -31,11 +33,19 @@ impl OllamaProvider {
 
 #[async_trait]
 impl LLMProvider for OllamaProvider {
+    fn provider_name(&self) -> &str {
+        "Ollama"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::streaming_text_only()
+    }
+
     async fn complete_with_tools(
-        &self, 
-        _messages: &[Message], 
+        &self,
+        _messages: &[Message],
         _options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>]
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<CompletionResponse> {
         anyhow::bail!("Non-streaming complete_with_tools not implemented for Ollama")
     }
@@ -44,7 +54,7 @@ impl LLMProvider for OllamaProvider {
         &self,
         messages: &[Message],
         options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>]
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
         let mut ollama_messages = Vec::new();
 
@@ -67,7 +77,8 @@ impl LLMProvider for OllamaProvider {
             "stream": true,
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(format!("{}/api/chat", self.base_url))
             .json(&request_body)
             .send()
@@ -85,12 +96,16 @@ impl LLMProvider for OllamaProvider {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     for line in text.lines() {
-                        if line.is_empty() { continue; }
-                        
+                        if line.is_empty() {
+                            continue;
+                        }
+
                         match serde_json::from_str::<serde_json::Value>(line) {
                             Ok(v) => {
                                 if let Some(msg) = v.get("message") {
-                                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                                    if let Some(content) =
+                                        msg.get("content").and_then(|c| c.as_str())
+                                    {
                                         chunks.push(Ok(ChatChunk::Content(content.to_string())));
                                     }
                                 }

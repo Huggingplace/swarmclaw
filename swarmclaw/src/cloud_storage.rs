@@ -1,10 +1,10 @@
 use anyhow::Result;
-use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::aws::AmazonS3Builder;
-use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::azure::MicrosoftAzureBuilder;
-use std::sync::Arc;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
+use std::sync::Arc;
 
 pub enum CloudProvider {
     AwsS3,

@@ -1,5 +1,5 @@
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     let schema_path = "schemas/agent.fbs";
@@ -7,7 +7,7 @@ fn main() {
 
     if Path::new(schema_path).exists() {
         println!("cargo:rerun-if-changed={}", schema_path);
-        
+
         let status = Command::new("flatc")
             .args(["--rust", "-o", out_dir, schema_path])
             .status()

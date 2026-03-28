@@ -47,9 +47,8 @@ Traditional Node.js/Python agents are heavy. SwarmClaw is built for the **Mother
 
 ### Building from Source
 ```bash
-git clone https://github.com/huggingplace/openclaw-rs.git
-cd openclaw-rs
-cargo build --release -p huggingplace-swarmclaw
+cd swarmclaw_core
+cargo build --release -p swarmclaw
 ```
 
 ## 🎮 Usage
@@ -58,8 +57,70 @@ cargo build --release -p huggingplace-swarmclaw
 Chat with the agent directly in your terminal.
 
 ```bash
+export LLM_PROVIDER=openai
 export OPENAI_API_KEY=sk-your-key...
-cargo run -p huggingplace-swarmclaw -- run
+cargo run -p swarmclaw -- run
+```
+
+### Provider Selection
+SwarmClaw supports `openai`, `groq`, `grok`, `anthropic`, `gemini`, and `ollama`.
+Provider capabilities are enforced explicitly by the runtime, so adapters that do not yet support local tool calling run in text-only mode instead of silently pretending tools executed.
+
+```bash
+export LLM_PROVIDER=groq
+export GROQ_API_KEY=your-groq-key
+cargo run -p swarmclaw -- run
+
+export LLM_PROVIDER=grok
+export XAI_API_KEY=your-xai-key
+cargo run -p swarmclaw -- run
+```
+
+### Health Check
+Use this for deployment probes or non-interactive sanity checks.
+
+```bash
+cargo run -p swarmclaw -- status
+```
+
+### Session Inspection
+Inspect persisted session summaries and recent transcript history from the local SQLite store.
+
+```bash
+cargo run -p swarmclaw -- sessions --limit 20
+cargo run -p swarmclaw -- history --session slack-C123456-thread-1712345678-1234 --limit 50
+cargo run -p swarmclaw -- outbox --status failed --limit 50
+```
+
+### Webhook Channels
+SwarmClaw can run webhook listeners for Slack, Discord, Telegram, and WhatsApp via Twilio alongside the CLI.
+
+```bash
+export SLACK_BOT_TOKEN=xoxb-your-bot-token
+export SLACK_SIGNING_SECRET=your-signing-secret
+export SLACK_WEBHOOK_PORT=8083
+
+export DISCORD_PUBLIC_KEY=your-discord-public-key
+export TELEGRAM_TOKEN=your-telegram-bot-token
+export TWILIO_ACCOUNT_SID=AC...
+export TWILIO_AUTH_TOKEN=your-twilio-auth-token
+export WHATSAPP_WEBHOOK_URL=https://your-public-host/twilio/whatsapp
+
+cargo run -p swarmclaw -- run
+```
+
+Slack ingress uses the Events API webhook path at `/slack/events`, WhatsApp uses the Twilio webhook path at `/twilio/whatsapp`, and all webhook channels reply through the same persisted session + outbox runtime path.
+
+### Admin API
+Set `SWARMCLAW_ADMIN_PORT` to expose read-only JSON endpoints for session and outbox inspection while the agent is running.
+
+```bash
+export SWARMCLAW_ADMIN_PORT=8787
+cargo run -p swarmclaw -- run
+
+curl http://127.0.0.1:8787/admin/health
+curl http://127.0.0.1:8787/admin/sessions?limit=20
+curl http://127.0.0.1:8787/admin/outbox?status=failed&limit=20
 ```
 
 ### Dynamic Skills (WASM)
@@ -67,18 +128,34 @@ SwarmClaw automatically loads any `.wasm` files found in your `workspace/skills`
 
 **1. Create a Skill (Rust):**
 ```rust
-// my_skill.rs
+use anyhow::Result;
+use serde_json::Value;
+use swarmclaw_sdk::{SwarmClawSkill, export_execute, export_manifest};
+
+struct MySkill;
+
+impl SwarmClawSkill for MySkill {
+    fn name(&self) -> &str { "my_skill" }
+    fn description(&self) -> &str { "Example skill" }
+    fn execute(&self, _args: Value) -> Result<String> { Ok("ok".to_string()) }
+}
+
 #[no_mangle]
-pub extern "C" fn claw_execute(ptr: *const u8, len: usize) -> *const u8 {
-    // ... Implement logic ...
+pub extern "C" fn claw_get_manifest() -> i64 {
+    export_manifest(&MySkill)
+}
+
+#[no_mangle]
+pub extern "C" fn claw_execute(ptr: *const u8, len: usize) -> i64 {
+    export_execute(&MySkill, ptr, len)
 }
 ```
 
 **2. Compile & Optimize:**
 ```bash
-cargo build --target wasm32-wasi --release
+cargo build --target wasm32-wasip1 --release
 # Optional: Pre-compile for faster startup
-cargo run -p huggingplace-swarmclaw -- repackage --input target/wasm32-wasi/release/my_skill.wasm
+cargo run -p swarmclaw -- repackage --input target/wasm32-wasip1/release/my_skill.wasm
 ```
 
 ## 🏗️ Architecture
