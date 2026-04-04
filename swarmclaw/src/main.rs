@@ -12,6 +12,7 @@ use swarmclaw::core::Agent;
 use swarmclaw::llm::openai::OpenAIProvider;
 use swarmclaw::skills::fs::FileSystemSkill;
 use swarmclaw::skills::shell::ShellSkill;
+use swarmclaw::skills::analytics::AnalyticsSkill;
 use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -954,6 +955,9 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     info!("Adding FileSystem skill...");
     agent.add_skill(Arc::new(FileSystemSkill::new(workspace_path.clone())));
 
+    info!("Adding Analytics skill...");
+    agent.add_skill(Arc::new(AnalyticsSkill::new(workspace_path.clone())));
+
     info!("Adding Shell skill...");
 
     agent.add_skill(Arc::new(ShellSkill::new()));
@@ -964,7 +968,8 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     {
         info!("Adding Browser skill...");
 
-        use swarmclaw::skills::browser::BrowserSkill;
+        use swarmclaw::skills::analytics::AnalyticsSkill;
+use swarmclaw::skills::browser::BrowserSkill;
 
         agent.add_skill(Arc::new(BrowserSkill::new()));
     }

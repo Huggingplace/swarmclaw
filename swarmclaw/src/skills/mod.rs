@@ -1,6 +1,8 @@
+pub mod analytics;
 pub mod browser;
 pub mod clawhub;
 pub mod config;
+pub mod firefox;
 pub mod fleet;
 pub mod fs;
 pub mod mcp;
