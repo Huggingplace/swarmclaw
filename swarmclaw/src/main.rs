@@ -114,7 +114,7 @@ impl ProviderKind {
             Self::Groq => "llama-3.3-70b-versatile",
             Self::Grok => "grok-code-fast-1",
             Self::Anthropic => "claude-3-5-sonnet-20240620",
-            Self::Gemini => "gemini-1.5-pro",
+            Self::Gemini => "gemini-3.1-pro-preview",
             Self::Ollama => "llama3",
         }
     }
@@ -969,6 +969,11 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
         agent.add_skill(Arc::new(BrowserSkill::new()));
     }
 
+    // Add Firefox Skill
+    info!("Adding Firefox skill...");
+    use swarmclaw::skills::firefox::FirefoxSkill;
+    agent.add_skill(Arc::new(FirefoxSkill::new()));
+
     // Add Media Skill
 
     #[cfg(feature = "image")]
@@ -1005,6 +1010,8 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     agent.add_skill(Arc::new(ClawHubSkill::new(workspace_path.clone())));
 
     let mut has_google_sheets_wasm = false;
+    let mut has_google_docs_wasm = false;
+    let mut has_google_gmail_wasm = false;
     let mut has_fetch_convert_wasm = false;
     let mut has_search_web_wasm = false;
     let workspace_skills_dir = workspace_path.join("skills");
@@ -1022,6 +1029,8 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                     let skill_name = swarmclaw::skills::Skill::name(&skill).to_string();
                     match skill_name.as_str() {
                         "google_sheets" => has_google_sheets_wasm = true,
+                        "google_docs" => has_google_docs_wasm = true,
+                        "google_gmail" => has_google_gmail_wasm = true,
                         "fetch_convert" => has_fetch_convert_wasm = true,
                         "search_web" => has_search_web_wasm = true,
                         _ => {}
@@ -1122,6 +1131,46 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                 Err(error) => {
                     warn!(
                         "Failed to register Google Sheets MCP skill from {}: {}",
+                        mcp_endpoint, error
+                    );
+                }
+            }
+        }
+
+        if has_google_docs_wasm {
+            info!(
+                "Google Docs WASM skill detected in workspace; skipping native MCP registration."
+            );
+        } else {
+            use swarmclaw::skills::mcp::McpSkill;
+            match McpSkill::connect("google_docs", &mcp_endpoint).await {
+                Ok(skill) => {
+                    info!("Adding Google Docs skill...");
+                    agent.add_skill(Arc::new(skill));
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to register Google Docs MCP skill from {}: {}",
+                        mcp_endpoint, error
+                    );
+                }
+            }
+        }
+
+        if has_google_gmail_wasm {
+            info!(
+                "Google Gmail WASM skill detected in workspace; skipping native MCP registration."
+            );
+        } else {
+            use swarmclaw::skills::mcp::McpSkill;
+            match McpSkill::connect("google_gmail", &mcp_endpoint).await {
+                Ok(skill) => {
+                    info!("Adding Google Gmail skill...");
+                    agent.add_skill(Arc::new(skill));
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to register Google Gmail MCP skill from {}: {}",
                         mcp_endpoint, error
                     );
                 }

@@ -23,6 +23,7 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +36,14 @@ pub struct CompletionResponse {
 #[derive(Debug, Clone)]
 pub enum ChatChunk {
     Content(String),
-    ToolCallStart { id: String, name: String },
-    ToolCallDelta { arguments: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+        thought_signature: Option<String>,
+    },
+    ToolCallDelta {
+        arguments: String,
+    },
     Done,
 }
 

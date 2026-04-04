@@ -130,6 +130,7 @@ impl OpenAICompatibleProvider {
                             id: c.get("id")?.as_str()?.to_string(),
                             name: function.get("name")?.as_str()?.to_string(),
                             arguments: function.get("arguments")?.as_str()?.to_string(),
+                            thought_signature: None,
                         })
                     })
                     .collect()
@@ -296,6 +297,7 @@ impl LLMProvider for OpenAICompatibleProvider {
                                             chunks.push(Ok(ChatChunk::ToolCallStart {
                                                 id: id.to_string(),
                                                 name: name.to_string(),
+                                                thought_signature: None,
                                             }));
                                         }
                                         if let Some(args) = tc

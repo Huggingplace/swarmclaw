@@ -769,6 +769,7 @@ impl Agent {
             let mut current_tool_id = String::new();
             let mut current_tool_name = String::new();
             let mut current_tool_args = String::new();
+            let mut current_thought_signature: Option<String> = None;
 
             if cli_mode {
                 write_cli(
@@ -788,18 +789,24 @@ impl Agent {
                             drain_resize_events(self, &mut stdout)?;
                         }
                     }
-                    Ok(ChatChunk::ToolCallStart { id, name }) => {
+                    Ok(ChatChunk::ToolCallStart {
+                        id,
+                        name,
+                        thought_signature,
+                    }) => {
                         debug!(tool_name = %name, tool_id = %id, "Received tool call start");
                         if !current_tool_name.is_empty() {
                             tool_calls.push(crate::llm::ToolCall {
                                 id: current_tool_id.clone(),
                                 name: current_tool_name.clone(),
                                 arguments: current_tool_args.clone(),
+                                thought_signature: current_thought_signature.take(),
                             });
                         }
                         current_tool_id = id;
                         current_tool_name = name;
                         current_tool_args.clear();
+                        current_thought_signature = thought_signature;
                     }
                     Ok(ChatChunk::ToolCallDelta { arguments }) => {
                         current_tool_args.push_str(&arguments);
@@ -810,6 +817,7 @@ impl Agent {
                                 id: current_tool_id.clone(),
                                 name: current_tool_name.clone(),
                                 arguments: current_tool_args.clone(),
+                                thought_signature: current_thought_signature.take(),
                             });
                             current_tool_name.clear();
                         }
@@ -845,6 +853,7 @@ impl Agent {
                         "function": {
                             "name": tc.name,
                             "arguments": tc.arguments,
+                            "thought_signature": tc.thought_signature,
                         }
                     }));
                 }
@@ -1091,6 +1100,7 @@ impl Agent {
                                             "function": {
                                                 "name": tc.name,
                                                 "arguments": tc.arguments,
+                                                "thought_signature": tc.thought_signature,
                                             }
                                         }));
                                     }

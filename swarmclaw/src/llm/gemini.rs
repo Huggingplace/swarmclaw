@@ -5,6 +5,7 @@ use crate::llm::{
 use crate::tools::Tool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::json;
@@ -34,7 +35,7 @@ impl LLMProvider for GeminiProvider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities::streaming_text_only()
+        ProviderCapabilities::openai_compatible() // Allows tools
     }
 
     fn update_api_key(&self, key: String) {
@@ -56,27 +57,126 @@ impl LLMProvider for GeminiProvider {
         &self,
         messages: &[Message],
         options: &CompletionOptions,
-        _tools: &[Arc<dyn Tool>],
+        tools: &[Arc<dyn Tool>],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
         let mut contents = Vec::new();
         let mut system = None;
 
-        for msg in messages {
+        let mut i = 0;
+        while i < messages.len() {
+            let msg = &messages[i];
             match msg.role {
                 Role::System => {
                     system = Some(json!({
                         "role": "user",
                         "parts": [{"text": format!("SYSTEM INSTRUCTION: {}", msg.content)}]
                     }));
+                    i += 1;
                 }
                 Role::User => {
                     contents.push(json!({"role": "user", "parts": [{"text": msg.content}]}));
+                    i += 1;
                 }
                 Role::Assistant => {
-                    contents.push(json!({"role": "model", "parts": [{"text": msg.content}]}));
+                    let mut parts = Vec::new();
+                    if !msg.content.is_empty() {
+                        parts.push(json!({"text": msg.content}));
+                    }
+                    if let Some(calls) = &msg.tool_calls {
+                        for call in calls {
+                            if let Some(func) = call.get("function") {
+                                let name = func
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or_default();
+                                let args_str = func
+                                    .get("arguments")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("{}");
+                                let args: serde_json::Value =
+                                    serde_json::from_str(args_str).unwrap_or(json!({}));
+
+                                let mut function_call = json!({
+                                    "name": name,
+                                    "args": args
+                                });
+                                if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
+                                    function_call["id"] = json!(id);
+                                }
+
+                                let mut part = json!({ "functionCall": function_call });
+                                if let Some(sig) =
+                                    func.get("thought_signature").and_then(|s| s.as_str())
+                                {
+                                    part["thoughtSignature"] = json!(sig);
+                                }
+                                parts.push(part);
+                            }
+                        }
+                    }
+                    if !parts.is_empty() {
+                        contents.push(json!({"role": "model", "parts": parts}));
+                    } else {
+                        // Empty assistant message? Push empty text to keep alternating structure
+                        contents.push(json!({"role": "model", "parts": [{"text": ""}]}));
+                    }
+                    i += 1;
                 }
                 Role::Tool => {
-                    // Ignored for basic text generation parity
+                    // Group consecutive tool responses into a single user message
+                    let mut parts = Vec::new();
+                    while i < messages.len() && messages[i].role == Role::Tool {
+                        let tmsg = &messages[i];
+                        let mut func_name = "unknown_function".to_string();
+
+                        if let Some(target_id) = &tmsg.tool_call_id {
+                            // Look back for the matching tool call
+                            for prev in messages.iter().rev() {
+                                if prev.role == Role::Assistant {
+                                    if let Some(calls) = &prev.tool_calls {
+                                        for call in calls {
+                                            if call.get("id").and_then(|i| i.as_str())
+                                                == Some(target_id.as_str())
+                                            {
+                                                if let Some(n) = call
+                                                    .get("function")
+                                                    .and_then(|f| f.get("name"))
+                                                    .and_then(|n| n.as_str())
+                                                {
+                                                    func_name = n.to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut response_obj = json!({"output": tmsg.content});
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&tmsg.content)
+                        {
+                            if parsed.is_object() {
+                                response_obj = parsed;
+                            }
+                        }
+
+                        let mut function_response = json!({
+                            "name": func_name,
+                            "response": response_obj
+                        });
+                        if let Some(id) = &tmsg.tool_call_id {
+                            function_response["id"] = json!(id);
+                        }
+
+                        parts.push(json!({
+                            "functionResponse": function_response
+                        }));
+                        i += 1;
+                    }
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": parts
+                    }));
                 }
             }
         }
@@ -85,17 +185,31 @@ impl LLMProvider for GeminiProvider {
             contents.insert(0, sys);
         }
 
-        let request_body = json!({
+        let mut request_body = json!({
             "contents": contents,
         });
 
-        let model = options.model.as_deref().unwrap_or("gemini-1.5-pro");
+        if !tools.is_empty() {
+            let mut declarations = Vec::new();
+            for t in tools {
+                declarations.push(json!({
+                    "name": t.name(),
+                    "description": t.description(),
+                    "parameters": t.parameters()
+                }));
+            }
+            request_body["tools"] = json!([{
+                "functionDeclarations": declarations
+            }]);
+        }
+
+        let model = options.model.as_deref().unwrap_or("gemini-3.1-pro-preview");
 
         let api_key = self.api_key.lock().unwrap().clone();
         let response = self
             .client
             .post(format!(
-                "{}/{}:streamGenerateContent?key={}",
+                "{}/{}:streamGenerateContent?alt=sse&key={}",
                 self.base_url, model, api_key
             ))
             .header("content-type", "application/json")
@@ -109,34 +223,67 @@ impl LLMProvider for GeminiProvider {
             anyhow::bail!("Gemini API error: {}", error_text);
         }
 
-        let stream = response.bytes_stream().flat_map(|item| {
+        let stream = response.bytes_stream().eventsource().flat_map(|event_res| {
             let mut chunks = Vec::new();
-            match item {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    // Gemini returns Server-Sent Events or chunked JSON arrays.
-                    // Assuming SSE for streamGenerateContent with alt=sse (not used here) or raw JSON chunks.
-                    // The standard streamGenerateContent returns an array stream `[ { "candidates": ... }, ... ]`
-                    // We'll do a very robust basic matching for the parts.text
-                    let mut found_text = false;
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("\"text\": \"") {
-                            // Quick and dirty extraction for parity requirement
-                            if let Some(start) = trimmed.find("\"text\": \"") {
-                                let val = &trimmed[start + 9..];
-                                if let Some(end) = val.rfind('"') {
-                                    let content = &val[..end];
-                                    let unescaped =
-                                        content.replace("\\n", "\n").replace("\\\"", "\"");
-                                    chunks.push(Ok(ChatChunk::Content(unescaped)));
-                                    found_text = true;
+            match event_res {
+                Ok(event) => {
+                    let data = event.data;
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(candidates) =
+                            parsed.get("candidates").and_then(|c| c.as_array())
+                        {
+                            if let Some(candidate) = candidates.get(0) {
+                                if let Some(parts) = candidate
+                                    .get("content")
+                                    .and_then(|c| c.get("parts"))
+                                    .and_then(|p| p.as_array())
+                                {
+                                    for part in parts {
+                                        if let Some(text) =
+                                            part.get("text").and_then(|t| t.as_str())
+                                        {
+                                            chunks.push(Ok(ChatChunk::Content(text.to_string())));
+                                        }
+                                        if let Some(call) = part.get("functionCall") {
+                                            let name = call
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or_default()
+                                                .to_string();
+                                            let args =
+                                                call.get("args").cloned().unwrap_or(json!({}));
+                                            let args_str = serde_json::to_string(&args)
+                                                .unwrap_or_else(|_| "{}".to_string());
+                                            let id = call
+                                                .get("id")
+                                                .and_then(|i| i.as_str())
+                                                .unwrap_or_default()
+                                                .to_string();
+                                            let sig = part
+                                                .get("thoughtSignature")
+                                                .and_then(|s| s.as_str())
+                                                .map(|s| s.to_string());
+
+                                            chunks.push(Ok(ChatChunk::ToolCallStart {
+                                                id,
+                                                name,
+                                                thought_signature: sig,
+                                            }));
+                                            chunks.push(Ok(ChatChunk::ToolCallDelta {
+                                                arguments: args_str,
+                                            }));
+                                        }
+                                    }
+                                }
+                                if let Some(finish_reason) =
+                                    candidate.get("finishReason").and_then(|r| r.as_str())
+                                {
+                                    if finish_reason == "STOP" {
+                                        chunks.push(Ok(ChatChunk::Done));
+                                    }
                                 }
                             }
                         }
-                    }
-                    if !found_text && text.contains("finishReason") {
-                        chunks.push(Ok(ChatChunk::Done));
                     }
                 }
                 Err(e) => chunks.push(Err(anyhow::anyhow!("Stream read error: {}", e))),
