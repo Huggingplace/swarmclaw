@@ -1243,6 +1243,17 @@ impl Agent {
             {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes()).await;
             }
+
+            // Circular Buffer Logic (Limit based on config)
+            let max_mb = self.config.analytics_max_size_mb.unwrap_or(100);
+            if let Ok(metadata) = tokio::fs::metadata(&log_file).await {
+                if metadata.len() > max_mb * 1024 * 1024 {
+                    // Rotate the log file by renaming it to .old
+                    let rotated_file = log_dir.join("analytics.jsonl.old");
+                    let _ = tokio::fs::rename(&log_file, &rotated_file).await;
+                    // Note: This simple rotation drops the oldest 100MB when it fills up again.
+                }
+            }
         }
     }
 }
