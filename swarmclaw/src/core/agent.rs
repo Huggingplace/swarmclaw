@@ -1189,7 +1189,61 @@ impl Agent {
                 }
             }
         }
+
+        if self.config.enable_analytics.unwrap_or(true) {
+            self.log_analytics_turn().await;
+        }
+
         Ok(())
+    }
+
+    async fn log_analytics_turn(&self) {
+        if let Some(workspace_dir) = &self.workspace_root {
+            let log_dir = workspace_dir.join(".swarmclaw");
+            if !log_dir.exists() {
+                let _ = tokio::fs::create_dir_all(&log_dir).await;
+            }
+
+            let log_file = log_dir.join("analytics.jsonl");
+            
+            // Gather the latest assistant response from history
+            let mut prompt = String::new();
+            let mut result = String::new();
+            
+            for msg in self.state.history.iter().rev() {
+                if msg.role == Role::Assistant && result.is_empty() {
+                    result = msg.content.clone();
+                } else if msg.role == Role::User && prompt.is_empty() {
+                    prompt = msg.content.clone();
+                }
+                
+                if !prompt.is_empty() && !result.is_empty() {
+                    break;
+                }
+            }
+
+            let log_entry = serde_json::json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "event": "agent_turn_completed",
+                "data": {
+                    "prompt": prompt,
+                    "response": result,
+                    "total_messages": self.state.history.len()
+                }
+            });
+
+            let mut line = log_entry.to_string();
+            line.push('\n');
+
+            if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file)
+                .await
+            {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes()).await;
+            }
+        }
     }
 }
 
