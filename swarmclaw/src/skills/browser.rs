@@ -86,50 +86,35 @@ impl Tool for ChromeDriverTool {
                 None => browser.new_tab()?,
             };
 
-            if action == "screenshot_window" {
-                let out_path = args
-                    .get("out_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("chrome_window_screenshot.png");
-                let png = tab.capture_screenshot(
-                    headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
-                    None,
-                    None,
-                    true,
-                )?;
-                std::fs::write(out_path, png)?;
-                return Ok(format!("Screenshot of Chrome window saved to {}", out_path));
-            }
+            let mut needs_screenshot = true;
 
-            if action == "dispatch_mouse" {
-                let mouse_action = args
-                    .get("mouse_action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("click");
-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
-                let point = headless_chrome::browser::tab::point::Point { x, y };
-
-                match mouse_action {
-                    "click" => {
-                        tab.click_point(point)?;
-                    }
-                    "move" => {
-                        tab.move_mouse_to_point(point)?;
-                    }
-                    "down" => {
-                        // Headless chrome doesn't have a distinct mouse down, fallback to click
-                        tab.click_point(point)?;
-                    }
-                    _ => {}
+            let result_msg = match action {
+                "screenshot_window" => {
+                    "Manual screenshot captured".to_string()
                 }
-                return Ok(format!(
-                    "Dispatched virtual mouse {} at ({}, {}) in Chrome",
-                    mouse_action, x, y
-                ));
-            }
+                "dispatch_mouse" => {
+                    let mouse_action = args
+                        .get("mouse_action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("click");
+                    let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+                    let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+                    let point = headless_chrome::browser::tab::point::Point { x, y };
 
-            match action {
+                    match mouse_action {
+                        "click" => {
+                            tab.click_point(point)?;
+                        }
+                        "move" => {
+                            tab.move_mouse_to_point(point)?;
+                        }
+                        "down" => {
+                            tab.click_point(point)?;
+                        }
+                        _ => {}
+                    }
+                    format!("Dispatched virtual mouse {} at ({}, {}) in Chrome", mouse_action, x, y)
+                }
                 "navigate" => {
                     let url = args
                         .get("url")
@@ -137,7 +122,7 @@ impl Tool for ChromeDriverTool {
                         .context("Missing 'url' argument")?;
                     tab.navigate_to(url)?;
                     tab.wait_for_element("body")?;
-                    Ok(format!("Successfully navigated to {}", url))
+                    format!("Successfully navigated to {}", url)
                 }
                 "get_content" => {
                     let selector = args
@@ -146,7 +131,8 @@ impl Tool for ChromeDriverTool {
                         .unwrap_or("body");
                     let elem = tab.wait_for_element(selector)?;
                     let text = elem.get_inner_text()?;
-                    Ok(format!("Content of '{}':\n{}", selector, text))
+                    needs_screenshot = false;
+                    format!("Content of '{}':\n{}", selector, text)
                 }
                 "click" => {
                     let selector = args
@@ -154,12 +140,8 @@ impl Tool for ChromeDriverTool {
                         .and_then(|v| v.as_str())
                         .context("Missing 'selector' argument")?;
                     let elem = tab.wait_for_element(selector)?;
-                    // Execute silent JS click to avoid focus stealing
                     elem.call_js_fn("function() { this.click(); }", vec![], false)?;
-                    Ok(format!(
-                        "Successfully clicked element '{}' via JS",
-                        selector
-                    ))
+                    format!("Successfully clicked element '{}' via JS", selector)
                 }
                 "type" => {
                     let selector = args
@@ -172,7 +154,6 @@ impl Tool for ChromeDriverTool {
                         .context("Missing 'text' argument")?;
                     let elem = tab.wait_for_element(selector)?;
 
-                    // Silent JS dispatch for typing
                     let script = format!(
                         r#"
                         function() {{
@@ -185,7 +166,7 @@ impl Tool for ChromeDriverTool {
                     );
 
                     elem.call_js_fn(&script, vec![], false)?;
-                    Ok(format!("Successfully typed into '{}' via JS", selector))
+                    format!("Successfully typed into '{}' via JS", selector)
                 }
                 "move_window" => {
                     let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -193,26 +174,41 @@ impl Tool for ChromeDriverTool {
                     let width = args.get("width").and_then(|v| v.as_i64()).unwrap_or(1280);
                     let height = args.get("height").and_then(|v| v.as_i64()).unwrap_or(800);
 
-                    // Headless Chrome bounds update using CDP Target API
                     tab.set_bounds(headless_chrome::types::Bounds::Normal {
                         left: Some(x as u32),
                         top: Some(y as u32),
                         width: Some(width as f64),
                         height: Some(height as f64),
                     })?;
-                    Ok(format!(
-                        "Moved Chrome window to x:{}, y:{}, w:{}, h:{}",
-                        x, y, width, height
-                    ))
+                    format!("Moved Chrome window to x:{}, y:{}, w:{}, h:{}", x, y, width, height)
                 }
                 "close" => {
-                    // Close happens automatically when browser drops, but we can explicitly close tabs
-                    Ok("Chrome session closed successfully".to_string())
+                    needs_screenshot = false;
+                    "Chrome session closed successfully".to_string()
                 }
                 _ => {
                     anyhow::bail!("Unknown action: {}", action);
                 }
+            };
+
+            if needs_screenshot {
+                let out_path = args
+                    .get("out_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("chrome_window_screenshot.png");
+                
+                if let Ok(png) = tab.capture_screenshot(
+                    headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
+                    None,
+                    None,
+                    true,
+                ) {
+                    let _ = std::fs::write(out_path, png);
+                    return Ok(format!("{}\n(Auto-screenshot verified state at {})", result_msg, out_path));
+                }
             }
+
+            Ok(result_msg)
         }
         #[cfg(not(feature = "headless_chrome"))]
         {
