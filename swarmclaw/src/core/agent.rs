@@ -509,63 +509,86 @@ impl Agent {
                 }
                 write_cli_line(&mut stdout, "")?;
                 let mut turn_failed = false;
-                while let Err(e) = self.respond(None).instrument(turn_span.clone()).await {
-                    if self.llm.is_auth_error(&e) {
+                loop {
+                    let mut respond_fut = Box::pin(self.respond(None).instrument(turn_span.clone()));
+                    let mut cancel_stream = crossterm::event::EventStream::new();
+                    let res = loop {
+                        tokio::select! {
+                            r = &mut respond_fut => break r,
+                            Some(Ok(event)) = cancel_stream.next() => {
+                                if let crossterm::event::Event::Key(key) = event {
+                                    if key.code == crossterm::event::KeyCode::Esc || (key.code == crossterm::event::KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)) {
+                                        break Err(anyhow::anyhow!("[Operation Cancelled] User cancelled tool execution."));
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    drop(respond_fut);
+                    drop(cancel_stream);
+
+                    match res {
+                        Ok(_) => break,
+                        Err(e) => {
+                            if self.llm.is_auth_error(&e) {
+                            write_cli_line(
+                                &mut stdout,
+                                format!(
+                                    "{} {}",
+                                    cli_chip("AUTH", CLI_DEEP_RGB, CLI_RED_RGB),
+                                    format!("Provider rejected the request: {e}")
+                                        .truecolor(CLI_RED_RGB.0, CLI_RED_RGB.1, CLI_RED_RGB.2)
+                                        .bold(),
+                                ),
+                            )?;
+    
+                            let mut auth_history = Vec::new();
+                            if let Some(key) = self.read_cli_input(
+                                &mut stdout,
+                                "NEW KEY",
+                                CLI_DEEP_RGB,
+                                CLI_AMBER_RGB,
+                                &mut auth_history,
+                                false,
+                            )? {
+                                let key = key.trim().to_string();
+                                if !key.is_empty() {
+                                    self.llm.update_api_key(key);
+                                    write_cli_line(
+                                        &mut stdout,
+                                        format!(
+                                            "{} {}",
+                                            cli_chip("UPDATED", CLI_DEEP_RGB, CLI_GREEN_RGB),
+                                            "API key refreshed. Retrying request...".truecolor(
+                                                CLI_GREEN_RGB.0,
+                                                CLI_GREEN_RGB.1,
+                                                CLI_GREEN_RGB.2
+                                            ),
+                                        ),
+                                    )?;
+                                    continue;
+                                }
+                            }
+                        }
+    
+                            turn_failed = true;
+                        {
+                            let _guard = turn_span.enter();
+                            warn!(error = %e, "CLI turn failed");
+                        }
+    
                         write_cli_line(
                             &mut stdout,
                             format!(
                                 "{} {}",
-                                cli_chip("AUTH", CLI_DEEP_RGB, CLI_RED_RGB),
-                                format!("Provider rejected the request: {e}")
-                                    .truecolor(CLI_RED_RGB.0, CLI_RED_RGB.1, CLI_RED_RGB.2)
-                                    .bold(),
+                                cli_chip("ERROR", CLI_DEEP_RGB, CLI_RED_RGB),
+                                format!("{e}").truecolor(CLI_RED_RGB.0, CLI_RED_RGB.1, CLI_RED_RGB.2),
                             ),
                         )?;
-
-                        let mut auth_history = Vec::new();
-                        if let Some(key) = self.read_cli_input(
-                            &mut stdout,
-                            "NEW KEY",
-                            CLI_DEEP_RGB,
-                            CLI_AMBER_RGB,
-                            &mut auth_history,
-                            false,
-                        )? {
-                            let key = key.trim().to_string();
-                            if !key.is_empty() {
-                                self.llm.update_api_key(key);
-                                write_cli_line(
-                                    &mut stdout,
-                                    format!(
-                                        "{} {}",
-                                        cli_chip("UPDATED", CLI_DEEP_RGB, CLI_GREEN_RGB),
-                                        "API key refreshed. Retrying request...".truecolor(
-                                            CLI_GREEN_RGB.0,
-                                            CLI_GREEN_RGB.1,
-                                            CLI_GREEN_RGB.2
-                                        ),
-                                    ),
-                                )?;
-                                continue;
-                            }
+                            break;
                         }
                     }
-
-                    turn_failed = true;
-                    {
-                        let _guard = turn_span.enter();
-                        warn!(error = %e, "CLI turn failed");
-                    }
-
-                    write_cli_line(
-                        &mut stdout,
-                        format!(
-                            "{} {}",
-                            cli_chip("ERROR", CLI_DEEP_RGB, CLI_RED_RGB),
-                            format!("{e}").truecolor(CLI_RED_RGB.0, CLI_RED_RGB.1, CLI_RED_RGB.2),
-                        ),
-                    )?;
-                    break;
                 }
 
                 if !turn_failed {
