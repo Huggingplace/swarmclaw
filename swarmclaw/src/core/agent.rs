@@ -417,7 +417,7 @@ impl Agent {
         {
             let _ui = TerminalUiGuard::enter(&mut stdout)?;
             self.redraw_cli_screen(&mut stdout)?;
-            let mut input_history = Vec::new();
+            let mut input_history: Vec<String> = self.state.history.iter().filter(|m| m.role == crate::core::state::Role::User).map(|m| m.content.clone()).collect();
 
             loop {
                 let Some(input) = self.read_cli_input(
