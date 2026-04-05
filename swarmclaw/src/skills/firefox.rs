@@ -210,6 +210,9 @@ impl Tool for FirefoxDriverTool {
                     .context("Missing 'text' argument")?;
                 let elem = driver.find(By::Css(selector)).await?;
                 // Use JS injection to set value and trigger React/Vue events without stealing keyboard focus
+                // Focus and click before typing to trigger event listeners properly
+                let _ = driver.execute(r#"arguments[0].focus(); arguments[0].click();"#, vec![elem.to_json()?]).await;
+
                 let script = r#"
                     let el = arguments[0];
                     el.value = arguments[1];

@@ -154,6 +154,9 @@ impl Tool for ChromeDriverTool {
                         .context("Missing 'text' argument")?;
                     let elem = tab.wait_for_element(selector)?;
 
+                    // Focus and click before typing to trigger event listeners properly
+                    let _ = elem.call_js_fn("function() { this.focus(); this.click(); }", vec![], false);
+
                     let script = format!(
                         r#"
                         function() {{
