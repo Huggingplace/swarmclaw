@@ -461,6 +461,7 @@ impl Agent {
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), "API key updated successfully.".truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
                     } else {
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /key <your-api-key>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("INFO", CLI_DEEP_RGB, CLI_CYAN_RGB), format!("Current Provider: {}", self.llm.provider_name()).truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
                     }
                     continue;
                 }
@@ -477,6 +478,8 @@ impl Agent {
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Model updated to {} (Provider auto-detected: {})", new_model, self.llm.provider_name()).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
                     } else {
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /model <model-name>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                        let current = self.config.model.as_deref().unwrap_or("default");
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("INFO", CLI_DEEP_RGB, CLI_CYAN_RGB), format!("Current Model: {}\nExamples: gemini-3.1-pro-preview, claude-3-5-sonnet-latest, gpt-4o, o3-mini", current).truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
                     }
                     continue;
                 }
@@ -524,6 +527,7 @@ impl Agent {
                         }
                     } else {
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /provider <provider-name>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("INFO", CLI_DEEP_RGB, CLI_CYAN_RGB), format!("Current Provider: {}\nAvailable: gemini, anthropic, openai, groq, grok, ollama", self.llm.provider_name()).truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
                     }
                     continue;
                 }
