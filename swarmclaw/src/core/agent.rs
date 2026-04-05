@@ -465,6 +465,69 @@ impl Agent {
                     continue;
                 }
 
+                if input.starts_with("/model") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let new_model = parts[1].trim().to_string();
+                        self.config.model = Some(new_model.clone());
+                        if new_model.starts_with("gemini") { self.llm = std::sync::Arc::new(crate::llm::gemini::GeminiProvider::new(std::env::var("GEMINI_API_KEY").unwrap_or_default())); }
+                        else if new_model.starts_with("gpt-") || new_model.starts_with("o1-") || new_model.starts_with("o3-") { self.llm = std::sync::Arc::new(crate::llm::openai::OpenAIProvider::new(std::env::var("OPENAI_API_KEY").unwrap_or_default())); }
+                        else if new_model.starts_with("claude-") { self.llm = std::sync::Arc::new(crate::llm::anthropic::AnthropicProvider::new(std::env::var("ANTHROPIC_API_KEY").unwrap_or_default())); }
+                        else if new_model.starts_with("grok-") { self.llm = std::sync::Arc::new(crate::llm::openai::OpenAIProvider::grok(std::env::var("XAI_API_KEY").or_else(|_| std::env::var("GROK_API_KEY")).unwrap_or_default())); }
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Model updated to {} (Provider auto-detected: {})", new_model, self.llm.provider_name()).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    } else {
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /model <model-name>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                    }
+                    continue;
+                }
+
+                if input.starts_with("/provider") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let new_provider = parts[1].trim().to_lowercase();
+                        let result = match new_provider.as_str() {
+                            "openai" => {
+                                let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                                self.llm = std::sync::Arc::new(crate::llm::openai::OpenAIProvider::new(key));
+                                Ok("Switched to OpenAI")
+                            }
+                            "anthropic" | "claude" => {
+                                let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+                                self.llm = std::sync::Arc::new(crate::llm::anthropic::AnthropicProvider::new(key));
+                                Ok("Switched to Anthropic")
+                            }
+                            "gemini" | "google" => {
+                                let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+                                self.llm = std::sync::Arc::new(crate::llm::gemini::GeminiProvider::new(key));
+                                Ok("Switched to Gemini")
+                            }
+                            "groq" => {
+                                let key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+                                self.llm = std::sync::Arc::new(crate::llm::openai::OpenAIProvider::groq(key));
+                                Ok("Switched to Groq")
+                            }
+                            "grok" | "xai" => {
+                                let key = std::env::var("XAI_API_KEY").or_else(|_| std::env::var("GROK_API_KEY")).unwrap_or_default();
+                                self.llm = std::sync::Arc::new(crate::llm::openai::OpenAIProvider::grok(key));
+                                Ok("Switched to Grok")
+                            }
+                            "ollama" | "local" => {
+                                let host = std::env::var("OLLAMA_HOST").unwrap_or_default();
+                                self.llm = std::sync::Arc::new(crate::llm::ollama::OllamaProvider::new(host));
+                                Ok("Switched to Ollama")
+                            }
+                            _ => Err("Unknown provider. Valid options: openai, anthropic, gemini, groq, grok, ollama")
+                        };
+                        match result {
+                            Ok(msg) => write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), msg.truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?,
+                            Err(msg) => write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), msg.truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?,
+                        }
+                    } else {
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /provider <provider-name>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                    }
+                    continue;
+                }
+
                 if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
                     break;
                 }
