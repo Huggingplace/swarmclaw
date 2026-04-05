@@ -417,7 +417,7 @@ impl Agent {
         {
             let _ui = TerminalUiGuard::enter(&mut stdout)?;
             self.redraw_cli_screen(&mut stdout)?;
-            let mut input_history = Vec::new();
+            let mut input_history: Vec<String> = self.state.history.iter().filter(|m| m.role == crate::core::state::Role::User).map(|m| m.content.clone()).collect();
 
             loop {
                 let Some(input) = self.read_cli_input(
@@ -639,6 +639,32 @@ impl Agent {
                             }
                         }
     
+                    if e.to_string().contains("[Operation Cancelled]") {
+                        let mut missing_tool_ids = Vec::new();
+                        if let Some(last_ast_idx) = self.state.history.iter().rposition(|m| m.role == crate::core::state::Role::Assistant && m.tool_calls.is_some()) {
+                            let ast_msg = &self.state.history[last_ast_idx];
+                            if let Some(tool_calls) = &ast_msg.tool_calls {
+                                let mut expected_ids: Vec<String> = tool_calls.iter().filter_map(|tc| tc.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())).collect();
+                                for msg in &self.state.history[last_ast_idx + 1..] {
+                                    if msg.role == crate::core::state::Role::Tool {
+                                        if let Some(id) = &msg.tool_call_id {
+                                            expected_ids.retain(|ex_id| ex_id != id);
+                                        }
+                                    }
+                                }
+                                missing_tool_ids = expected_ids;
+                            }
+                        }
+                        for id in missing_tool_ids {
+                            self.record_message(crate::core::state::Message {
+                                role: crate::core::state::Role::Tool,
+                                content: "[Operation Cancelled] User interrupted tool execution.".to_string(),
+                                timestamp: now_secs() as i64,
+                                tool_calls: None,
+                                tool_call_id: Some(id),
+                            });
+                        }
+                    }
                             turn_failed = true;
                         {
                             let _guard = turn_span.enter();
