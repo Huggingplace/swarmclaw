@@ -736,6 +736,7 @@ impl Agent {
                     let _guard = turn_span.enter();
                     info!("CLI turn completed");
                 }
+                self.redraw_cli_screen(&mut stdout)?;
             }
         }
 
@@ -1823,16 +1824,15 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
             Role::Assistant => {
                 if !message.content.is_empty() {
                     has_visible_messages = true;
-                    write_cli_line(
+                    write_cli(
                         stdout,
-                        format!(
-                            "{} {}",
-                            cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB),
-                            message
-                                .content
-                                .truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2),
-                        ),
+                        format!("{} \r\n", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB))
                     )?;
+                    let mut skin = termimad::MadSkin::default();
+                    let (r, g, b) = CLI_FG_RGB;
+                    skin.set_fg(crossterm::style::Color::Rgb { r, g, b });
+                    let _ = skin.write_text_on(stdout, &message.content);
+                    write_cli(stdout, "\r\n")?;
                 }
 
                 if let Some(tool_calls) = &message.tool_calls {
