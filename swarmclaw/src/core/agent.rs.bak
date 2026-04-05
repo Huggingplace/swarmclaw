@@ -398,7 +398,7 @@ impl Agent {
         lines_occupied: &mut u16,
     ) -> io::Result<()> {
         let prompt_width = label.chars().count() + 3;
-        let term_width = crate::utils::terminal_width().max(1) as usize;
+        let term_width = terminal_width().max(1) as usize;
 
         if *lines_occupied > 0 {
             execute!(stdout, crossterm::cursor::MoveUp(*lines_occupied))?;
