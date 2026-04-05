@@ -141,6 +141,8 @@ pub struct Agent {
     pub skills: Vec<Arc<dyn Skill>>,
     pub memory_org_id: Option<String>,
     pub memory_api_key: Option<String>,
+    pub use_orchestrator: bool,
+    pub use_multithread: bool,
 }
 
 impl Agent {
@@ -158,6 +160,8 @@ impl Agent {
             skills: Vec::new(),
             memory_org_id: None,
             memory_api_key: None,
+            use_orchestrator: true,
+            use_multithread: true,
         }
     }
 
@@ -499,6 +503,32 @@ impl Agent {
                         let current = self.config.model.as_deref().unwrap_or("default");
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("INFO", CLI_DEEP_RGB, CLI_CYAN_RGB), format!("Current Model: {}\nExamples: gemini-3.1-pro-preview, claude-3-5-sonnet-latest, gpt-4o, o3-mini", current).truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
                     }
+                    continue;
+                }
+
+                if input.starts_with("/orchestrator") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let val = parts[1].trim().to_lowercase();
+                        self.use_orchestrator = val == "on" || val == "true" || val == "1";
+                    } else {
+                        self.use_orchestrator = !self.use_orchestrator;
+                    }
+                    let state = if self.use_orchestrator { "ON" } else { "OFF" };
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Orchestrator Planner is now {}", state).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/multithread") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let val = parts[1].trim().to_lowercase();
+                        self.use_multithread = val == "on" || val == "true" || val == "1";
+                    } else {
+                        self.use_multithread = !self.use_multithread;
+                    }
+                    let state = if self.use_multithread { "ON" } else { "OFF" };
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Multithreaded Execution is now {}", state).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
                     continue;
                 }
 
@@ -947,7 +977,7 @@ impl Agent {
                     Ok(ChatChunk::Content(delta)) => {
                         full_content.push_str(&delta);
                         if cli_mode {
-                            print!("{}", delta);
+                            write_cli(&mut stdout, delta)?; stdout.flush()?;
                             stdout.flush()?;
                             drain_resize_events(self, &mut stdout)?;
                         }
