@@ -441,7 +441,23 @@ impl Agent {
                     let parts: Vec<&str> = input.splitn(2, ' ').collect();
                     if parts.len() == 2 {
                         let new_key = parts[1].trim().to_string();
-                        self.llm.update_api_key(new_key);
+                        self.llm.update_api_key(new_key.clone());
+                        let provider_name = self.llm.provider_name();
+                        let env_key = match provider_name.to_lowercase().as_str() {
+                            "openai" => "OPENAI_API_KEY",
+                            "anthropic" => "ANTHROPIC_API_KEY",
+                            "gemini" => "GEMINI_API_KEY",
+                            "groq" => "GROQ_API_KEY",
+                            "grok" | "xai" => "XAI_API_KEY",
+                            _ => "API_KEY"
+                        };
+                        if let Ok(contents) = std::fs::read_to_string(".env") {
+                            let lines: Vec<String> = contents.lines().filter(|line| !line.starts_with(env_key)).map(String::from).collect();
+                            let new_contents = format!("{}\n{}={}\n", lines.join("\n"), env_key, new_key);
+                            let _ = std::fs::write(".env", new_contents);
+                        } else {
+                            let _ = std::fs::write(".env", format!("{}={}\n", env_key, new_key));
+                        }
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), "API key updated successfully.".truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
                     } else {
                         write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /key <your-api-key>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;

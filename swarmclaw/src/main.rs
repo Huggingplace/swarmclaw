@@ -1125,60 +1125,20 @@ use swarmclaw::skills::browser::BrowserSkill;
 
         info!("Google Sheets UI available at {}", service_url);
 
-        if has_google_sheets_wasm {
+        if has_google_sheets_wasm && has_google_docs_wasm && has_google_gmail_wasm {
             info!(
-                "Google Sheets WASM skill detected in workspace; skipping native MCP registration."
+                "Google Workspace WASM skills detected in workspace; skipping native MCP registration."
             );
         } else {
             use swarmclaw::skills::mcp::McpSkill;
-            match McpSkill::connect("google_sheets", &mcp_endpoint).await {
+            match McpSkill::connect("google_workspace", &mcp_endpoint).await {
                 Ok(skill) => {
-                    info!("Adding Google Sheets skill...");
+                    info!("Adding Google Workspace skill...");
                     agent.add_skill(Arc::new(skill));
                 }
                 Err(error) => {
                     warn!(
-                        "Failed to register Google Sheets MCP skill from {}: {}",
-                        mcp_endpoint, error
-                    );
-                }
-            }
-        }
-
-        if has_google_docs_wasm {
-            info!(
-                "Google Docs WASM skill detected in workspace; skipping native MCP registration."
-            );
-        } else {
-            use swarmclaw::skills::mcp::McpSkill;
-            match McpSkill::connect("google_docs", &mcp_endpoint).await {
-                Ok(skill) => {
-                    info!("Adding Google Docs skill...");
-                    agent.add_skill(Arc::new(skill));
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to register Google Docs MCP skill from {}: {}",
-                        mcp_endpoint, error
-                    );
-                }
-            }
-        }
-
-        if has_google_gmail_wasm {
-            info!(
-                "Google Gmail WASM skill detected in workspace; skipping native MCP registration."
-            );
-        } else {
-            use swarmclaw::skills::mcp::McpSkill;
-            match McpSkill::connect("google_gmail", &mcp_endpoint).await {
-                Ok(skill) => {
-                    info!("Adding Google Gmail skill...");
-                    agent.add_skill(Arc::new(skill));
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to register Google Gmail MCP skill from {}: {}",
+                        "Failed to register Google Workspace MCP skill from {}: {}",
                         mcp_endpoint, error
                     );
                 }
