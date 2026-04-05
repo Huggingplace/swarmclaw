@@ -9,10 +9,11 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{collections::BTreeSet, net::SocketAddr, path::Path, sync::Arc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -525,6 +526,7 @@ struct GoogleWorkspaceConfig {
     client_secret: String,
     picker_api_key: Option<String>,
     picker_app_id: Option<String>,
+    extra_scopes: Vec<String>,
     public_base_url: String,
     redirect_uri: String,
 }
@@ -605,6 +607,12 @@ struct GoogleSpreadsheetSheetProperties {
     title: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct GoogleDriveFileParentsResponse {
+    #[serde(default)]
+    parents: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BindGoogleSheetRequest {
     alias: String,
@@ -666,11 +674,20 @@ impl GoogleWorkspaceService {
 
         let store = GoogleWorkspaceStore::open(&workspace_path.join(".swarmclaw")).await?;
 
+        let mut extra_scopes = std::env::var("SWARMCLAW_GOOGLE_EXTRA_SCOPES")
+            .ok()
+            .map(|value| parse_google_scope_list(&value))
+            .unwrap_or_default();
+        if env_var_truthy("SWARMCLAW_GOOGLE_ENABLE_FULL_GMAIL_ACCESS") {
+            extra_scopes.push("https://mail.google.com/".to_string());
+        }
+
         let config = GoogleWorkspaceConfig {
             client_id,
             client_secret,
             picker_api_key: std::env::var("SWARMCLAW_GOOGLE_PICKER_API_KEY").ok(),
             picker_app_id: std::env::var("SWARMCLAW_GOOGLE_PICKER_APP_ID").ok(),
+            extra_scopes,
             public_base_url: public_base_url.trim_end_matches('/').to_string(),
             redirect_uri,
         };
@@ -713,7 +730,7 @@ impl GoogleWorkspaceService {
                 "/api/sheets",
                 get(list_google_sheets).post(bind_google_sheet),
             )
-            .route("/api/sheets/:binding_id", delete(delete_google_sheet))
+            .route("/api/sheets/{binding_id}", delete(delete_google_sheet))
             .route("/mcp", post(handle_mcp))
             .with_state(self.state.clone());
 
@@ -798,14 +815,7 @@ async fn start_google_connect(
 ) -> Result<Redirect, (StatusCode, Json<Value>)> {
     json_result(async move {
         let oauth_state = state.store.create_oauth_state().await?;
-        let scopes = [
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/spreadsheets",
-            "openid",
-            "email",
-            "profile",
-        ]
-        .join(" ");
+        let scopes = state.config.oauth_scopes().join(" ");
 
         let mut url = Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
             .context("Failed to construct Google OAuth URL")?;
@@ -1052,6 +1062,236 @@ async fn dispatch_mcp(state: &GoogleWorkspaceState, request: JsonRpcRequest) -> 
                     }
                 },
                 {
+                    "name": "get_google_sheet_values",
+                    "description": "Read values from a concrete A1 range inside a previously bound spreadsheet alias.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["alias", "range"],
+                        "properties": {
+                            "alias": { "type": "string" },
+                            "range": { "type": "string" },
+                            "majorDimension": {
+                                "type": "string",
+                                "enum": ["ROWS", "COLUMNS"]
+                            },
+                            "valueRenderOption": {
+                                "type": "string",
+                                "enum": ["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]
+                            },
+                            "dateTimeRenderOption": {
+                                "type": "string",
+                                "enum": ["SERIAL_NUMBER", "FORMATTED_STRING"]
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "create_google_doc",
+                    "description": "Create a new Google Doc with an optional initial body of text.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["title"],
+                        "properties": {
+                            "title": { "type": "string" },
+                            "initialText": { "type": "string" },
+                            "folderId": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "get_google_doc_content",
+                    "description": "Fetch the content of a Google Doc by document id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["documentId"],
+                        "properties": {
+                            "documentId": { "type": "string" },
+                            "format": {
+                                "type": "string",
+                                "enum": ["plain_text", "markdown", "json"]
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "append_google_doc_text",
+                    "description": "Append text to the end of an existing Google Doc.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["documentId", "text"],
+                        "properties": {
+                            "documentId": { "type": "string" },
+                            "text": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "insert_google_doc_image",
+                    "description": "Insert a publicly accessible image into an existing Google Doc.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["documentId", "imageUrl"],
+                        "properties": {
+                            "documentId": { "type": "string" },
+                            "imageUrl": { "type": "string" },
+                            "widthPt": { "type": "number" },
+                            "heightPt": { "type": "number" },
+                            "locationIndex": { "type": "integer" }
+                        }
+                    }
+                },
+                {
+                    "name": "share_google_doc",
+                    "description": "Share an existing Google Doc with one or more recipients by email.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["documentId"],
+                        "properties": {
+                            "documentId": { "type": "string" },
+                            "email": { "type": "string" },
+                            "emails": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "role": {
+                                "type": "string",
+                                "enum": ["reader", "commenter", "writer"]
+                            },
+                            "sendNotificationEmail": { "type": "boolean" },
+                            "emailMessage": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "replace_google_doc_text",
+                    "description": "Replace the body content of an existing Google Doc with new text.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["documentId", "text"],
+                        "properties": {
+                            "documentId": { "type": "string" },
+                            "text": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "search_gmail",
+                    "description": "Search Gmail messages for the connected Google account.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "maxResults": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 100
+                            },
+                            "includeSpamTrash": { "type": "boolean" }
+                        }
+                    }
+                },
+                {
+                    "name": "list_gmail_threads",
+                    "description": "List Gmail threads for the connected Google account, optionally filtered by query.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "maxResults": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 100
+                            },
+                            "includeSpamTrash": { "type": "boolean" }
+                        }
+                    }
+                },
+                {
+                    "name": "get_gmail_message",
+                    "description": "Fetch a Gmail message by id, including decoded body content when available.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["messageId"],
+                        "properties": {
+                            "messageId": { "type": "string" },
+                            "format": {
+                                "type": "string",
+                                "enum": ["minimal", "metadata", "full", "raw"]
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "send_gmail_message",
+                    "description": "Send an email from the connected Gmail account.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["to", "subject", "bodyText"],
+                        "properties": {
+                            "to": {
+                                "oneOf": [
+                                    { "type": "string" },
+                                    { "type": "array", "items": { "type": "string" } }
+                                ]
+                            },
+                            "cc": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "bcc": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "subject": { "type": "string" },
+                            "bodyText": { "type": "string" },
+                            "threadId": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "draft_gmail_message",
+                    "description": "Create a Gmail draft from the connected Gmail account.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["to", "subject", "bodyText"],
+                        "properties": {
+                            "to": {
+                                "oneOf": [
+                                    { "type": "string" },
+                                    { "type": "array", "items": { "type": "string" } }
+                                ]
+                            },
+                            "cc": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "bcc": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "subject": { "type": "string" },
+                            "bodyText": { "type": "string" },
+                            "threadId": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "create_google_sheet_tab",
+                    "description": "Create a new tab inside a previously bound spreadsheet alias.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["alias", "title"],
+                        "properties": {
+                            "alias": { "type": "string" },
+                            "title": { "type": "string" },
+                            "index": {
+                                "type": "integer",
+                                "minimum": 0
+                            }
+                        }
+                    }
+                },
+                {
                     "name": "append_google_sheet_rows",
                     "description": "Append rows to a logical table inside a previously bound spreadsheet alias.",
                     "inputSchema": {
@@ -1181,6 +1421,346 @@ async fn execute_google_tool(
             .await?;
             Ok(serde_json::to_value(metadata)?)
         }
+        "get_google_sheet_values" => {
+            let alias = required_string(&args, "alias")?;
+            let range = required_string(&args, "range")?;
+            let binding = require_binding_for_alias(state, alias).await?;
+            enforce_binding_range_policy(&binding, range)?;
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let major_dimension = optional_string(&args, "majorDimension").unwrap_or("ROWS");
+            let value_render_option =
+                optional_string(&args, "valueRenderOption").unwrap_or("FORMATTED_VALUE");
+            let date_time_render_option =
+                optional_string(&args, "dateTimeRenderOption").unwrap_or("SERIAL_NUMBER");
+            let encoded_range = encode_sheet_range(range);
+            let url = format!(
+                "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?majorDimension={}&valueRenderOption={}&dateTimeRenderOption={}",
+                binding.spreadsheet_id,
+                encoded_range,
+                major_dimension,
+                value_render_option,
+                date_time_render_option,
+            );
+            google_get_json(state, &token.access_token, &url).await
+        }
+        "create_google_doc" => {
+            let title = required_string(&args, "title")?;
+            let initial_text = optional_string(&args, "initialText").unwrap_or("");
+            let folder_id = optional_string(&args, "folderId");
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+
+            let created = google_post_json(
+                state,
+                &token.access_token,
+                "https://docs.googleapis.com/v1/documents",
+                &json!({ "title": title }),
+            )
+            .await?;
+            let document_id = created
+                .get("documentId")
+                .and_then(Value::as_str)
+                .context("Google Docs create response did not include a documentId")?;
+
+            if !initial_text.is_empty() {
+                update_google_doc_text(
+                    state,
+                    &token.access_token,
+                    document_id,
+                    &json!([
+                        {
+                            "insertText": {
+                                "location": { "index": 1 },
+                                "text": initial_text,
+                            }
+                        }
+                    ]),
+                )
+                .await?;
+            }
+
+            if let Some(folder_id) = folder_id {
+                add_google_drive_parent(state, &token.access_token, document_id, folder_id).await?;
+            }
+
+            Ok(json!({
+                "documentId": document_id,
+                "title": created.get("title").and_then(Value::as_str).unwrap_or(title),
+                "url": google_doc_url(document_id),
+                "folderId": folder_id,
+            }))
+        }
+        "get_google_doc_content" => {
+            let document_id = required_string(&args, "documentId")?;
+            let format = optional_string(&args, "format").unwrap_or("plain_text");
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let url = format!("https://docs.googleapis.com/v1/documents/{}", document_id);
+            let document = google_get_json(state, &token.access_token, &url).await?;
+            match format {
+                "json" => Ok(document),
+                "plain_text" | "markdown" => Ok(json!({
+                    "documentId": document_id,
+                    "title": document.get("title").and_then(Value::as_str),
+                    "format": format,
+                    "text": extract_google_doc_plain_text(&document),
+                    "url": google_doc_url(document_id),
+                })),
+                other => bail!("Unsupported Google Doc format '{}'", other),
+            }
+        }
+        "search_gmail" => {
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let query = optional_string(&args, "query");
+            let max_results = optional_u64(&args, "maxResults")
+                .unwrap_or(10)
+                .clamp(1, 100);
+            let include_spam_trash = optional_bool(&args, "includeSpamTrash").unwrap_or(false);
+            let url = gmail_list_url("messages", query, max_results, include_spam_trash)?;
+            google_get_json(state, &token.access_token, url.as_str()).await
+        }
+        "list_gmail_threads" => {
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let query = optional_string(&args, "query");
+            let max_results = optional_u64(&args, "maxResults")
+                .unwrap_or(10)
+                .clamp(1, 100);
+            let include_spam_trash = optional_bool(&args, "includeSpamTrash").unwrap_or(false);
+            let url = gmail_list_url("threads", query, max_results, include_spam_trash)?;
+            google_get_json(state, &token.access_token, url.as_str()).await
+        }
+        "get_gmail_message" => {
+            let message_id = required_string(&args, "messageId")?;
+            let format = optional_string(&args, "format").unwrap_or("full");
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let url = format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format={}",
+                message_id, format
+            );
+            let message = google_get_json(state, &token.access_token, &url).await?;
+            if format == "raw" {
+                return Ok(message);
+            }
+            Ok(normalize_gmail_message(&message))
+        }
+        "append_google_doc_text" => {
+            let document_id = required_string(&args, "documentId")?;
+            let text = required_string(&args, "text")?;
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let result = update_google_doc_text(
+                state,
+                &token.access_token,
+                document_id,
+                &json!([
+                    {
+                        "insertText": {
+                            "endOfSegmentLocation": {},
+                            "text": text,
+                        }
+                    }
+                ]),
+            )
+            .await?;
+            Ok(json!({
+                "documentId": document_id,
+                "url": google_doc_url(document_id),
+                "result": result,
+            }))
+        }
+        "insert_google_doc_image" => {
+            let document_id = required_string(&args, "documentId")?;
+            let image_url = required_string(&args, "imageUrl")?;
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+
+            let mut insert_request = serde_json::Map::new();
+            insert_request.insert("uri".to_string(), Value::String(image_url.to_string()));
+
+            if let (Some(width), Some(height)) = (
+                optional_f64(&args, "widthPt"),
+                optional_f64(&args, "heightPt"),
+            ) {
+                insert_request.insert(
+                    "objectSize".to_string(),
+                    json!({
+                        "width": { "magnitude": width, "unit": "PT" },
+                        "height": { "magnitude": height, "unit": "PT" }
+                    }),
+                );
+            }
+
+            if let Some(location_index) = optional_u64(&args, "locationIndex") {
+                insert_request.insert("location".to_string(), json!({ "index": location_index }));
+            } else {
+                insert_request.insert("endOfSegmentLocation".to_string(), json!({}));
+            }
+
+            let result = update_google_doc_text(
+                state,
+                &token.access_token,
+                document_id,
+                &json!([
+                    {
+                        "insertInlineImage": Value::Object(insert_request)
+                    }
+                ]),
+            )
+            .await?;
+            Ok(json!({
+                "documentId": document_id,
+                "url": google_doc_url(document_id),
+                "imageUrl": image_url,
+                "result": result,
+            }))
+        }
+        "share_google_doc" => {
+            let document_id = required_string(&args, "documentId")?;
+            let recipients = required_google_share_recipients(&args)?;
+            let role = optional_string(&args, "role").unwrap_or("reader");
+            if !matches!(role, "reader" | "commenter" | "writer") {
+                bail!(
+                    "Unsupported Google Doc share role '{}'. Expected one of reader, commenter, or writer.",
+                    role
+                );
+            }
+            let send_notification_email =
+                optional_bool(&args, "sendNotificationEmail").unwrap_or(true);
+            let email_message = optional_string(&args, "emailMessage")
+                .map(sanitize_email_header_value)
+                .filter(|value| !value.is_empty());
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+
+            let mut permissions = Vec::with_capacity(recipients.len());
+            for recipient in recipients {
+                let permission = create_google_drive_permission(
+                    state,
+                    &token.access_token,
+                    document_id,
+                    &recipient,
+                    role,
+                    send_notification_email,
+                    email_message.as_deref(),
+                )
+                .await?;
+                permissions.push(permission);
+            }
+
+            Ok(json!({
+                "documentId": document_id,
+                "url": google_doc_url(document_id),
+                "role": role,
+                "sendNotificationEmail": send_notification_email,
+                "permissions": permissions,
+            }))
+        }
+        "replace_google_doc_text" => {
+            let document_id = required_string(&args, "documentId")?;
+            let text = required_string(&args, "text")?;
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let current = google_get_json(
+                state,
+                &token.access_token,
+                &format!("https://docs.googleapis.com/v1/documents/{}", document_id),
+            )
+            .await?;
+            let end_index = google_doc_body_end_index(&current);
+            let mut requests = Vec::new();
+            if end_index > 1 {
+                requests.push(json!({
+                    "deleteContentRange": {
+                        "range": {
+                            "startIndex": 1,
+                            "endIndex": end_index - 1,
+                        }
+                    }
+                }));
+            }
+            if !text.is_empty() {
+                requests.push(json!({
+                    "insertText": {
+                        "location": { "index": 1 },
+                        "text": text,
+                    }
+                }));
+            }
+            let result = update_google_doc_text(
+                state,
+                &token.access_token,
+                document_id,
+                &Value::Array(requests),
+            )
+            .await?;
+            Ok(json!({
+                "documentId": document_id,
+                "url": google_doc_url(document_id),
+                "result": result,
+            }))
+        }
+        "send_gmail_message" => {
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let payload = gmail_outbound_payload(&args, false)?;
+            google_post_json(
+                state,
+                &token.access_token,
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                &payload,
+            )
+            .await
+        }
+        "draft_gmail_message" => {
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let payload = gmail_outbound_payload(&args, true)?;
+            google_post_json(
+                state,
+                &token.access_token,
+                "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+                &payload,
+            )
+            .await
+        }
+        "create_google_sheet_tab" => {
+            let alias = required_string(&args, "alias")?;
+            let title = required_string(&args, "title")?.trim();
+            if title.is_empty() {
+                bail!("Tab title is required");
+            }
+            let binding = require_binding_for_alias(state, alias).await?;
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let mut properties = serde_json::Map::new();
+            properties.insert("title".to_string(), Value::String(title.to_string()));
+            if let Some(index) = optional_u64(&args, "index") {
+                properties.insert("index".to_string(), Value::Number(index.into()));
+            }
+            let url = format!(
+                "https://sheets.googleapis.com/v4/spreadsheets/{}:batchUpdate",
+                binding.spreadsheet_id
+            );
+            google_post_json(
+                state,
+                &token.access_token,
+                &url,
+                &json!({
+                    "requests": [
+                        {
+                            "addSheet": {
+                                "properties": Value::Object(properties)
+                            }
+                        }
+                    ]
+                }),
+            )
+            .await
+        }
         "append_google_sheet_rows" => {
             let alias = required_string(&args, "alias")?;
             let range = required_string(&args, "range")?;
@@ -1307,6 +1887,102 @@ async fn refresh_google_access_token(
     parse_google_json_response(response).await
 }
 
+async fn update_google_doc_text(
+    state: &GoogleWorkspaceState,
+    access_token: &str,
+    document_id: &str,
+    requests: &Value,
+) -> Result<Value> {
+    google_post_json(
+        state,
+        access_token,
+        &format!(
+            "https://docs.googleapis.com/v1/documents/{}:batchUpdate",
+            document_id
+        ),
+        &json!({ "requests": requests }),
+    )
+    .await
+}
+
+async fn add_google_drive_parent(
+    state: &GoogleWorkspaceState,
+    access_token: &str,
+    file_id: &str,
+    folder_id: &str,
+) -> Result<Value> {
+    let metadata: GoogleDriveFileParentsResponse = parse_google_json_response(
+        state
+            .http
+            .get(format!(
+                "https://www.googleapis.com/drive/v3/files/{}?fields=parents",
+                file_id
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch Google Drive parents for {}", file_id))?,
+    )
+    .await?;
+    let mut url = Url::parse(&format!(
+        "https://www.googleapis.com/drive/v3/files/{}",
+        file_id
+    ))
+    .context("Failed to construct Google Drive update URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("addParents", folder_id);
+        query.append_pair("fields", "id,name,parents");
+        if !metadata.parents.is_empty() {
+            query.append_pair("removeParents", &metadata.parents.join(","));
+        }
+    }
+    google_patch_json(state, access_token, url.as_str(), &json!({})).await
+}
+
+async fn create_google_drive_permission(
+    state: &GoogleWorkspaceState,
+    access_token: &str,
+    file_id: &str,
+    email: &str,
+    role: &str,
+    send_notification_email: bool,
+    email_message: Option<&str>,
+) -> Result<Value> {
+    let mut url = Url::parse(&format!(
+        "https://www.googleapis.com/drive/v3/files/{}/permissions",
+        file_id
+    ))
+    .context("Failed to construct Google Drive permissions URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair(
+            "sendNotificationEmail",
+            if send_notification_email {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        query.append_pair("fields", "id,type,role,emailAddress");
+        if let Some(message) = email_message {
+            query.append_pair("emailMessage", message);
+        }
+    }
+
+    google_post_json(
+        state,
+        access_token,
+        url.as_str(),
+        &json!({
+            "role": role,
+            "type": "user",
+            "emailAddress": email,
+        }),
+    )
+    .await
+}
+
 async fn fetch_google_userinfo(
     state: &GoogleWorkspaceState,
     access_token: &str,
@@ -1354,6 +2030,38 @@ async fn google_post_json(
         .send()
         .await
         .with_context(|| format!("Failed to POST Google Sheets request to {}", url))?;
+    parse_google_json_response(response).await
+}
+
+async fn google_get_json(
+    state: &GoogleWorkspaceState,
+    access_token: &str,
+    url: &str,
+) -> Result<Value> {
+    let response = state
+        .http
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .with_context(|| format!("Failed to GET Google Sheets request from {}", url))?;
+    parse_google_json_response(response).await
+}
+
+async fn google_patch_json(
+    state: &GoogleWorkspaceState,
+    access_token: &str,
+    url: &str,
+    body: &Value,
+) -> Result<Value> {
+    let response = state
+        .http
+        .patch(url)
+        .bearer_auth(access_token)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("Failed to PATCH Google request to {}", url))?;
     parse_google_json_response(response).await
 }
 
@@ -1437,6 +2145,312 @@ fn optional_string<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn optional_bool(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(Value::as_bool)
+}
+
+fn optional_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+    })
+}
+
+fn optional_f64(args: &Value, key: &str) -> Option<f64> {
+    args.get(key).and_then(Value::as_f64)
+}
+
+fn extract_google_doc_plain_text(document: &Value) -> String {
+    let mut text = String::new();
+    for element in document
+        .get("body")
+        .and_then(|body| body.get("content"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(paragraph_elements) = element
+            .get("paragraph")
+            .and_then(|paragraph| paragraph.get("elements"))
+            .and_then(Value::as_array)
+        {
+            for paragraph_element in paragraph_elements {
+                if let Some(content) = paragraph_element
+                    .get("textRun")
+                    .and_then(|text_run| text_run.get("content"))
+                    .and_then(Value::as_str)
+                {
+                    text.push_str(content);
+                }
+            }
+        }
+        if let Some(table_rows) = element
+            .get("table")
+            .and_then(|table| table.get("tableRows"))
+            .and_then(Value::as_array)
+        {
+            for row in table_rows {
+                if let Some(cells) = row.get("tableCells").and_then(Value::as_array) {
+                    for cell in cells {
+                        if let Some(content) = cell.get("content").and_then(Value::as_array) {
+                            let nested = json!({ "body": { "content": content } });
+                            text.push_str(&extract_google_doc_plain_text(&nested));
+                            if !text.ends_with('\t') {
+                                text.push('\t');
+                            }
+                        }
+                    }
+                    if text.ends_with('\t') {
+                        text.pop();
+                    }
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    text.trim_end().to_string()
+}
+
+fn google_doc_body_end_index(document: &Value) -> i64 {
+    document
+        .get("body")
+        .and_then(|body| body.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content
+                .iter()
+                .filter_map(|element| element.get("endIndex").and_then(Value::as_i64))
+                .max()
+        })
+        .unwrap_or(1)
+}
+
+fn google_doc_url(document_id: &str) -> String {
+    format!("https://docs.google.com/document/d/{}/edit", document_id)
+}
+
+fn gmail_list_url(
+    resource: &str,
+    query: Option<&str>,
+    max_results: u64,
+    include_spam_trash: bool,
+) -> Result<Url> {
+    let mut url = Url::parse(&format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/{}",
+        resource
+    ))
+    .context("Failed to construct Gmail list URL")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("maxResults", &max_results.to_string());
+        if let Some(query) = query {
+            pairs.append_pair("q", query);
+        }
+        if include_spam_trash {
+            pairs.append_pair("includeSpamTrash", "true");
+        }
+    }
+    Ok(url)
+}
+
+fn gmail_outbound_payload(args: &Value, as_draft: bool) -> Result<Value> {
+    let to = required_recipients(args, "to")?;
+    let cc = optional_string_list(args, "cc");
+    let bcc = optional_string_list(args, "bcc");
+    let subject = sanitize_email_header_value(required_string(args, "subject")?);
+    let body_text = required_string(args, "bodyText")?;
+    let thread_id = optional_string(args, "threadId");
+    let raw = build_gmail_raw_message(&to, &cc, &bcc, &subject, body_text);
+    let mut message = serde_json::Map::new();
+    message.insert("raw".to_string(), Value::String(raw));
+    if let Some(thread_id) = thread_id {
+        message.insert("threadId".to_string(), Value::String(thread_id.to_string()));
+    }
+    if as_draft {
+        Ok(json!({ "message": Value::Object(message) }))
+    } else {
+        Ok(Value::Object(message))
+    }
+}
+
+fn build_gmail_raw_message(
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    body_text: &str,
+) -> String {
+    let mut mime = String::new();
+    mime.push_str(&format!("To: {}\r\n", to.join(", ")));
+    if !cc.is_empty() {
+        mime.push_str(&format!("Cc: {}\r\n", cc.join(", ")));
+    }
+    if !bcc.is_empty() {
+        mime.push_str(&format!("Bcc: {}\r\n", bcc.join(", ")));
+    }
+    mime.push_str(&format!("Subject: {}\r\n", subject));
+    mime.push_str("MIME-Version: 1.0\r\n");
+    mime.push_str("Content-Type: text/plain; charset=UTF-8\r\n");
+    mime.push_str("Content-Transfer-Encoding: 8bit\r\n");
+    mime.push_str("\r\n");
+    mime.push_str(body_text);
+    URL_SAFE_NO_PAD.encode(mime.as_bytes())
+}
+
+fn required_google_share_recipients(args: &Value) -> Result<Vec<String>> {
+    if args.get("emails").is_some() {
+        return required_recipients(args, "emails");
+    }
+    required_recipients(args, "email")
+}
+
+fn required_recipients(args: &Value, key: &str) -> Result<Vec<String>> {
+    let recipients = if let Some(value) = args.get(key) {
+        if let Some(single) = value.as_str() {
+            vec![single.trim().to_string()]
+        } else if let Some(items) = value.as_array() {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| item.trim().to_string())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let recipients = recipients
+        .into_iter()
+        .filter(|item| !item.is_empty())
+        .map(|item| sanitize_email_header_value(&item))
+        .collect::<Vec<_>>();
+    if recipients.is_empty() {
+        bail!("Missing required recipient field '{}'", key);
+    }
+    Ok(recipients)
+}
+
+fn optional_string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| sanitize_email_header_value(item.trim()))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn sanitize_email_header_value(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+fn normalize_gmail_message(message: &Value) -> Value {
+    let payload = message.get("payload");
+    json!({
+        "id": message.get("id").and_then(Value::as_str),
+        "threadId": message.get("threadId").and_then(Value::as_str),
+        "labelIds": message.get("labelIds"),
+        "snippet": message.get("snippet").and_then(Value::as_str),
+        "internalDate": message.get("internalDate").and_then(Value::as_str),
+        "headers": gmail_selected_headers(payload),
+        "textBody": gmail_extract_body(payload, "text/plain"),
+        "htmlBody": gmail_extract_body(payload, "text/html"),
+        "rawPayload": message,
+    })
+}
+
+fn gmail_selected_headers(payload: Option<&Value>) -> Value {
+    let mut headers = serde_json::Map::new();
+    for name in ["From", "To", "Cc", "Bcc", "Subject", "Date", "Reply-To"] {
+        if let Some(value) = gmail_header_value(payload, name) {
+            headers.insert(name.to_string(), Value::String(value));
+        }
+    }
+    Value::Object(headers)
+}
+
+fn gmail_header_value(payload: Option<&Value>, name: &str) -> Option<String> {
+    payload
+        .and_then(|payload| payload.get("headers"))
+        .and_then(Value::as_array)
+        .and_then(|headers| {
+            headers.iter().find_map(|header| {
+                let header_name = header.get("name").and_then(Value::as_str)?;
+                if header_name.eq_ignore_ascii_case(name) {
+                    header
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn gmail_extract_body(payload: Option<&Value>, desired_mime: &str) -> Option<String> {
+    let payload = payload?;
+    let mime = payload
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if mime.eq_ignore_ascii_case(desired_mime) {
+        if let Some(data) = payload
+            .get("body")
+            .and_then(|body| body.get("data"))
+            .and_then(Value::as_str)
+        {
+            return decode_gmail_body(data);
+        }
+    }
+    payload
+        .get("parts")
+        .and_then(Value::as_array)
+        .and_then(|parts| {
+            parts
+                .iter()
+                .find_map(|part| gmail_extract_body(Some(part), desired_mime))
+        })
+}
+
+fn decode_gmail_body(data: &str) -> Option<String> {
+    let normalized = data.replace('-', "+").replace('_', "/");
+    URL_SAFE_NO_PAD
+        .decode(normalized.as_bytes())
+        .or_else(|_| URL_SAFE_NO_PAD.decode(data.as_bytes()))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+fn parse_google_scope_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn env_var_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn enforce_binding_range_policy(binding: &StoredGoogleSheetBinding, range: &str) -> Result<()> {
     if !binding.allowed_tabs.is_empty() {
         let Some(sheet_name) = extract_sheet_name(range) else {
@@ -1470,6 +2484,26 @@ fn enforce_binding_range_policy(binding: &StoredGoogleSheetBinding, range: &str)
     }
 
     Ok(())
+}
+
+impl GoogleWorkspaceConfig {
+    fn oauth_scopes(&self) -> Vec<String> {
+        let mut scopes = vec![
+            "https://www.googleapis.com/auth/drive.file".to_string(),
+            "https://www.googleapis.com/auth/spreadsheets".to_string(),
+            "https://www.googleapis.com/auth/documents".to_string(),
+            "openid".to_string(),
+            "email".to_string(),
+            "profile".to_string(),
+        ];
+        scopes.extend(self.extra_scopes.clone());
+
+        let mut seen = BTreeSet::new();
+        scopes
+            .into_iter()
+            .filter(|scope| seen.insert(scope.clone()))
+            .collect()
+    }
 }
 
 fn extract_sheet_name(range: &str) -> Option<&str> {

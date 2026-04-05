@@ -2,7 +2,7 @@ use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use reqwest::{blocking::Client as BlockingClient, Method};
+use reqwest::{Client as HttpClient, Method};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -27,7 +27,7 @@ use plugin_generated::swarmclaw_plugin::{
 struct WasmState {
     wasi: WasiCtx,
     capabilities: Vec<String>,
-    http_client: BlockingClient,
+    http_client: HttpClient,
     http_response: Vec<u8>,
 }
 
@@ -277,7 +277,7 @@ fn instantiate(
         WasmState {
             wasi,
             capabilities,
-            http_client: BlockingClient::new(),
+            http_client: HttpClient::new(),
             http_response: Vec::new(),
         },
     );
@@ -368,22 +368,37 @@ fn execute_host_http_request(
 
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("Unsupported HTTP method '{}'", request.method))?;
-    let mut builder = caller.data().http_client.request(method, &request.url);
-    for (name, value) in &request.headers {
-        builder = builder.header(name, value);
-    }
-    if let Some(body) = request.body {
-        builder = builder.body(body);
-    }
+    let client = caller.data().http_client.clone();
+    let url = request.url;
+    let headers = request.headers;
+    let body = request.body;
 
-    let response = builder
-        .send()
-        .with_context(|| format!("Host HTTP request to {} failed", request.url))?;
-    let status = response.status().as_u16() as i32;
-    let body = response
-        .bytes()
-        .context("Failed to read host HTTP response body")?;
-    caller.data_mut().http_response = body.to_vec();
+    let (status, response_body) = tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::try_current()
+            .context("host_http_request requires an active Tokio runtime")?;
+        handle.block_on(async move {
+            let mut builder = client.request(method, &url);
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(body) = body {
+                builder = builder.body(body);
+            }
+
+            let response = builder
+                .send()
+                .await
+                .with_context(|| format!("Host HTTP request to {} failed", url))?;
+            let status = response.status().as_u16() as i32;
+            let body = response
+                .bytes()
+                .await
+                .context("Failed to read host HTTP response body")?;
+            Ok::<(i32, Vec<u8>), anyhow::Error>((status, body.to_vec()))
+        })
+    })?;
+
+    caller.data_mut().http_response = response_body;
     Ok(status)
 }
 

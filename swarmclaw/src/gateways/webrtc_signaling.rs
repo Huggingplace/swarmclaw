@@ -144,6 +144,8 @@ impl ChatGateway for WebRTCSignalingGateway {
                                 // Setup Data Channel handler
                                 let agent_dc = agent_template.clone();
                                 let remote_sender_id = sender_id.to_string();
+                                let tx_ws_data_channel = tx_ws.clone();
+                                let outbound_agent_id = agent_id_clone.clone();
                                 pc_clone.on_data_channel(Box::new(
                                     move |d: Arc<RTCDataChannel>| {
                                         info!("New DataChannel {} {}", d.label(), d.id());
@@ -152,6 +154,8 @@ impl ChatGateway for WebRTCSignalingGateway {
                                         let response_channel = outbound_channel.clone();
                                         let agent_template = agent_dc.clone();
                                         let remote_sender_id = remote_sender_id.clone();
+                                        let tx_ws_channel = tx_ws_data_channel.clone();
+                                        let outbound_agent_id = outbound_agent_id.clone();
                                         Box::pin(async move {
                                             outbound_channel.on_message(Box::new(
                                                 move |msg: DataChannelMessage| {
@@ -166,6 +170,9 @@ impl ChatGateway for WebRTCSignalingGateway {
                                                     let outbound_channel = response_channel.clone();
                                                     let agent_template = agent_template.clone();
                                                     let remote_sender_id = remote_sender_id.clone();
+                                                    let tx_ws_channel = tx_ws_channel.clone();
+                                                    let outbound_agent_id =
+                                                        outbound_agent_id.clone();
 
                                                     Box::pin(async move {
                                                         if msg_str.trim().is_empty() {
@@ -185,10 +192,61 @@ impl ChatGateway for WebRTCSignalingGateway {
                                                             info!("Accepted WebRTC data channel message");
                                                         }
 
+                                                        let parsed_message =
+                                                            serde_json::from_str::<Value>(&msg_str)
+                                                                .ok();
+                                                        let thread_id = parsed_message
+                                                            .as_ref()
+                                                            .and_then(|value| {
+                                                                value.get("thread_id")
+                                                            })
+                                                            .and_then(Value::as_str)
+                                                            .map(ToOwned::to_owned);
+                                                        let reply_to_message_id = parsed_message
+                                                            .as_ref()
+                                                            .and_then(|value| {
+                                                                value.get("message_id")
+                                                            })
+                                                            .and_then(Value::as_str)
+                                                            .map(ToOwned::to_owned);
+                                                        let content = parsed_message
+                                                            .as_ref()
+                                                            .and_then(|value| {
+                                                                value.get("content")
+                                                            })
+                                                            .and_then(Value::as_str)
+                                                            .map(str::to_owned)
+                                                            .unwrap_or_else(|| msg_str.clone());
+                                                        let session_scope = thread_id
+                                                            .clone()
+                                                            .unwrap_or_else(|| {
+                                                                remote_sender_id.clone()
+                                                            });
+                                                        if let (Some(thread_id), Some(message_id)) =
+                                                            (
+                                                                thread_id.clone(),
+                                                                reply_to_message_id.clone(),
+                                                            )
+                                                        {
+                                                            let delivery_event = json!({
+                                                                "type": "agent_message_delivered",
+                                                                "sender_id": outbound_agent_id.clone(),
+                                                                "thread_id": thread_id,
+                                                                "message_id": message_id,
+                                                            });
+                                                            let _ = tx_ws_channel.send(
+                                                                Message::Text(
+                                                                    delivery_event
+                                                                        .to_string()
+                                                                        .into(),
+                                                                ),
+                                                            );
+                                                        }
                                                         let response = match run_webrtc_turn(
                                                             agent_template,
+                                                            &session_scope,
                                                             &remote_sender_id,
-                                                            &msg_str,
+                                                            &content,
                                                         )
                                                         .instrument(request_span)
                                                         .await
@@ -201,6 +259,51 @@ impl ChatGateway for WebRTCSignalingGateway {
                                                                 )
                                                             }
                                                         };
+
+                                                        let response_message_id =
+                                                            Uuid::new_v4().to_string();
+                                                        if let Some(thread_id) = thread_id.clone() {
+                                                            let response_content = response.clone();
+                                                            let outbound_agent_id_for_ws =
+                                                                outbound_agent_id.clone();
+                                                            let outbound_agent_id_for_dc =
+                                                                outbound_agent_id.clone();
+                                                            let response_event = json!({
+                                                                "type": "agent_message_reply",
+                                                                "sender_id": outbound_agent_id_for_ws,
+                                                                "thread_id": thread_id,
+                                                                "message_id": response_message_id.clone(),
+                                                                "in_reply_to_message_id": reply_to_message_id,
+                                                                "content": response_content.clone(),
+                                                            });
+                                                            let _ = tx_ws_channel.send(
+                                                                Message::Text(
+                                                                    response_event
+                                                                        .to_string()
+                                                                        .into(),
+                                                                ),
+                                                            );
+                                                            if let Err(error) = outbound_channel
+                                                                .send_text(
+                                                                    json!({
+                                                                        "type": "agent_message_reply",
+                                                                        "id": response_message_id,
+                                                                        "thread_id": thread_id,
+                                                                        "reply_to_message_id": reply_to_message_id,
+                                                                        "sender_id": outbound_agent_id_for_dc,
+                                                                        "content": response_content,
+                                                                    })
+                                                                    .to_string(),
+                                                                )
+                                                                .await
+                                                            {
+                                                                error!(
+                                                                    "Failed to send DataChannel response: {}",
+                                                                    error
+                                                                );
+                                                            }
+                                                            return;
+                                                        }
 
                                                         if let Err(error) = outbound_channel
                                                             .send_text(response)
@@ -252,12 +355,77 @@ impl ChatGateway for WebRTCSignalingGateway {
                                 }
                             }
                         }
+                        "direct_message_delivery" => {
+                            if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
+                                info!("Received direct ClawNet delivery on WebRTC: {}", content);
+
+                                let content_owned = content.to_string();
+                                let sender_id_owned = sender_id.to_string();
+                                let thread_id = parsed
+                                    .get("thread_id")
+                                    .and_then(|value| value.as_str())
+                                    .map(ToOwned::to_owned);
+                                let reply_to_message_id = parsed
+                                    .get("message_id")
+                                    .and_then(|value| value.as_str())
+                                    .map(ToOwned::to_owned);
+                                let agent_template = agent_template.clone();
+                                let tx_ws_clone = tx_ws.clone();
+                                let aid = self.agent_id.clone();
+                                let request_span = info_span!(
+                                    "gateway_ingress",
+                                    request_id = %format!("webrtc-{}", Uuid::new_v4()),
+                                    platform = "webrtc",
+                                    transport = "direct_delivery",
+                                    sender_id = %sender_id_owned,
+                                    payload_bytes = content_owned.len()
+                                );
+
+                                tokio::spawn(
+                                    async move {
+                                        if content_owned.trim().is_empty() {
+                                            return;
+                                        }
+
+                                        let session_scope = thread_id
+                                            .clone()
+                                            .unwrap_or_else(|| sender_id_owned.clone());
+                                        let response_text = match run_webrtc_turn(
+                                            agent_template,
+                                            &session_scope,
+                                            &sender_id_owned,
+                                            &content_owned,
+                                        )
+                                        .await
+                                        {
+                                            Ok(response) => response,
+                                            Err(error) => format!("SwarmClaw error: {}", error),
+                                        };
+
+                                        let response = json!({
+                                            "type": "agent_message_reply",
+                                            "sender_id": aid,
+                                            "thread_id": thread_id,
+                                            "in_reply_to_message_id": reply_to_message_id,
+                                            "content": response_text
+                                        });
+                                        let _ = tx_ws_clone
+                                            .send(Message::Text(response.to_string().into()));
+                                    }
+                                    .instrument(request_span),
+                                );
+                            }
+                        }
                         "message" => {
                             if let Some(content) = parsed.get("content").and_then(|c| c.as_str()) {
                                 info!("Received legacy WS message on WebRTC: {}", content);
 
                                 let content_owned = content.to_string();
                                 let sender_id_owned = sender_id.to_string();
+                                let thread_id = parsed
+                                    .get("thread_id")
+                                    .and_then(|value| value.as_str())
+                                    .map(ToOwned::to_owned);
                                 let agent_template = agent_template.clone();
                                 let tx_ws_clone = tx_ws.clone();
                                 let aid = self.agent_id.clone();
@@ -281,8 +449,12 @@ impl ChatGateway for WebRTCSignalingGateway {
                                             return;
                                         }
 
+                                        let session_scope = thread_id
+                                            .clone()
+                                            .unwrap_or_else(|| sender_id_owned.clone());
                                         let response_text = match run_webrtc_turn(
                                             agent_template,
+                                            &session_scope,
                                             &sender_id_owned,
                                             &content_owned,
                                         )
@@ -329,10 +501,11 @@ impl ChatGateway for WebRTCSignalingGateway {
 
 async fn run_webrtc_turn(
     agent_template: Arc<Agent>,
+    session_scope: &str,
     sender_id: &str,
     input: &str,
 ) -> Result<String> {
-    let session_id = format!("webrtc-{}", normalize_webrtc_sender_id(sender_id));
+    let session_id = format!("webrtc-{}", normalize_webrtc_sender_id(session_scope));
     let mut agent = agent_template.spawn_session(session_id);
     let history_len = agent.state.history.len();
 
