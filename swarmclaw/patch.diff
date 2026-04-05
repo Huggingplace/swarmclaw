@@ -1,0 +1,151 @@
+--- src/skills/browser.rs
++++ src/skills/browser.rs
+@@ -90,14 +90,6 @@
+                 None => browser.new_tab()?,
+             };
+ 
+-            if action == "screenshot_window" {
+-                let out_path = args
+-                    .get("out_path")
+-                    .and_then(|v| v.as_str())
+-                    .unwrap_or("chrome_window_screenshot.png");
+-                let png = tab.capture_screenshot(
+-                    headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
+-                    None,
+-                    None,
+-                    true,
+-                )?;
+-                std::fs::write(out_path, png)?;
+-                return Ok(format!("Screenshot of Chrome window saved to {}", out_path));
+-            }
+-
+-            if action == "dispatch_mouse" {
+-                let mouse_action = args
+-                    .get("mouse_action")
+-                    .and_then(|v| v.as_str())
+-                    .unwrap_or("click");
+-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+-                let point = headless_chrome::browser::tab::point::Point { x, y };
+-
+-                match mouse_action {
+-                    "click" => {
+-                        tab.click_point(point)?;
+-                    }
+-                    "move" => {
+-                        tab.move_mouse_to_point(point)?;
+-                    }
+-                    "down" => {
+-                        // Headless chrome doesn't have a distinct mouse down, fallback to click
+-                        tab.click_point(point)?;
+-                    }
+-                    _ => {}
+-                }
+-                return Ok(format!(
+-                    "Dispatched virtual mouse {} at ({}, {}) in Chrome",
+-                    mouse_action, x, y
+-                ));
+-            }
+-
+-            match action {
++            let result_msg = match action {
++                "screenshot_window" => {
++                    "Manual screenshot captured".to_string()
++                }
++                "dispatch_mouse" => {
++                    let mouse_action = args
++                        .get("mouse_action")
++                        .and_then(|v| v.as_str())
++                        .unwrap_or("click");
++                    let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
++                    let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
++                    let point = headless_chrome::browser::tab::point::Point { x, y };
++    
++                    match mouse_action {
++                        "click" => tab.click_point(point)?,
++                        "move" => tab.move_mouse_to_point(point)?,
++                        "down" => tab.click_point(point)?,
++                        _ => {}
++                    }
++                    format!("Dispatched virtual mouse {} at ({}, {}) in Chrome", mouse_action, x, y)
++                }
+                 "navigate" => {
+                     let url = args
+@@ -143,7 +135,7 @@
+                     tab.navigate_to(url)?;
+                     tab.wait_for_element("body")?;
+-                    Ok(format!("Successfully navigated to {}", url))
++                    format!("Successfully navigated to {}", url)
+                 }
+                 "get_content" => {
+                     let selector = args
+@@ -151,7 +143,7 @@
+                         .unwrap_or("body");
+                     let elem = tab.wait_for_element(selector)?;
+                     let text = elem.get_inner_text()?;
+-                    Ok(format!("Content of '{}':\n{}", selector, text))
++                    return Ok(format!("Content of '{}':\n{}", selector, text)); // Return early, no need for screenshot
+                 }
+                 "click" => {
+                     let selector = args
+@@ -160,10 +152,7 @@
+                     let elem = tab.wait_for_element(selector)?;
+                     // Execute silent JS click to avoid focus stealing
+                     elem.call_js_fn("function() { this.click(); }", vec![], false)?;
+-                    Ok(format!(
+-                        "Successfully clicked element '{}' via JS",
+-                        selector
+-                    ))
++                    format!("Successfully clicked element '{}' via JS", selector)
+                 }
+                 "type" => {
+                     let selector = args
+@@ -185,7 +174,7 @@
+                     );
+ 
+                     elem.call_js_fn(&script, vec![], false)?;
+-                    Ok(format!("Successfully typed into '{}' via JS", selector))
++                    format!("Successfully typed into '{}' via JS", selector)
+                 }
+                 "move_window" => {
+                     let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+@@ -199,18 +188,32 @@
+                         width: Some(width as f64),
+                         height: Some(height as f64),
+                     })?;
+-                    Ok(format!(
+-                        "Moved Chrome window to x:{}, y:{}, w:{}, h:{}",
+-                        x, y, width, height
+-                    ))
++                    format!("Moved Chrome window to x:{}, y:{}, w:{}, h:{}", x, y, width, height)
+                 }
+                 "close" => {
+-                    // Close happens automatically when browser drops, but we can explicitly close tabs
+-                    Ok("Chrome session closed successfully".to_string())
++                    return Ok("Chrome session closed successfully".to_string());
+                 }
+                 _ => {
+                     anyhow::bail!("Unknown action: {}", action);
+                 }
+-            }
++            };
++            
++            // Automatically take screenshot for mutating actions
++            let out_path = args
++                .get("out_path")
++                .and_then(|v| v.as_str())
++                .unwrap_or("chrome_window_screenshot.png");
++                
++            if let Ok(png) = tab.capture_screenshot(
++                headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
++                None,
++                None,
++                true,
++            ) {
++                let _ = std::fs::write(out_path, png);
++                Ok(format!("{}\n(Auto-screenshot saved to {})", result_msg, out_path))
++            } else {
++                Ok(result_msg)
++            }
+         }
+         #[cfg(not(feature = "headless_chrome"))]
