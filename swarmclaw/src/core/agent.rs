@@ -335,6 +335,7 @@ impl Agent {
                         return Ok(None);
                     }
                     KeyCode::Enter => {
+                        if input.trim().is_empty() { return Ok(Some(input)); }
                         write_cli_line(stdout, "")?;
                         if record_history && !input.trim().is_empty() {
                             history.push(input.clone());
@@ -436,6 +437,18 @@ impl Agent {
                     continue;
                 }
 
+                if input.starts_with("/key") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let new_key = parts[1].trim().to_string();
+                        self.llm.update_api_key(new_key);
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), "API key updated successfully.".truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    } else {
+                        write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /key <your-api-key>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                    }
+                    continue;
+                }
+
                 if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
                     break;
                 }
@@ -478,7 +491,7 @@ impl Agent {
                     });
                     info!("CLI turn started");
                 }
-
+                write_cli_line(&mut stdout, "")?;
                 let mut turn_failed = false;
                 while let Err(e) = self.respond(None).instrument(turn_span.clone()).await {
                     if self.llm.is_auth_error(&e) {
@@ -822,7 +835,7 @@ impl Agent {
                             current_tool_name.clear();
                         }
                         if cli_mode {
-                            println!();
+                            write_cli_line(&mut stdout, "")?;
                         }
                         debug!(
                             assistant_chars = full_content.len(),
@@ -1058,11 +1071,11 @@ impl Agent {
             let tools = prepared.tools;
 
             if let Some(notice) = prepared.disabled_tool_notice {
-                println!(
+                write_cli_line(&mut stdout, format!(
                     "{} {}",
                     cli_chip("LIMITED", CLI_DEEP_RGB, CLI_AMBER_RGB),
                     notice.truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2),
-                );
+                ))?;
                 apply_cli_palette(&mut stdout)?;
             }
 
@@ -1078,7 +1091,7 @@ impl Agent {
                     if let Some(content) = &response.content {
                         if !content.is_empty() {
                             let redacted_content = Redactor::redact(content);
-                            println!(
+                            write_cli_line(&mut stdout, format!(
                                 "{} {}",
                                 cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB),
                                 redacted_content.truecolor(
@@ -1086,7 +1099,7 @@ impl Agent {
                                     CLI_FG_RGB.1,
                                     CLI_FG_RGB.2
                                 ),
-                            );
+                            ))?;
                             apply_cli_palette(&mut stdout)?;
 
                             let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
@@ -1124,7 +1137,7 @@ impl Agent {
                         }
 
                         for tc in tool_calls {
-                            println!(
+                            write_cli_line(&mut stdout, format!(
                                 "{} {} {}",
                                 cli_chip("TOOL", CLI_FG_RGB, CLI_BORDER_RGB),
                                 tc.name
@@ -1135,7 +1148,7 @@ impl Agent {
                                     CLI_MUTED_RGB.1,
                                     CLI_MUTED_RGB.2
                                 ),
-                            );
+                            ))?;
                             apply_cli_palette(&mut stdout)?;
 
                             let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
@@ -1156,7 +1169,7 @@ impl Agent {
 
                             // Redact tool results
                             let redacted_result = Redactor::redact(&result);
-                            println!(
+                            write_cli_line(&mut stdout, format!(
                                 "{} {}",
                                 cli_chip("RESULT", CLI_FG_RGB, CLI_RESULT_RGB),
                                 redacted_result.truecolor(
@@ -1164,7 +1177,7 @@ impl Agent {
                                     CLI_MUTED_RGB.1,
                                     CLI_MUTED_RGB.2
                                 ),
-                            );
+                            ))?;
                             apply_cli_palette(&mut stdout)?;
 
                             self.record_message(Message {
@@ -1184,7 +1197,7 @@ impl Agent {
                 Err(e) => {
                     print!("\r\x1b[K");
                     stdout.flush()?;
-                    eprintln!("Error: {}", e);
+                    write_cli_line(&mut stdout, format!("Error: {}", e))?;
                     break;
                 }
             }
@@ -1470,14 +1483,14 @@ fn paint_cli_viewport(stdout: &mut io::Stdout) -> io::Result<()> {
 }
 
 fn write_cli(stdout: &mut io::Stdout, content: impl Display) -> io::Result<()> {
-    write!(stdout, "{content}")?;
+    let safe_content = content.to_string().replace("\r\n", "\n").replace("\n", "\r\n"); write!(stdout, "{safe_content}")?;
     apply_cli_palette(stdout)
 }
 
 fn write_cli_line(stdout: &mut io::Stdout, content: impl Display) -> io::Result<()> {
-    write!(stdout, "{content}")?;
+    let safe_content = content.to_string().replace("\r\n", "\n").replace("\n", "\r\n"); write!(stdout, "{safe_content}")?;
     execute!(stdout, Clear(ClearType::UntilNewLine))?;
-    writeln!(stdout)?;
+    write!(stdout, "\r\n")?;
     apply_cli_palette(stdout)
 }
 

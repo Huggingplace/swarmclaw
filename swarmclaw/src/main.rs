@@ -266,6 +266,7 @@ fn init_tracing(verbose: bool) {
         } else {
             FmtSpan::CLOSE
         })
+        .with_writer(|| std::fs::OpenOptions::new().create(true).append(true).open("swarmclaw.log").unwrap())
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 }
@@ -940,7 +941,7 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
         }
     }
 
-    let mut agent = Agent::new(agent_id.to_string(), config, llm_provider)
+    let mut agent = Agent::new(agent_id.to_string(), config.clone(), llm_provider)
         .with_state_path(session_state_path(&workspace_path, &agent_id))
         .with_workspace_root(workspace_path.clone());
 
@@ -955,8 +956,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     info!("Adding FileSystem skill...");
     agent.add_skill(Arc::new(FileSystemSkill::new(workspace_path.clone())));
 
-    info!("Adding Analytics skill...");
-    agent.add_skill(Arc::new(AnalyticsSkill::new(workspace_path.clone())));
+    if config.enable_analytics.unwrap_or(true) {
+        info!("Adding Analytics skill...");
+        agent.add_skill(Arc::new(AnalyticsSkill::new(workspace_path.clone())));
+    }
 
     info!("Adding Shell skill...");
 
