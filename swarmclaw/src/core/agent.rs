@@ -1854,7 +1854,10 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                     let mut skin = termimad::MadSkin::default();
                     let (r, g, b) = CLI_FG_RGB;
                     skin.set_fg(crossterm::style::Color::Rgb { r, g, b });
-                    let _ = skin.write_text_on(stdout, &message.content);
+                    let rendered = format!("{}", skin.term_text(&message.content));
+                    let safe_content = rendered.replace("\r\n", "\n").replace("\n", "\r\n");
+                    let _ = write!(stdout, "{}", safe_content);
+                    let _ = stdout.flush();
                     write_cli(stdout, "\r\n")?;
                 }
 
