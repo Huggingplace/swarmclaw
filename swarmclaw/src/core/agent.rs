@@ -22,7 +22,7 @@ use crossterm::{
 };
 use futures::StreamExt;
 use std::fmt::Display;
-use std::io::{self, Write};
+use std::io::{self, Write, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -855,8 +855,8 @@ impl Agent {
         let cli_mode = channel_info.is_none();
 
         loop {
-            if cli_mode {
-                drain_resize_events(self, &mut stdout)?;
+            if std::io::stdout().is_terminal() {
+                drain_resize_events(self, &mut stdout, "")?;
             }
             debug!(
                 history_len = self.state.history.len(),
@@ -983,7 +983,7 @@ impl Agent {
 ");
                             let _ = write!(stdout, "{}", safe_delta);
                             let _ = stdout.flush();
-                            let _ = drain_resize_events(self, &mut stdout);
+                            let _ = drain_resize_events(self, &mut stdout, &full_content);
                         }
                     }
                     Ok(ChatChunk::ToolCallStart {
@@ -1391,6 +1391,12 @@ impl Agent {
             self.log_analytics_turn().await;
         }
 
+        // Final redraw to apply termimad formatting to the completed message
+        if std::io::stdout().is_terminal() {
+            let mut stdout = io::stdout();
+            let _ = self.redraw_cli_screen(&mut stdout);
+        }
+
         Ok(())
     }
 
@@ -1543,10 +1549,24 @@ fn seeded_state(config: &AgentConfig) -> State {
     state
 }
 
-fn drain_resize_events(agent: &Agent, stdout: &mut io::Stdout) -> io::Result<()> {
+fn drain_resize_events(agent: &Agent, stdout: &mut io::Stdout, active_content: &str) -> io::Result<()> {
     while event::poll(Duration::from_millis(0))? {
         if let Event::Resize(_, _) = event::read()? {
             agent.redraw_cli_screen(stdout)?;
+            if !active_content.is_empty() {
+                write_cli(
+                    stdout,
+                    format!("{} 
+", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB))
+                )?;
+                let safe_content = active_content.replace("
+", "
+").replace("
+", "
+");
+                let _ = write!(stdout, "{}", safe_content);
+                let _ = stdout.flush();
+            }
         }
     }
 
