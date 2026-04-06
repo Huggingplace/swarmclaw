@@ -55,24 +55,31 @@ impl ProviderKind {
         }
     }
 
-    fn infer_from_env() -> Option<Self> {
-        if env::var("OPENAI_API_KEY").is_ok() {
-            Some(Self::OpenAI)
-        } else if env::var("GROQ_API_KEY").is_ok() {
-            Some(Self::Groq)
-        } else if env::var("XAI_API_KEY").is_ok() || env::var("GROK_API_KEY").is_ok() {
-            Some(Self::Grok)
-        } else if env::var("ANTHROPIC_API_KEY").is_ok() {
-            Some(Self::Anthropic)
-        } else if env::var("GEMINI_API_KEY").is_ok() {
-            Some(Self::Gemini)
-        } else if env::var("OLLAMA_HOST").is_ok() {
-            Some(Self::Ollama)
-        } else if env::var("API_KEY").is_ok() {
-            Some(Self::OpenAI)
-        } else {
-            None
+        fn infer_from_env(model_hint: Option<&str>) -> Option<Self> {
+        // If a model is specified in config, try to infer provider from it first
+        if let Some(model) = model_hint {
+            let m = model.to_lowercase();
+            if m.contains("gpt") || m.contains("o1") { return Some(Self::OpenAI); }
+            if m.contains("claude") || m.contains("anthropic") { return Some(Self::Anthropic); }
+            if m.contains("gemini") { return Some(Self::Gemini); }
+            if m.contains("llama") || m.contains("mixtral") || m.contains("mistral") {
+                 // Check if local Ollama is likely
+                 if env::var("OLLAMA_HOST").is_ok() { return Some(Self::Ollama); }
+                 // Otherwise maybe Groq?
+                 if env::var("GROQ_API_KEY").is_ok() { return Some(Self::Groq); }
+            }
         }
+
+        let is_set = |name| env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false);
+
+        if is_set("GEMINI_API_KEY") { return Some(Self::Gemini); }
+        if is_set("ANTHROPIC_API_KEY") { return Some(Self::Anthropic); }
+        if is_set("OPENAI_API_KEY") { return Some(Self::OpenAI); }
+        if is_set("GROQ_API_KEY") { return Some(Self::Groq); }
+        if is_set("XAI_API_KEY") || is_set("GROK_API_KEY") { return Some(Self::Grok); }
+        if is_set("OLLAMA_HOST") { return Some(Self::Ollama); }
+        
+        None
     }
 
     fn from_prompt_choice(choice: &str) -> Option<Self> {
@@ -229,7 +236,7 @@ fn print_status(workspace: Option<String>) -> anyhow::Result<()> {
     let workspace_path = resolve_workspace_path(workspace);
     let agents_path = workspace_path.join("AGENTS.md");
     let provider = ProviderKind::configured()?
-        .or_else(ProviderKind::infer_from_env)
+        .or_else(|| ProviderKind::infer_from_env(None))
         .map(|kind| kind.display_name().to_string())
         .unwrap_or_else(|| "unconfigured".to_string());
 
@@ -591,7 +598,7 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     // LLM Setup
     let provider = if let Some(provider) = ProviderKind::configured()? {
         provider
-    } else if let Some(provider) = ProviderKind::infer_from_env() {
+    } else if let Some(provider) = ProviderKind::infer_from_env(config.model.as_deref()) {
         provider
     } else if !interactive {
         anyhow::bail!(
@@ -651,8 +658,9 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
             std::io::stdout().flush().unwrap();
 
             let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_err() {
-                continue;
+            let bytes_read = std::io::stdin().read_line(&mut input).unwrap_or(0);
+            if bytes_read == 0 {
+                anyhow::bail!("Input stream closed unexpectedly (EOF). SwarmClaw requires an interactive terminal for initial setup, or you must provide all required configuration via environment variables (e.g. LLM_PROVIDER, *_API_KEY).");
             }
 
             if let Some(provider) = ProviderKind::from_prompt_choice(input.trim()) {
@@ -690,9 +698,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
         std::io::stdout().flush().unwrap();
 
         let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            continue;
-        }
+        let bytes_read = std::io::stdin().read_line(&mut input).unwrap_or(0);
+            if bytes_read == 0 {
+                anyhow::bail!("Input stream closed unexpectedly (EOF). SwarmClaw requires an interactive terminal for initial setup, or you must provide all required configuration via environment variables (e.g. LLM_PROVIDER, *_API_KEY).");
+            }
         api_key = input.trim().to_string();
 
         if api_key.is_empty() {
@@ -727,9 +736,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                 std::io::stdout().flush().unwrap();
 
                 let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_err() {
-                    continue;
-                }
+                let bytes_read = std::io::stdin().read_line(&mut input).unwrap_or(0);
+            if bytes_read == 0 {
+                anyhow::bail!("Input stream closed unexpectedly (EOF). SwarmClaw requires an interactive terminal for initial setup, or you must provide all required configuration via environment variables (e.g. LLM_PROVIDER, *_API_KEY).");
+            }
 
                 let choice = input.trim();
                 if choice.is_empty() {
@@ -818,9 +828,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                 );
                 std::io::stdout().flush().unwrap();
                 let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_err() {
-                    continue;
-                }
+                let bytes_read = std::io::stdin().read_line(&mut input).unwrap_or(0);
+            if bytes_read == 0 {
+                anyhow::bail!("Input stream closed unexpectedly (EOF). SwarmClaw requires an interactive terminal for initial setup, or you must provide all required configuration via environment variables (e.g. LLM_PROVIDER, *_API_KEY).");
+            }
 
                 let choice = input.trim().to_lowercase();
                 if choice == "y" || choice == "yes" {
@@ -836,9 +847,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                         );
                         std::io::stdout().flush().unwrap();
                         let mut email_input = String::new();
-                        if std::io::stdin().read_line(&mut email_input).is_err() {
-                            continue;
-                        }
+                        let bytes_read = std::io::stdin().read_line(&mut email_input).unwrap_or(0);
+            if bytes_read == 0 {
+                anyhow::bail!("Input stream closed unexpectedly (EOF). SwarmClaw requires an interactive terminal for initial setup, or you must provide all required configuration via environment variables (e.g. LLM_PROVIDER, *_API_KEY).");
+            }
 
                         let email = email_input.trim();
                         if !email.is_empty() && email.contains("@") {
