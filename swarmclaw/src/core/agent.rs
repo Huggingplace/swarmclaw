@@ -965,29 +965,24 @@ impl Agent {
             let mut current_tool_args = String::new();
             let mut current_thought_signature: Option<String> = None;
 
-            let mut previous_lines_count: u16 = 0;
+            
 
+            if cli_mode {
+                let chip = format!("{} \r\n", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB));
+                let _ = write!(stdout, "{}", chip);
+                let _ = stdout.flush();
+            }
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(ChatChunk::Content(delta)) => {
                         full_content.push_str(&delta);
                         if cli_mode {
-                            if previous_lines_count > 0 {
-                                let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                                let move_up = previous_lines_count.min(rows - 1);
-                                let _ = crossterm::execute!(stdout, crossterm::cursor::MoveUp(move_up), crossterm::cursor::MoveToColumn(0), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown));
-                            }
-                            let mut skin = termimad::MadSkin::default();
-                            let (r, g, b) = CLI_FG_RGB;
-                            skin.set_fg(crossterm::style::Color::Rgb { r, g, b });
-                            let rendered = format!("{}", skin.term_text(&full_content));
-                            let safe_content = rendered.replace("\r\n", "\n").replace("\n", "\r\n");
-                            let chip = format!("{} \r\n", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB));
-                            let total_output = format!("{}{}", chip, safe_content);
-                            let lines = total_output.lines().count() as u16;
-                            let _ = write!(stdout, "{}", total_output);
+                            // Print delta directly to avoid terminal wrapping/MoveUp bugs
+                            let safe_delta = delta.replace("
+", "
+");
+                            let _ = write!(stdout, "{}", safe_delta);
                             let _ = stdout.flush();
-                            previous_lines_count = lines;
                             let _ = drain_resize_events(self, &mut stdout);
                         }
                     }
