@@ -231,6 +231,86 @@ impl Tool for TranscribeAudioTool {
 
 // --- Media Skill ---
 
+
+// --- Vision (Analyze Image) Tool ---
+
+#[derive(Clone)]
+pub struct AnalyzeImageTool;
+
+#[async_trait]
+impl Tool for AnalyzeImageTool {
+    fn name(&self) -> &str {
+        "analyze_image"
+    }
+
+    fn description(&self) -> &str {
+        "Analyzes an image file on disk using a Vision model and returns a detailed textual description of its contents. Useful after capture_screen."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The absolute or relative path to the image file (e.g. PNG or JPG)." },
+                "prompt": { "type": "string", "description": "Specific questions to ask about the image, e.g., 'What city is shown on the map?'" }
+            },
+            "required": ["path", "prompt"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let path = args.get("path").and_then(|v| v.as_str()).context("Missing path")?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).context("Missing prompt")?;
+        
+        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| std::env::var("API_KEY").unwrap_or_default());
+        if api_key.is_empty() {
+            anyhow::bail!("GEMINI_API_KEY environment variable is required to analyze images.");
+        }
+
+        let img_bytes = std::fs::read(path).context("Failed to read image file")?;
+        let base64_img = base64::encode(&img_bytes);
+        
+        let mime_type = if path.to_lowercase().ends_with(".png") { "image/png" } else { "image/jpeg" };
+
+        let payload = serde_json::json!({
+            "contents": [{
+                "parts": [
+                    { "text": prompt },
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64_img
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
+        
+        let res = client.post(&url)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            anyhow::bail!("Vision API failed with status {}: {}", status, text);
+        }
+
+        let json: Value = res.json().await?;
+        
+        if let Some(text) = json.pointer("/candidates/0/content/parts/0/text").and_then(|v| v.as_str()) {
+            Ok(text.to_string())
+        } else {
+            Ok(format!("Received response, but could not parse text: {}", json))
+        }
+    }
+}
+
 pub struct MediaSkill {
     tools: Vec<Arc<dyn Tool>>,
 }
@@ -243,6 +323,7 @@ impl MediaSkill {
                 Arc::new(CaptureScreenTool),
                 Arc::new(SynthesizeSpeechTool),
                 Arc::new(TranscribeAudioTool),
+                Arc::new(AnalyzeImageTool),
             ],
         }
     }
