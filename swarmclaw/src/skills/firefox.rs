@@ -38,6 +38,16 @@ impl FirefoxDriverTool {
         std::fs::create_dir_all(&profile_path)
             .context("Failed to create firefox profile directory")?;
 
+        // Pre-flight check: Kill any orphaned Firefox processes holding this profile lock
+        // Otherwise, Geckodriver will throw HTTP 500 (Process unexpectedly closed with status 0)
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg(&profile_path)
+            .output();
+        
+        // Brief pause to allow OS to clean up the process and release .parentlock
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
         // Instruct Firefox to use our persistent profile
         caps.add_arg("-profile").map_err(|e| anyhow::anyhow!(e))?;
         caps.add_arg(&profile_path)

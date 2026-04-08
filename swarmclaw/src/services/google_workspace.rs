@@ -1317,7 +1317,7 @@ async fn dispatch_mcp(state: &GoogleWorkspaceState, request: JsonRpcRequest) -> 
                 },
                 {
                     "name": "update_google_sheet_values",
-                    "description": "Overwrite a concrete A1 range inside a previously bound spreadsheet alias.",
+                    "description": "Overwrite a concrete A1 range inside a previously bound spreadsheet alias. Formulas (e.g. =HYPERLINK) are supported when valueInputOption is USER_ENTERED (default). WARNING: Ensure the target range exists within the sheet's current bounds (max rows/cols), otherwise it will fail with an exceeds grid limits error.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["alias", "range", "values"],
@@ -1325,19 +1325,39 @@ async fn dispatch_mcp(state: &GoogleWorkspaceState, request: JsonRpcRequest) -> 
                             "alias": { "type": "string" },
                             "range": { "type": "string" },
                             "values": {
-                                "type": "array",
+                                "description": "A 2D array of values (rows of columns), a 1D array (single row), or a single primitive value.",
+                                "type": ["array", "string", "number", "boolean", "null"],
                                 "items": { "type": "array", "items": {} }
                             },
                             "valueInputOption": {
                                 "type": "string",
-                                "enum": ["RAW", "USER_ENTERED"]
+                                "enum": ["RAW", "USER_ENTERED"],
+                                "default": "USER_ENTERED"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "update_google_sheet_cell",
+                    "description": "Update a single cell in a previously bound spreadsheet alias. Supports formulas. WARNING: Ensure the cell exists within current sheet bounds.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["alias", "range", "value"],
+                        "properties": {
+                            "alias": { "type": "string" },
+                            "range": { "type": "string", "description": "A single cell A1 range, e.g. Sheet1!A1" },
+                            "value": { "description": "The value or formula to insert." },
+                            "valueInputOption": {
+                                "type": "string",
+                                "enum": ["RAW", "USER_ENTERED"],
+                                "default": "USER_ENTERED"
                             }
                         }
                     }
                 },
                 {
                     "name": "batch_update_google_sheet_values",
-                    "description": "Write multiple A1 ranges in a previously bound spreadsheet alias with one request.",
+                    "description": "Write multiple A1 ranges in a previously bound spreadsheet alias with one request. Formulas are supported. WARNING: Ensure ranges do not exceed current grid limits.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["alias", "data"],
@@ -1345,7 +1365,8 @@ async fn dispatch_mcp(state: &GoogleWorkspaceState, request: JsonRpcRequest) -> 
                             "alias": { "type": "string" },
                             "valueInputOption": {
                                 "type": "string",
-                                "enum": ["RAW", "USER_ENTERED"]
+                                "enum": ["RAW", "USER_ENTERED"],
+                                "default": "USER_ENTERED"
                             },
                             "data": {
                                 "type": "array",
@@ -1355,8 +1376,8 @@ async fn dispatch_mcp(state: &GoogleWorkspaceState, request: JsonRpcRequest) -> 
                                     "properties": {
                                         "range": { "type": "string" },
                                         "values": {
-                                            "type": "array",
-                                            "items": { "type": "array", "items": {} }
+                                            "description": "A 2D array, 1D array, or a single primitive value.",
+                                            "type": ["array", "string", "number", "boolean", "null"]
                                         }
                                     }
                                 }
@@ -1772,7 +1793,7 @@ async fn execute_google_tool(
                 optional_string(&args, "valueInputOption").unwrap_or("USER_ENTERED");
             let insert_data_option =
                 optional_string(&args, "insertDataOption").unwrap_or("INSERT_ROWS");
-            let values = args.get("values").cloned().context("Missing values")?;
+            let values = normalize_sheet_values(args.get("values").cloned().context("Missing values")?);
             let encoded_range = encode_sheet_range(range);
             let url = format!(
                 "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption={}&insertDataOption={}",
@@ -1798,7 +1819,31 @@ async fn execute_google_tool(
             let token = refresh_google_access_token(state, &account.refresh_token).await?;
             let value_input_option =
                 optional_string(&args, "valueInputOption").unwrap_or("USER_ENTERED");
-            let values = args.get("values").cloned().context("Missing values")?;
+            let values = normalize_sheet_values(args.get("values").cloned().context("Missing values")?);
+            let encoded_range = encode_sheet_range(range);
+            let url = format!(
+                "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption={}",
+                binding.spreadsheet_id, encoded_range, value_input_option,
+            );
+            google_put_json(
+                state,
+                &token.access_token,
+                &url,
+                &json!({ "range": range, "majorDimension": "ROWS", "values": values }),
+            )
+            .await
+        }
+        "update_google_sheet_cell" => {
+            let alias = required_string(&args, "alias")?;
+            let range = required_string(&args, "range")?;
+            let binding = require_binding_for_alias(state, alias).await?;
+            enforce_binding_range_policy(&binding, range)?;
+            let account = require_google_account(state).await?;
+            let token = refresh_google_access_token(state, &account.refresh_token).await?;
+            let value_input_option =
+                optional_string(&args, "valueInputOption").unwrap_or("USER_ENTERED");
+            let value = args.get("value").cloned().context("Missing value")?;
+            let values = json!([[value]]);
             let encoded_range = encode_sheet_range(range);
             let url = format!(
                 "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption={}",
@@ -1815,17 +1860,21 @@ async fn execute_google_tool(
         "batch_update_google_sheet_values" => {
             let alias = required_string(&args, "alias")?;
             let binding = require_binding_for_alias(state, alias).await?;
-            let data = args
+            let mut data = args
                 .get("data")
                 .cloned()
                 .context("Missing data payload for batch update")?;
-            if let Some(items) = data.as_array() {
+            
+            if let Some(items) = data.as_array_mut() {
                 for item in items {
                     let range = item
                         .get("range")
                         .and_then(Value::as_str)
                         .context("Each batch update range requires a range string")?;
                     enforce_binding_range_policy(&binding, range)?;
+                    if let Some(values) = item.get_mut("values") {
+                        *values = normalize_sheet_values(values.clone());
+                    }
                 }
             }
             let account = require_google_account(state).await?;
@@ -1845,6 +1894,21 @@ async fn execute_google_tool(
             .await
         }
         other => bail!("Unsupported Google Workspace tool: {}", other),
+    }
+}
+
+fn normalize_sheet_values(values: Value) -> Value {
+    match values {
+        Value::Array(items) => {
+            if items.iter().all(|item| !item.is_array()) {
+                // Wrap 1D array into 2D (a single row)
+                Value::Array(vec![Value::Array(items)])
+            } else {
+                Value::Array(items)
+            }
+        }
+        // Wrap single value into 2D array
+        other => Value::Array(vec![Value::Array(vec![other])]),
     }
 }
 

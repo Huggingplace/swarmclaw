@@ -960,8 +960,17 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     // Inject HuggingPlace Memory if enabled
     if use_memory && !memory_api_key.is_empty() {
         let org_id = "default-org".to_string();
-        agent = agent.with_memory(org_id, memory_api_key);
+        agent = agent.with_memory(org_id.clone(), memory_api_key.clone());
         info!("HuggingPlace Memory context injection enabled.");
+
+        // Add explicit memory tools
+        use swarmclaw::skills::memory::MemorySkill;
+        agent.add_skill(Arc::new(MemorySkill::new(
+            agent_id.to_string(),
+            Some(org_id),
+            Some(memory_api_key),
+            workspace_path.clone(),
+        )));
     }
 
     // Add Native Skills
@@ -976,6 +985,10 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
     info!("Adding Shell skill...");
 
     agent.add_skill(Arc::new(ShellSkill::new()));
+
+    info!("Adding Desktop skill...");
+    use swarmclaw::skills::desktop::DesktopSkill;
+    agent.add_skill(Arc::new(DesktopSkill::new()));
 
     // Add Browser Skill
 

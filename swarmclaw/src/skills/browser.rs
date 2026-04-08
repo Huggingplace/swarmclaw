@@ -8,6 +8,80 @@ use serde_json::Value;
 use std::process::Command;
 use std::sync::Arc;
 
+// --- Active Chrome JS Tool (macOS specific) ---
+
+#[derive(Clone)]
+pub struct ActiveChromeJsTool;
+
+#[async_trait]
+impl Tool for ActiveChromeJsTool {
+    fn name(&self) -> &str {
+        "execute_active_chrome_javascript"
+    }
+
+    fn description(&self) -> &str {
+        "Executes raw JavaScript on the currently active tab of the user's already open Google Chrome window (macOS only). Use this instead of run_shell_command + osascript to avoid quoting errors."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "javascript": {
+                    "type": "string",
+                    "description": "The JavaScript code to execute on the active tab (e.g. document.querySelector('.title').value = 'Hello';)"
+                }
+            },
+            "required": ["javascript"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let javascript = args
+            .get("javascript")
+            .and_then(|v| v.as_str())
+            .context("Missing 'javascript' argument")?;
+
+        if !cfg!(target_os = "macos") {
+            anyhow::bail!("This tool is only supported on macOS.");
+        }
+
+        // We use AppleScript to tell Chrome to execute the JS.
+        // We properly escape the JS string so it can be passed as an AppleScript string literal.
+        let escaped_js = javascript
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+            
+        let script = format!(
+            "tell application \"Google Chrome\"\n\
+             execute front window's active tab javascript \"{}\"\n\
+             end tell",
+            escaped_js
+        );
+
+        let output = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("AppleScript failed: {}", err);
+        }
+
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        
+        // Automatically capture the screen so the agent can visually verify the result of the JS execution
+        let out_path = "chrome_active_tab_screenshot.png";
+        let _ = Command::new("screencapture")
+            .arg("-x")
+            .arg(out_path)
+            .output();
+
+        Ok(format!("JS executed successfully. Return value: {}\n(Auto-screenshot verified state at {})", out, out_path))
+    }
+}
+
 // --- Chrome/Browser Tool ---
 
 #[derive(Clone)]
@@ -229,7 +303,10 @@ pub struct BrowserSkill {
 impl BrowserSkill {
     pub fn new() -> Self {
         Self {
-            tools: vec![Arc::new(ChromeDriverTool)],
+            tools: vec![
+                Arc::new(ChromeDriverTool),
+                Arc::new(ActiveChromeJsTool),
+            ],
         }
     }
 }

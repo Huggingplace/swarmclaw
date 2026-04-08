@@ -7,6 +7,7 @@ pub mod fleet;
 pub mod fs;
 pub mod mcp;
 pub mod media;
+pub mod memory;
 pub mod shell;
 pub mod wasm;
 
@@ -21,3 +22,4 @@ pub trait Skill: Send + Sync {
     fn description(&self) -> &str;
     fn tools(&self) -> Vec<Arc<dyn Tool>>;
 }
+pub mod desktop;

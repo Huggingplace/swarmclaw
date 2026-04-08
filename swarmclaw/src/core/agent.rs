@@ -41,6 +41,11 @@ const CLI_FG: Color = Color::Rgb {
 };
 const CLI_BG_RGB: (u8, u8, u8) = (23, 24, 27);
 const CLI_FG_RGB: (u8, u8, u8) = (231, 233, 238);
+
+const CLI_USER_BG_RGB: (u8, u8, u8) = (90, 95, 105);
+const CLI_AI_BG_RGB: (u8, u8, u8) = (40, 44, 52);
+const CLI_WHITE_TEXT_RGB: (u8, u8, u8) = (245, 245, 250);
+
 const CLI_PANEL_RGB: (u8, u8, u8) = (34, 37, 42);
 const CLI_DEEP_RGB: (u8, u8, u8) = (13, 14, 16);
 const CLI_BORDER_RGB: (u8, u8, u8) = (52, 56, 65);
@@ -107,6 +112,9 @@ impl TerminalUiGuard {
         enable_raw_mode()?;
         execute!(stdout, EnterAlternateScreen, SetTitle("SwarmClaw CLI"))?;
         apply_cli_terminal_theme(stdout)?;
+        let (_, rows) = crossterm::terminal::size().unwrap_or((100, 40));
+        // Set scrolling region: 1 to rows-8 to leave room for multiline padded input box
+        let _ = write!(stdout, "\x1b[1;{}r", rows.saturating_sub(8).max(5));
         execute!(
             stdout,
             SetBackgroundColor(CLI_BG),
@@ -115,7 +123,12 @@ impl TerminalUiGuard {
             MoveTo(0, 0),
         )?;
         paint_cli_viewport(stdout)?;
-        execute!(stdout, MoveTo(0, 0))?;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 40));
+        // Draw the divider line
+        let _ = execute!(stdout, MoveTo(0, rows - 3), crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r: 30, g: 32, b: 36 }), crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine));
+        let divider = "━".repeat(cols as usize);
+        let _ = write!(stdout, "{}", divider.truecolor(60, 65, 75));
+        let _ = execute!(stdout, MoveTo(0, 0), crossterm::style::ResetColor);
         Ok(Self)
     }
 }
@@ -280,7 +293,7 @@ impl Agent {
             MoveTo(0, 0),
         )?;
         paint_cli_viewport(stdout)?;
-        execute!(stdout, MoveTo(0, 0))?;
+        execute!(stdout, MoveTo(0, 0), crossterm::style::ResetColor)?;
 
         render_cli_intro(
             stdout,
@@ -310,7 +323,7 @@ impl Agent {
         render_cli_history(stdout, &self.state.history)
     }
 
-    fn read_cli_input(
+        fn read_cli_input(
         &self,
         stdout: &mut io::Stdout,
         label: &str,
@@ -318,17 +331,20 @@ impl Agent {
         chip_bg: (u8, u8, u8),
         history: &mut Vec<String>,
         record_history: bool,
-    ) -> io::Result<Option<String>> {
-        let mut input = String::new();
+        initial_input: String,
+        initial_cursor: usize,
+    ) -> io::Result<Option<(String, usize)>> {
+                let mut input = initial_input;
         let mut lines_occupied: u16 = 0;
         let mut history_index: Option<usize> = None;
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+        let mut cursor_pos = initial_cursor;
+        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
 
         loop {
             match event::read()? {
                 Event::Resize(_, _) => {
                     self.redraw_cli_screen(stdout)?;
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -340,22 +356,29 @@ impl Agent {
                         return Ok(None);
                     }
                     KeyCode::Enter => {
-                        if input.trim().is_empty() { return Ok(Some(input)); }
-                        write_cli_line(stdout, "")?;
+                        if input.trim().is_empty() { return Ok(Some((input, cursor_pos))); }
+                        // Clear the input area
+                        let (_, r) = crossterm::terminal::size().unwrap_or((100,40));
+                        let _ = execute!(stdout, MoveTo(0, r-2), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown));
                         if record_history && !input.trim().is_empty() {
                             history.push(input.clone());
                         }
-                        return Ok(Some(input));
+                        return Ok(Some((input, cursor_pos)));
                     }
-                    KeyCode::Backspace => {
-                        input.pop();
+                                        KeyCode::Backspace => {
+                        if cursor_pos > 0 {
+                            let mut chars: Vec<char> = input.chars().collect();
+                            chars.remove(cursor_pos - 1);
+                            input = chars.into_iter().collect();
+                            cursor_pos -= 1;
+                        }
                         history_index = None;
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+                        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
                     }
                     KeyCode::Esc => {
                         input.clear();
                         history_index = None;
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
                     }
                     KeyCode::Up if !history.is_empty() => {
                         history_index = Some(match history_index {
@@ -365,7 +388,7 @@ impl Agent {
                         });
                         if let Some(index) = history_index {
                             input = history[index].clone();
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
                         }
                     }
                     KeyCode::Down if !history.is_empty() => {
@@ -377,13 +400,24 @@ impl Agent {
                                 history_index = None;
                                 input.clear();
                             }
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
                         }
                     }
-                    KeyCode::Char(ch) => {
-                        input.push(ch);
+                                        KeyCode::Char(ch) => {
+                        let mut chars: Vec<char> = input.chars().collect();
+                        chars.insert(cursor_pos, ch);
+                        input = chars.into_iter().collect();
+                        cursor_pos += 1;
                         history_index = None;
-        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, &mut lines_occupied)?;
+                        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
+                    }
+                    KeyCode::Left => {
+                        if cursor_pos > 0 { cursor_pos -= 1; }
+                        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
+                    }
+                    KeyCode::Right => {
+                        if cursor_pos < input.chars().count() { cursor_pos += 1; }
+                        self.render_input_prompt(stdout, label, chip_fg, chip_bg, &input, cursor_pos, &mut lines_occupied)?;
                     }
                     _ => {}
                 },
@@ -392,44 +426,90 @@ impl Agent {
         }
     }
 
-    fn render_input_prompt(
+        fn render_input_prompt(
         &self,
         stdout: &mut io::Stdout,
         label: &str,
         chip_fg: (u8, u8, u8),
         chip_bg: (u8, u8, u8),
         input: &str,
+        cursor_pos: usize,
         lines_occupied: &mut u16,
     ) -> io::Result<()> {
-        let prompt_width = label.chars().count() + 3;
+        let prompt_width = if label == "USER" { 3 } else { label.chars().count() + 3 };
         let term_width = terminal_width().max(1) as usize;
 
-        if *lines_occupied > 0 {
-            execute!(stdout, crossterm::cursor::MoveUp(*lines_occupied))?;
+        let mut total_lines: u16 = 1;
+        let mut current_len = prompt_width;
+        for c in input.chars() {
+            if c == '\n' {
+                total_lines += 1;
+                current_len = 0;
+            } else {
+                if current_len >= term_width {
+                    total_lines += 1;
+                    current_len = 0;
+                }
+                current_len += 1;
+            }
         }
-        execute!(stdout, crossterm::cursor::MoveToColumn(0), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown))?;
 
-        let mut out_str = format!("{} ", cli_chip(label, chip_fg, chip_bg));
+        let (cols, r) = crossterm::terminal::size().unwrap_or((100, 40));
+        let start_row = (r - 3).saturating_sub(total_lines - 1);
+        let divider_row = start_row.saturating_sub(2);
+        
+        // We clear everything from the divider down so we redraw the whole block cleanly
+        if *lines_occupied > total_lines {
+            let old_divider = (r - 3).saturating_sub(*lines_occupied - 1).saturating_sub(2);
+            for i in old_divider..divider_row {
+                let _ = execute!(stdout, crossterm::cursor::MoveTo(0, i), crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine));
+            }
+        }
+
+        execute!(stdout, crossterm::cursor::MoveTo(0, divider_row), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown))?;
+
+        // 1. Draw divider
+        let divider = "━".repeat(cols as usize);
+        let _ = write!(stdout, "{}\r\n", divider.truecolor(60, 65, 75).on_truecolor(30, 32, 36));
+
+        // 2. Draw Top Padding
+        let _ = write!(stdout, "\x1b[48;2;60;65;75m\x1b[K\r\n");
+
+        // 3. Draw Input Area
+        let mut out_str = if label == "USER" {
+            format!("\x1b[48;2;60;65;75m \x1b[38;2;200;150;255m>\x1b[38;2;245;245;250m ")
+        } else {
+            format!("{} ", cli_chip(label, chip_fg, chip_bg))
+        };
+
+        out_str.push_str(&format!("\x1b[38;2;245;245;250m\x1b[48;2;60;65;75m\x1b[K"));
         let mut current_line_len = prompt_width;
-        let mut new_lines: u16 = 0;
 
         for c in input.chars() {
             if c == '\n' {
-                out_str.push_str("\r\n");
+                out_str.push_str("\r\n\x1b[K"); // Re-fill line with background
                 current_line_len = 0;
-                new_lines += 1;
             } else {
                 if current_line_len >= term_width {
-                    out_str.push_str("\r\n");
+                    out_str.push_str("\r\n\x1b[K"); // Re-fill line with background
                     current_line_len = 0;
-                    new_lines += 1;
                 }
                 out_str.push(c);
                 current_line_len += 1;
             }
         }
-        write!(stdout, "{}", out_str)?;
-        *lines_occupied = new_lines;
+        out_str.push_str("\x1b[0m\r\n");
+        let _ = write!(stdout, "{}", out_str);
+
+        // 4. Draw Bottom Padding
+        let _ = write!(stdout, "\x1b[48;2;60;65;75m\x1b[K\x1b[0m\r\n");
+
+        // 5. Draw Menu
+        let _ = write!(stdout, "\x1b[48;2;23;24;27m\x1b[38;2;154;163;173m\x1b[K  \x1b[38;2;200;150;255m/help\x1b[38;2;154;163;173m commands  |  \x1b[38;2;200;150;255mctrl+c\x1b[38;2;154;163;173m cancel tool  |  \x1b[38;2;200;150;255m/key\x1b[38;2;154;163;173m API key\x1b[0m");
+
+        let col = current_line_len as u16;
+        execute!(stdout, crossterm::cursor::MoveTo(col, r - 3))?;
+        *lines_occupied = total_lines;
         apply_cli_palette(stdout)?;
         stdout.flush()
     }
@@ -441,21 +521,50 @@ impl Agent {
             self.redraw_cli_screen(&mut stdout)?;
             let mut input_history: Vec<String> = self.state.history.iter().filter(|m| m.role == crate::core::state::Role::User).map(|m| m.content.clone()).collect();
 
+            let mut queued_input = String::new();
+            let mut queued_cursor = 0;
             loop {
-                let Some(input) = self.read_cli_input(
-                    &mut stdout,
-                    "USER",
-                    CLI_DEEP_RGB,
-                    CLI_CYAN_RGB,
-                    &mut input_history,
-                    true,
-                )?
-                else {
-                    break;
+                let input_to_process = if let Some(idx) = queued_input.find('\n') {
+                    let cmd = queued_input[..idx].to_string();
+                    queued_input = queued_input[idx+1..].to_string();
+                    
+                    // Add queued command to history
+                    if !cmd.trim().is_empty() {
+                        input_history.push(cmd.clone());
+                    }
+                    
+                    cmd
+                } else {
+                    let Some((input, _)) = self.read_cli_input(
+                        &mut stdout,
+                        "USER",
+                        CLI_DEEP_RGB,
+                        CLI_CYAN_RGB,
+                        &mut input_history,
+                        true,
+                        queued_input.clone(),
+                        queued_cursor,
+                    )? else {
+                        break;
+                    };
+                    
+                    queued_input.clear();
+                    input
                 };
 
-                let input = input.trim();
+                let input = input_to_process.trim();
                 if input.is_empty() {
+                    continue;
+                }
+
+                                if input.eq_ignore_ascii_case("/help") || input.eq_ignore_ascii_case("/helpp") {
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("HELP", CLI_DEEP_RGB, CLI_CYAN_RGB), "SwarmClaw Commands".truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2).bold()))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/help, /helpp".truecolor(200, 150, 255), "Show this help menu"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/key <API_KEY>".truecolor(200, 150, 255), "Update your API key for the current provider"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/provider <NAME>".truecolor(200, 150, 255), "Switch AI provider (openai, anthropic, gemini, etc.)"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "exit, quit".truecolor(200, 150, 255), "Exit SwarmClaw"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "ctrl+c".truecolor(200, 150, 255), "Cancel the current tool execution or LLM response"))?;
+                    write_cli_line(&mut stdout, "")?;
                     continue;
                 }
 
@@ -621,11 +730,13 @@ impl Agent {
                         tool_call_id: None,
                     });
                     info!("CLI turn started");
+                self.redraw_cli_screen(&mut stdout)?;
+
                 }
                 write_cli_line(&mut stdout, "")?;
                 let mut turn_failed = false;
                 loop {
-                    let mut respond_fut = Box::pin(self.respond(None).instrument(turn_span.clone()));
+                    let mut respond_fut = Box::pin(self.respond(None, &mut queued_input, &mut queued_cursor).instrument(turn_span.clone()));
                     let mut cancel_stream = crossterm::event::EventStream::new();
                     let res = loop {
                         tokio::select! {
@@ -659,13 +770,15 @@ impl Agent {
                             )?;
     
                             let mut auth_history = Vec::new();
-                            if let Some(key) = self.read_cli_input(
+                            if let Some((key, _)) = self.read_cli_input(
                                 &mut stdout,
                                 "NEW KEY",
                                 CLI_DEEP_RGB,
                                 CLI_AMBER_RGB,
                                 &mut auth_history,
                                 false,
+                                String::new(),
+                                0,
                             )? {
                                 let key = key.trim().to_string();
                                 if !key.is_empty() {
@@ -804,7 +917,7 @@ impl Agent {
         }
 
         match self
-            .respond(Some(channel_info))
+            .respond(Some(channel_info), &mut String::new(), &mut 0)
             .instrument(turn_span.clone())
             .await
         {
@@ -821,11 +934,11 @@ impl Agent {
         }
     }
 
-    async fn respond(&mut self, channel_info: Option<ChannelInfo>) -> anyhow::Result<()> {
+    async fn respond(&mut self, channel_info: Option<ChannelInfo>, queued_input: &mut String, queued_cursor: &mut usize) -> anyhow::Result<()> {
         let capabilities = self.llm.capabilities();
 
         if capabilities.supports_streaming {
-            self.stream_think(channel_info).await
+            self.stream_think(channel_info, queued_input, queued_cursor).await
         } else if capabilities.supports_non_streaming && channel_info.is_none() {
             self.think().await
         } else if capabilities.supports_non_streaming {
@@ -842,7 +955,7 @@ impl Agent {
     }
 
     /// Streaming thought loop for CLI and webhook gateways.
-    pub async fn stream_think(&mut self, channel_info: Option<ChannelInfo>) -> anyhow::Result<()> {
+    pub async fn stream_think(&mut self, channel_info: Option<ChannelInfo>, queued_input: &mut String, queued_cursor: &mut usize) -> anyhow::Result<()> {
         let capabilities = self.llm.capabilities();
         if !capabilities.supports_streaming {
             anyhow::bail!(
@@ -967,75 +1080,178 @@ impl Agent {
 
             
 
-            if cli_mode {
-                let chip = format!("{} \r\n", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB));
-                let _ = write!(stdout, "{}", chip);
+            let mut spinner_idx = 0;
+            let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            
+            let mut event_stream = crossterm::event::EventStream::new();
+            let mut lines_occupied: u16 = 0;
+            let start_time = std::time::Instant::now();
+            let mut ui_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            
+            // Webhook Streaming state
+            let mut last_patch_time = std::time::Instant::now();
+            let mut last_patched_len = 0;
+
+                        if cli_mode {
+                // Let the spinner write at the current natural scroll cursor position
+                let _ = write!(stdout, "\n");
+                let chip = cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB);
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[0].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), format!("Working... ({:.1}s)", elapsed).truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
+                
+                let _ = execute!(stdout, crossterm::cursor::SavePosition);
+                let _ = self.render_input_prompt(&mut stdout, "USER", CLI_DEEP_RGB, CLI_CYAN_RGB, &queued_input, *queued_cursor, &mut lines_occupied);
+                let _ = execute!(stdout, crossterm::cursor::RestorePosition);
                 let _ = stdout.flush();
             }
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(ChatChunk::Content(delta)) => {
-                        full_content.push_str(&delta);
+
+            loop {
+                tokio::select! {
+                    _ = ui_tick.tick() => {
                         if cli_mode {
-                            // Print delta directly to avoid terminal wrapping/MoveUp bugs
-                            let safe_delta = delta.replace("
-", "
-");
-                            let _ = write!(stdout, "{}", safe_delta);
+                            spinner_idx = (spinner_idx + 1) % spinner_frames.len();
+                            let elapsed = start_time.elapsed().as_secs_f32();
+                            let chip = cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB);
+                            
+                            // Re-draw in place
+                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), format!("Working... ({:.1}s)", elapsed).truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
                             let _ = stdout.flush();
                             let _ = drain_resize_events(self, &mut stdout, &full_content);
                         }
                     }
-                    Ok(ChatChunk::ToolCallStart {
-                        id,
-                        name,
-                        thought_signature,
-                    }) => {
-                        debug!(tool_name = %name, tool_id = %id, "Received tool call start");
-                        if !current_tool_name.is_empty() {
-                            tool_calls.push(crate::llm::ToolCall {
-                                id: current_tool_id.clone(),
-                                name: current_tool_name.clone(),
-                                arguments: current_tool_args.clone(),
-                                thought_signature: current_thought_signature.take(),
-                            });
-                        }
-                        current_tool_id = id;
-                        current_tool_name = name;
-                        current_tool_args.clear();
-                        current_thought_signature = thought_signature;
-                    }
-                    Ok(ChatChunk::ToolCallDelta { arguments }) => {
-                        current_tool_args.push_str(&arguments);
-                    }
-                    Ok(ChatChunk::Done) => {
-                        if !current_tool_name.is_empty() {
-                            tool_calls.push(crate::llm::ToolCall {
-                                id: current_tool_id.clone(),
-                                name: current_tool_name.clone(),
-                                arguments: current_tool_args.clone(),
-                                thought_signature: current_thought_signature.take(),
-                            });
-                            current_tool_name.clear();
-                        }
+                    chunk_opt = stream.next() => {
+                        let chunk = match chunk_opt {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        
                         if cli_mode {
-                            write_cli_line(&mut stdout, "")?;
+                            let elapsed = start_time.elapsed().as_secs_f32();
+                            let chip = cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB);
+                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), format!("Working... ({:.1}s)", elapsed).truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
+                            let _ = stdout.flush();
                         }
-                        debug!(
-                            assistant_chars = full_content.len(),
-                            tool_calls = tool_calls.len(),
-                            "Provider stream completed"
-                        );
-                        break;
+
+                        match chunk {
+                            Ok(ChatChunk::Content(delta)) => {
+                                full_content.push_str(&delta);
+                                
+                                // Real-Time Webhook Streaming (Debounced)
+                                if let Some(channel_info) = &channel_info {
+                                    if full_content.len() > last_patched_len && last_patch_time.elapsed().as_millis() > 1000 {
+                                        queue_gateway_text(channel_info, &full_content);
+                                        last_patched_len = full_content.len();
+                                        last_patch_time = std::time::Instant::now();
+                                    }
+                                }
+                            }
+                            Ok(ChatChunk::ToolCallStart {
+                                id,
+                                name,
+                                thought_signature,
+                            }) => {
+                                debug!(tool_name = %name, tool_id = %id, "Received tool call start");
+                                if !current_tool_name.is_empty() {
+                                    tool_calls.push(crate::llm::ToolCall {
+                                        id: current_tool_id.clone(),
+                                        name: current_tool_name.clone(),
+                                        arguments: current_tool_args.clone(),
+                                        thought_signature: current_thought_signature.take(),
+                                    });
+                                }
+                                current_tool_id = id;
+                                current_tool_name = name;
+                                current_tool_args.clear();
+                                current_thought_signature = thought_signature;
+                            }
+                            Ok(ChatChunk::ToolCallDelta { arguments }) => {
+                                current_tool_args.push_str(&arguments);
+                            }
+                            Ok(ChatChunk::Done) => {
+                                if !current_tool_name.is_empty() {
+                                    tool_calls.push(crate::llm::ToolCall {
+                                        id: current_tool_id.clone(),
+                                        name: current_tool_name.clone(),
+                                        arguments: current_tool_args.clone(),
+                                        thought_signature: current_thought_signature.take(),
+                                    });
+                                    current_tool_name.clear();
+                                }
+                                if cli_mode {
+                                    let (_, rows) = crossterm::terminal::size().unwrap_or((100, 40));
+                                    // Clear the bottom area
+                                    let _ = execute!(stdout, MoveTo(0, rows - 2), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown));
+                                    let _ = stdout.flush();
+                                }
+                                debug!(
+                                    assistant_chars = full_content.len(),
+                                    tool_calls = tool_calls.len(),
+                                    "Provider stream completed"
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                if cli_mode {
+                                    let (_, rows) = crossterm::terminal::size().unwrap_or((100, 40));
+                                    // Clear the bottom area
+                                    let _ = execute!(stdout, MoveTo(0, rows - 2), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown));
+                                    let _ = stdout.flush();
+                                }
+                                if let Some(channel_info) = &channel_info {
+                                    queue_gateway_text(
+                                        channel_info,
+                                        &format!("SwarmClaw engine error: {error}"),
+                                    );
+                                }
+                                return Err(error);
+                            }
+                        }
                     }
-                    Err(error) => {
-                        if let Some(channel_info) = &channel_info {
-                            queue_gateway_text(
-                                channel_info,
-                                &format!("SwarmClaw engine error: {error}"),
-                            );
+                    event_opt = event_stream.next() => {
+                        if let Some(Ok(crossterm::event::Event::Key(key))) = event_opt {
+                            if key.kind == crossterm::event::KeyEventKind::Press {
+                                match key.code {
+                                    crossterm::event::KeyCode::Char(c) => {
+                                        let mut chars: Vec<char> = queued_input.chars().collect();
+                                        chars.insert(*queued_cursor, c);
+                                        *queued_input = chars.into_iter().collect();
+                                        *queued_cursor += 1;
+                                    },
+                                    crossterm::event::KeyCode::Backspace => {
+                                        if *queued_cursor > 0 {
+                                            let mut chars: Vec<char> = queued_input.chars().collect();
+                                            chars.remove(*queued_cursor - 1);
+                                            *queued_input = chars.into_iter().collect();
+                                            *queued_cursor -= 1;
+                                        }
+                                    },
+                                    crossterm::event::KeyCode::Left => {
+                                        if *queued_cursor > 0 { *queued_cursor -= 1; }
+                                    },
+                                    crossterm::event::KeyCode::Right => {
+                                        if *queued_cursor < *queued_cursor { *queued_cursor += 1; }
+                                    },
+                                    crossterm::event::KeyCode::Enter => {
+                                        let mut chars: Vec<char> = queued_input.chars().collect();
+                                        chars.insert(*queued_cursor, '\n');
+                                        *queued_input = chars.into_iter().collect();
+                                        *queued_cursor += 1;
+                                    },
+                                    crossterm::event::KeyCode::Esc => { 
+                                        queued_input.clear(); 
+                                        *queued_cursor = 0;
+                                    },
+                                    _ => {}
+                                }
+                                if cli_mode {
+                                    // Move down using cursor to redraw prompt in place
+                                    let (_, r) = crossterm::terminal::size().unwrap_or((100,40)); let _ = execute!(stdout, MoveTo(0, r-2));
+                                    let _ = self.render_input_prompt(&mut stdout, "USER", CLI_DEEP_RGB, CLI_CYAN_RGB, &queued_input, *queued_cursor, &mut lines_occupied);
+                                    let (_, r) = crossterm::terminal::size().unwrap_or((100,40)); let _ = execute!(stdout, MoveTo(0, r-4));
+                                    let _ = stdout.flush();
+                                }
+                            }
                         }
-                        return Err(error);
                     }
                 }
             }
@@ -1068,6 +1284,11 @@ impl Agent {
                     tool_call_id: None,
                 });
 
+                if cli_mode {
+                    // Render the full formatted text immediately
+                    let _ = self.redraw_cli_screen(&mut stdout);
+                }
+
                 if tool_calls.is_empty() {
                     if let Some(channel_info) = &channel_info {
                         queue_gateway_text(channel_info, &redacted_content);
@@ -1097,20 +1318,80 @@ impl Agent {
 
                     let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
 
+
                     let result = match tool {
                         Some(t) => {
                             debug!(tool_name = %tc.name, "Executing tool");
                             let args: serde_json::Value =
                                 serde_json::from_str(&tc.arguments).unwrap_or_default();
 
-                            // Use WorkerPool to isolate tool execution
-                            match WorkerPool::execute_tool(t, args).await {
-                                Ok(res) => res,
-                                Err(e) => format!("Error: {}", e),
+                            if cli_mode {
+                                let _ = self.render_input_prompt(&mut stdout, "USER", CLI_DEEP_RGB, CLI_CYAN_RGB, &queued_input, *queued_cursor, &mut lines_occupied);
+                                let (_, rows) = crossterm::terminal::size().unwrap_or((100, 40)); let _ = execute!(stdout, MoveTo(0, rows - 4));
+                                let _ = stdout.flush();
                             }
+
+                            // Use WorkerPool to isolate tool execution
+                            let mut tool_fut = Box::pin(WorkerPool::execute_tool(t, args));
+                            let tool_start = std::time::Instant::now();
+                            let mut tool_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                            let res = loop {
+                                tokio::select! {
+                                    _ = tool_tick.tick() => {
+                                        if cli_mode {
+                                            let elapsed = tool_start.elapsed().as_secs_f32();
+                                            let (_, rows) = crossterm::terminal::size().unwrap_or((100, 40));
+                                            
+                                            // Ensure we are in the scroll region
+                                            let (_, rows) = crossterm::terminal::size().unwrap_or((100, 40)); let _ = execute!(stdout, MoveTo(0, rows - 4));
+                                            
+                                            let chip = cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB);
+                                            spinner_idx = (spinner_idx + 1) % spinner_frames.len();
+                                            
+                                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), format!("Executing tool '{}'... ({:.1}s)", tc.name, elapsed).truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
+                                            let _ = stdout.flush();
+                                        }
+                                    }
+                                    res = &mut tool_fut => {
+ 
+                                        break match res {
+                                            Ok(res) => res,
+                                            Err(e) => format!("Error: {}", e),
+                                        };
+                                    }
+                                    event_opt = event_stream.next() => {
+                                        if let Some(Ok(crossterm::event::Event::Key(key))) = event_opt {
+                                            if key.kind == crossterm::event::KeyEventKind::Press {
+                                                match key.code {
+                                                    crossterm::event::KeyCode::Char(c) => queued_input.push(c),
+                                                    crossterm::event::KeyCode::Backspace => { queued_input.pop(); },
+                                                    crossterm::event::KeyCode::Enter => { queued_input.push('\n'); },
+                                                    crossterm::event::KeyCode::Esc => { queued_input.clear(); },
+                                                    _ => {}
+                                                }
+                                if cli_mode {
+                                    let _ = execute!(stdout, crossterm::cursor::SavePosition);
+                                    let _ = self.render_input_prompt(&mut stdout, "USER", CLI_DEEP_RGB, CLI_CYAN_RGB, &queued_input, *queued_cursor, &mut lines_occupied);
+                                    let _ = execute!(stdout, crossterm::cursor::RestorePosition);
+                                    let _ = stdout.flush();
+                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            if cli_mode {
+                                // Clear async prompt before printing result
+                                let _ = execute!(stdout, crossterm::cursor::MoveDown(2), crossterm::cursor::MoveToColumn(0), crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown));
+                                let _ = execute!(stdout, crossterm::cursor::MoveUp(2), crossterm::cursor::MoveToColumn(0), crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine));
+                                let _ = stdout.flush();
+                            }
+                            res
                         }
                         None => format!("Tool '{}' not found", tc.name),
                     };
+
                     debug!(
                         tool_name = %tc.name,
                         result_bytes = result.len(),
@@ -1724,7 +2005,7 @@ fn render_cli_intro(
     write_cli_line(stdout, cli_frame_top(width))?;
     write_cli_line(
         stdout,
-        cli_frame_line("SwarmClaw CLI", width)
+        cli_frame_line("SwarmClaw CLI (v2.2 Panes)", width)
             .bold()
             .truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2)
             .on_truecolor(CLI_DEEP_RGB.0, CLI_DEEP_RGB.1, CLI_DEEP_RGB.2),
@@ -1833,32 +2114,78 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
             Role::System => continue,
             Role::User => {
                 has_visible_messages = true;
-                write_cli_line(
-                    stdout,
-                    format!(
-                        "{} {}",
-                        cli_chip("USER", CLI_DEEP_RGB, CLI_CYAN_RGB),
-                        message
-                            .content
-                            .truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2),
-                    ),
-                )?;
+                let bg = crossterm::style::Color::Rgb { r: 60, g: 65, b: 75 }; // Cool slate gray
+                let fg = crossterm::style::Color::Rgb { r: 245, g: 245, b: 250 }; // Off-white
+                
+                // Top padding
+                let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                let _ = write!(stdout, " ");
+                let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                let _ = write!(stdout, "\r\n");
+                
+                let lines: Vec<&str> = message.content.split('\n').collect();
+                for (i, line) in lines.iter().enumerate() {
+                    let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                    if i == 0 {
+                        // Pink '*' icon
+                        let _ = write!(stdout, " \x1b[38;2;200;150;255m>\x1b[38;2;245;245;250m ");
+                    } else {
+                        let _ = write!(stdout, "   ");
+                    }
+                    let _ = write!(stdout, "{}", line.replace("\r", ""));
+                    let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                    let _ = write!(stdout, "\r\n");
+                }
+                
+                // Bottom padding
+                let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                let _ = write!(stdout, " ");
+                let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                let _ = write!(stdout, "\r\n");
+                let _ = crossterm::execute!(stdout, crossterm::style::ResetColor);
             }
             Role::Assistant => {
                 if !message.content.is_empty() {
                     has_visible_messages = true;
-                    write_cli(
-                        stdout,
-                        format!("{} \r\n", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB))
-                    )?;
+                    let bg = crossterm::style::Color::Rgb { r: 35, g: 38, b: 45 }; // Dark charcoal
+                    
+                    // Top padding
+                    let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                    let _ = write!(stdout, " ");
+                    let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                    let _ = write!(stdout, "\r\n");
+
+                    // Brand tag
+                    let _ = write!(stdout, "   ");
+                    let _ = write!(stdout, "{} ", cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB));
+                    let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                    let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                    let _ = write!(stdout, "\r\n");
+                    
                     let mut skin = termimad::MadSkin::default();
-                    let (r, g, b) = CLI_FG_RGB;
-                    skin.set_fg(crossterm::style::Color::Rgb { r, g, b });
-                    let rendered = format!("{}", skin.term_text(&message.content));
-                    let safe_content = rendered.replace("\r\n", "\n").replace("\n", "\r\n");
-                    let _ = write!(stdout, "{}", safe_content);
-                    let _ = stdout.flush();
-                    write_cli(stdout, "\r\n")?;
+                    skin.set_fg(crossterm::style::Color::Rgb { r: 245, g: 245, b: 250 });
+                    skin.set_bg(bg);
+                    let term_width = crossterm::terminal::size().unwrap_or((100, 40)).0 as usize;
+                    let rendered = format!("{}", skin.text(&message.content, Some(term_width.saturating_sub(4))));
+                    
+                    for line in rendered.split('\n') {
+                        if line.is_empty() { continue; }
+                        let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                        // Indent content slightly to match
+                        let _ = write!(stdout, "   {}", line.replace("\r", ""));
+                        // termimad often leaves trailing color resets [0m which disable the background.
+                        // We must set the background color AGAIN right before clearing to the end of the line.
+                        let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                        let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                        let _ = write!(stdout, "\r\n");
+                    }
+                    
+                    // Bottom padding
+                    let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
+                    let _ = write!(stdout, " ");
+                    let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
+                    let _ = write!(stdout, "\r\n");
+                    let _ = crossterm::execute!(stdout, crossterm::style::ResetColor);
                 }
 
                 if let Some(tool_calls) = &message.tool_calls {
@@ -2009,7 +2336,6 @@ fn terminal_width() -> usize {
     size()
         .map(|(cols, _)| cols as usize)
         .unwrap_or(96)
-        .min(108)
         .max(1)
 }
 
