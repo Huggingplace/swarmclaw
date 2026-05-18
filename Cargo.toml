@@ -4,6 +4,8 @@ members = [
     "swarmclaw-sdk",
     "skills-library/fetch-convert",
     "skills-library/filesystem",
+    "skills-library/google-docs",
+    "skills-library/google-gmail",
     "skills-library/google-sheets",
     "skills-library/search-web",
     "skills-library/shell",

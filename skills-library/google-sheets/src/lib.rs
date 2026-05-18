@@ -15,7 +15,7 @@ impl SwarmClawSkill for GoogleSheetsSkill {
     }
 
     fn description(&self) -> &str {
-        "Write to user-selected Google Sheets through SwarmClaw's host-owned local integration."
+        "Read and write user-selected Google Sheets through SwarmClaw's host-owned local integration."
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -37,8 +37,48 @@ impl SwarmClawSkill for GoogleSheetsSkill {
                 }),
             ),
             ToolDefinition::new(
+                "get_google_sheet_values",
+                "Read values from a concrete A1 range inside a previously bound spreadsheet alias.",
+                json!({
+                    "type": "object",
+                    "required": ["alias", "range"],
+                    "properties": {
+                        "alias": { "type": "string" },
+                        "range": { "type": "string" },
+                        "majorDimension": {
+                            "type": "string",
+                            "enum": ["ROWS", "COLUMNS"]
+                        },
+                        "valueRenderOption": {
+                            "type": "string",
+                            "enum": ["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]
+                        },
+                        "dateTimeRenderOption": {
+                            "type": "string",
+                            "enum": ["SERIAL_NUMBER", "FORMATTED_STRING"]
+                        }
+                    }
+                }),
+            ),
+            ToolDefinition::new(
+                "create_google_sheet_tab",
+                "Create a new tab inside a previously bound spreadsheet alias.",
+                json!({
+                    "type": "object",
+                    "required": ["alias", "title"],
+                    "properties": {
+                        "alias": { "type": "string" },
+                        "title": { "type": "string" },
+                        "index": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    }
+                }),
+            ),
+            ToolDefinition::new(
                 "append_google_sheet_rows",
-                "Append rows to a logical table inside a previously bound spreadsheet alias.",
+                "Append rows to a logical table inside a previously bound spreadsheet alias. Formulas are supported.",
                 json!({
                     "type": "object",
                     "required": ["alias", "range", "values"],
@@ -46,12 +86,13 @@ impl SwarmClawSkill for GoogleSheetsSkill {
                         "alias": { "type": "string" },
                         "range": { "type": "string" },
                         "values": {
-                            "type": "array",
-                            "items": { "type": "array", "items": {} }
+                            "description": "A 2D array, 1D array, or a single primitive value.",
+                            "type": ["array", "string", "number", "boolean", "null"]
                         },
                         "valueInputOption": {
                             "type": "string",
-                            "enum": ["RAW", "USER_ENTERED"]
+                            "enum": ["RAW", "USER_ENTERED"],
+                            "default": "USER_ENTERED"
                         },
                         "insertDataOption": {
                             "type": "string",
@@ -62,7 +103,7 @@ impl SwarmClawSkill for GoogleSheetsSkill {
             ),
             ToolDefinition::new(
                 "update_google_sheet_values",
-                "Overwrite a concrete A1 range inside a previously bound spreadsheet alias.",
+                "Overwrite a concrete A1 range inside a previously bound spreadsheet alias. Formulas (e.g. =HYPERLINK) are supported when valueInputOption is USER_ENTERED (default). WARNING: Ensure the target range exists within the sheet's current bounds (max rows/cols), otherwise it will fail with an exceeds grid limits error.",
                 json!({
                     "type": "object",
                     "required": ["alias", "range", "values"],
@@ -70,19 +111,39 @@ impl SwarmClawSkill for GoogleSheetsSkill {
                         "alias": { "type": "string" },
                         "range": { "type": "string" },
                         "values": {
-                            "type": "array",
+                            "description": "A 2D array of values (rows of columns), a 1D array (single row), or a single primitive value.",
+                            "type": ["array", "string", "number", "boolean", "null"],
                             "items": { "type": "array", "items": {} }
                         },
                         "valueInputOption": {
                             "type": "string",
-                            "enum": ["RAW", "USER_ENTERED"]
+                            "enum": ["RAW", "USER_ENTERED"],
+                            "default": "USER_ENTERED"
+                        }
+                    }
+                }),
+            ),
+            ToolDefinition::new(
+                "update_google_sheet_cell",
+                "Update a single cell in a previously bound spreadsheet alias. Supports formulas. WARNING: Ensure the cell exists within current sheet bounds.",
+                json!({
+                    "type": "object",
+                    "required": ["alias", "range", "value"],
+                    "properties": {
+                        "alias": { "type": "string" },
+                        "range": { "type": "string", "description": "A single cell A1 range, e.g. Sheet1!A1" },
+                        "value": { "description": "The value or formula to insert." },
+                        "valueInputOption": {
+                            "type": "string",
+                            "enum": ["RAW", "USER_ENTERED"],
+                            "default": "USER_ENTERED"
                         }
                     }
                 }),
             ),
             ToolDefinition::new(
                 "batch_update_google_sheet_values",
-                "Write multiple A1 ranges in a previously bound spreadsheet alias with one request.",
+                "Write multiple A1 ranges in a previously bound spreadsheet alias with one request. Formulas are supported. WARNING: Ensure ranges do not exceed current grid limits.",
                 json!({
                     "type": "object",
                     "required": ["alias", "data"],
@@ -90,7 +151,8 @@ impl SwarmClawSkill for GoogleSheetsSkill {
                         "alias": { "type": "string" },
                         "valueInputOption": {
                             "type": "string",
-                            "enum": ["RAW", "USER_ENTERED"]
+                            "enum": ["RAW", "USER_ENTERED"],
+                            "default": "USER_ENTERED"
                         },
                         "data": {
                             "type": "array",
@@ -100,8 +162,8 @@ impl SwarmClawSkill for GoogleSheetsSkill {
                                 "properties": {
                                     "range": { "type": "string" },
                                     "values": {
-                                        "type": "array",
-                                        "items": { "type": "array", "items": {} }
+                                        "description": "A 2D array, 1D array, or a single primitive value.",
+                                        "type": ["array", "string", "number", "boolean", "null"]
                                     }
                                 }
                             }
