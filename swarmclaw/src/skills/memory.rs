@@ -6,6 +6,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Process-wide lock guarding concurrent appends to `recipes.jsonl`.
+/// Without this, concurrent tool tasks can interleave partial writes and
+/// corrupt the JSONL log.
+static RECIPE_LOG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct MemorySkill {
     tools: Vec<Arc<dyn Tool>>,
 }
@@ -99,12 +104,17 @@ impl Tool for SavePathwayTool {
         let mut line = log_entry.to_string();
         line.push('\n');
 
+        // Serialize concurrent appends so partial writes cannot interleave
+        // and corrupt the JSONL log. The guard is held across the
+        // open + single write_all below.
+        let _guard = RECIPE_LOG_LOCK.lock().await;
+
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_file)
             .await?;
-        
+
         tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes()).await?;
 
         Ok(format!("Successfully wrote pathway for '{}' to local recipe pipeline ({}).", task_description, log_file.display()))
@@ -154,7 +164,10 @@ impl Tool for GetPathwayTool {
         
         let query = args.get("query").and_then(|v| v.as_str()).context("Missing query")?;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let payload = json!({
             "session_id": self.id,
             "user_question": query,
@@ -162,8 +175,12 @@ impl Tool for GetPathwayTool {
             "should_use_memory": "YES"
         });
 
+        let base = std::env::var("HUGGINGPLACE_MEMORY_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:8001".to_string());
+        let endpoint = format!("{}/get-memory-context", base.trim_end_matches('/'));
+
         let res = client
-            .post("http://localhost:8001/get-memory-context")
+            .post(&endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&payload)
             .send()

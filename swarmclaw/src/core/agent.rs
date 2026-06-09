@@ -29,6 +29,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
+/// Maximum number of tool-execution iterations a single agent turn may perform
+/// before SwarmClaw stops to avoid an unbounded (potentially runaway) loop.
+const MAX_AGENT_ITERATIONS: usize = 25;
+
 const CLI_BG: Color = Color::Rgb {
     r: 23,
     g: 24,
@@ -954,6 +958,83 @@ impl Agent {
         }
     }
 
+    /// Inject HuggingPlace memory context into the outgoing history, if configured.
+    ///
+    /// Only runs when memory credentials are present and the last message is from
+    /// the user. Queries the configured memory service and, when a non-empty,
+    /// non-"none" memory context is returned, appends a system message carrying it.
+    async fn inject_memory_context(&self, history: &mut Vec<Message>, session_id: &str) {
+        let (org_id, api_key) = match (&self.memory_org_id, &self.memory_api_key) {
+            (Some(org_id), Some(api_key)) => (org_id, api_key),
+            _ => return,
+        };
+
+        // Only run memory extraction if the last message was from the user.
+        let Some(last_msg) = history.last() else {
+            return;
+        };
+        if last_msg.role != Role::User {
+            return;
+        }
+
+        let user_question = last_msg.content.clone();
+        let mut formatted_history = String::new();
+        // Format the last few turns (e.g. 10) for context
+        for msg in history.iter().rev().take(10).rev() {
+            match msg.role {
+                Role::User => formatted_history.push_str(&format!("Human: {}\n", msg.content)),
+                Role::Assistant => formatted_history.push_str(&format!("AI: {}\n\n", msg.content)),
+                _ => {}
+            }
+        }
+
+        let base = std::env::var("HUGGINGPLACE_MEMORY_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:8001".to_string());
+        let endpoint = format!("{}/get-memory-context", base);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "user_question": user_question,
+            "org_id": org_id,
+            "should_use_memory": "YES",
+            "variables": serde_json::json!({ "formatted_history": formatted_history }).to_string()
+        });
+
+        if let Ok(res) = client
+            .post(&endpoint)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&payload)
+            .send()
+            .await
+        {
+            if res.status().is_success() {
+                if let Ok(body) = res.json::<serde_json::Value>().await {
+                    if let Some(memory_context) =
+                        body.get("memory_context_used").and_then(|v| v.as_str())
+                    {
+                        if !memory_context.is_empty() && memory_context.to_lowercase() != "none" {
+                            history.push(Message {
+                                role: Role::System,
+                                content: format!(
+                                    "Memory Context (use this to preserve continuity): {}",
+                                    memory_context
+                                ),
+                                timestamp: now_secs(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Streaming thought loop for CLI and webhook gateways.
     pub async fn stream_think(&mut self, channel_info: Option<ChannelInfo>, queued_input: &mut String, queued_cursor: &mut usize) -> anyhow::Result<()> {
         let capabilities = self.llm.capabilities();
@@ -967,7 +1048,30 @@ impl Agent {
         let mut stdout = io::stdout();
         let cli_mode = channel_info.is_none();
 
+        let mut iterations: usize = 0;
         loop {
+            iterations += 1;
+            if iterations > MAX_AGENT_ITERATIONS {
+                let notice = format!(
+                    "[SwarmClaw stopped after {} tool iterations to avoid an unbounded loop.]",
+                    MAX_AGENT_ITERATIONS
+                );
+                self.record_message(Message {
+                    role: Role::Assistant,
+                    content: notice.clone(),
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                if let Some(channel_info) = &channel_info {
+                    queue_gateway_text(channel_info, &notice);
+                }
+                if cli_mode {
+                    let _ = self.redraw_cli_screen(&mut stdout);
+                }
+                break;
+            }
+
             if std::io::stdout().is_terminal() {
                 drain_resize_events(self, &mut stdout, "")?;
             }
@@ -983,67 +1087,12 @@ impl Agent {
             let mut history_to_send = self.state.history.clone();
 
             // Inject HuggingPlace Memory automatically if configured
-            if let (Some(org_id), Some(api_key)) = (&self.memory_org_id, &self.memory_api_key) {
-                // Only run memory extraction if the last message was from the user
-                if let Some(last_msg) = history_to_send.last() {
-                    if last_msg.role == Role::User {
-                        let user_question = last_msg.content.clone();
-                        let mut formatted_history = String::new();
-                        // Format the last few turns (e.g. 10) for context
-                        for msg in history_to_send.iter().rev().take(10).rev() {
-                            match msg.role {
-                                Role::User => {
-                                    formatted_history.push_str(&format!("Human: {}\n", msg.content))
-                                }
-                                Role::Assistant => {
-                                    formatted_history.push_str(&format!("AI: {}\n\n", msg.content))
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        let client = reqwest::Client::new();
-                        let payload = serde_json::json!({
-                            "session_id": channel_info
-                                .as_ref()
-                                .map(|info| info.channel_id.clone())
-                                .unwrap_or_else(|| self.id.clone()),
-                            "user_question": user_question,
-                            "org_id": org_id,
-                            "should_use_memory": "YES",
-                            "variables": serde_json::json!({ "formatted_history": formatted_history }).to_string()
-                        });
-
-                        if let Ok(res) = client
-                            .post("http://localhost:8001/get-memory-context")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .json(&payload)
-                            .send()
-                            .await
-                        {
-                            if res.status().is_success() {
-                                if let Ok(body) = res.json::<serde_json::Value>().await {
-                                    if let Some(memory_context) =
-                                        body.get("memory_context_used").and_then(|v| v.as_str())
-                                    {
-                                        if !memory_context.is_empty()
-                                            && memory_context.to_lowercase() != "none"
-                                        {
-                                            history_to_send.push(Message {
-                                                role: Role::System,
-                                                content: format!("Memory Context (use this to preserve continuity): {}", memory_context),
-                                                timestamp: now_secs(),
-                                                tool_calls: None,
-                                                tool_call_id: None,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let memory_session_id = channel_info
+                .as_ref()
+                .map(|info| info.channel_id.clone())
+                .unwrap_or_else(|| self.id.clone());
+            self.inject_memory_context(&mut history_to_send, &memory_session_id)
+                .await;
 
             let prepared = prepare_turn_request(
                 history_to_send,
@@ -1229,7 +1278,7 @@ impl Agent {
                                         if *queued_cursor > 0 { *queued_cursor -= 1; }
                                     },
                                     crossterm::event::KeyCode::Right => {
-                                        if *queued_cursor < *queued_cursor { *queued_cursor += 1; }
+                                        if *queued_cursor < queued_input.chars().count() { *queued_cursor += 1; }
                                     },
                                     crossterm::event::KeyCode::Enter => {
                                         let mut chars: Vec<char> = queued_input.chars().collect();
@@ -1320,10 +1369,17 @@ impl Agent {
 
 
                     let result = match tool {
-                        Some(t) => {
+                        Some(t) => match serde_json::from_str::<serde_json::Value>(if tc.arguments.trim().is_empty() { "{}" } else { &tc.arguments }) {
+                            Err(err) => {
+                                // Malformed tool arguments: do not call the tool. Surface the
+                                // error back to the model so it can self-correct.
+                                format!(
+                                    "Error: tool '{}' received invalid JSON arguments: {}",
+                                    tc.name, err
+                                )
+                            }
+                            Ok(args) => {
                             debug!(tool_name = %tc.name, "Executing tool");
-                            let args: serde_json::Value =
-                                serde_json::from_str(&tc.arguments).unwrap_or_default();
 
                             if cli_mode {
                                 let _ = self.render_input_prompt(&mut stdout, "USER", CLI_DEEP_RGB, CLI_CYAN_RGB, &queued_input, *queued_cursor, &mut lines_occupied);
@@ -1388,6 +1444,7 @@ impl Agent {
                                 let _ = stdout.flush();
                             }
                             res
+                            }
                         }
                         None => format!("Tool '{}' not found", tc.name),
                     };
@@ -1453,7 +1510,30 @@ impl Agent {
 
         let mut stdout = io::stdout();
 
+        let mut iterations: usize = 0;
         loop {
+            iterations += 1;
+            if iterations > MAX_AGENT_ITERATIONS {
+                let notice = format!(
+                    "[SwarmClaw stopped after {} tool iterations to avoid an unbounded loop.]",
+                    MAX_AGENT_ITERATIONS
+                );
+                write_cli_line(&mut stdout, format!(
+                    "{} {}",
+                    cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB),
+                    notice.truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2),
+                ))?;
+                apply_cli_palette(&mut stdout)?;
+                self.record_message(Message {
+                    role: Role::Assistant,
+                    content: notice,
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                break;
+            }
+
             print!("Thinking...");
             stdout.flush()?;
 
@@ -1464,65 +1544,10 @@ impl Agent {
 
             let mut history_to_send = self.state.history.clone();
 
-            // Inject HuggingPlace Memory automatically if configured
-            if let (Some(org_id), Some(api_key)) = (&self.memory_org_id, &self.memory_api_key) {
-                // Only run memory extraction if the last message was from the user
-                if let Some(last_msg) = history_to_send.last() {
-                    if last_msg.role == Role::User {
-                        let user_question = last_msg.content.clone();
-                        let mut formatted_history = String::new();
-                        // Format the last few turns (e.g. 10) for context
-                        for msg in history_to_send.iter().rev().take(10).rev() {
-                            match msg.role {
-                                Role::User => {
-                                    formatted_history.push_str(&format!("Human: {}\n", msg.content))
-                                }
-                                Role::Assistant => {
-                                    formatted_history.push_str(&format!("AI: {}\n\n", msg.content))
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        let client = reqwest::Client::new();
-                        let payload = serde_json::json!({
-                            "session_id": self.id.clone(),
-                            "user_question": user_question,
-                            "org_id": org_id,
-                            "should_use_memory": "YES",
-                            "variables": serde_json::json!({ "formatted_history": formatted_history }).to_string()
-                        });
-
-                        if let Ok(res) = client
-                            .post("http://localhost:8001/get-memory-context")
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .json(&payload)
-                            .send()
-                            .await
-                        {
-                            if res.status().is_success() {
-                                if let Ok(body) = res.json::<serde_json::Value>().await {
-                                    if let Some(memory_context) =
-                                        body.get("memory_context_used").and_then(|v| v.as_str())
-                                    {
-                                        if !memory_context.is_empty()
-                                            && memory_context.to_lowercase() != "none"
-                                        {
-                                            history_to_send.push(Message {
-                                                role: Role::System,
-                                                content: format!("Memory Context (use this to preserve continuity): {}", memory_context),
-                                                timestamp: now_secs(),
-                                                tool_calls: None,
-                                                tool_call_id: None,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Inject HuggingPlace Memory automatically if configured.
+            let memory_session_id = self.id.clone();
+            self.inject_memory_context(&mut history_to_send, &memory_session_id)
+                .await;
 
             let prepared = prepare_turn_request(
                 history_to_send,
@@ -1553,47 +1578,55 @@ impl Agent {
                     print!("\r\x1b[K");
                     stdout.flush()?;
 
-                    if let Some(content) = &response.content {
-                        if !content.is_empty() {
-                            let redacted_content = Redactor::redact(content);
-                            write_cli_line(&mut stdout, format!(
-                                "{} {}",
-                                cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB),
-                                redacted_content.truecolor(
-                                    CLI_FG_RGB.0,
-                                    CLI_FG_RGB.1,
-                                    CLI_FG_RGB.2
-                                ),
-                            ))?;
-                            apply_cli_palette(&mut stdout)?;
-
-                            let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
-                            if let Some(tool_calls) = &response.tool_calls {
-                                if !tool_calls.is_empty() {
-                                    let mut tc_vec = Vec::new();
-                                    for tc in tool_calls {
-                                        tc_vec.push(serde_json::json!({
-                                            "id": tc.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tc.name,
-                                                "arguments": tc.arguments,
-                                                "thought_signature": tc.thought_signature,
-                                            }
-                                        }));
+                    // Build the assistant tool_calls payload (if any) up front so we can
+                    // record the assistant message whenever there is content OR tool calls.
+                    let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
+                    if let Some(tool_calls) = &response.tool_calls {
+                        if !tool_calls.is_empty() {
+                            let mut tc_vec = Vec::new();
+                            for tc in tool_calls {
+                                tc_vec.push(serde_json::json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments,
+                                        "thought_signature": tc.thought_signature,
                                     }
-                                    assistant_tool_calls = Some(tc_vec);
-                                }
+                                }));
                             }
-
-                            self.record_message(Message {
-                                role: Role::Assistant,
-                                content: redacted_content,
-                                timestamp: now_secs(),
-                                tool_calls: assistant_tool_calls,
-                                tool_call_id: None,
-                            });
+                            assistant_tool_calls = Some(tc_vec);
                         }
+                    }
+
+                    let content_nonempty = response.content.clone().unwrap_or_default();
+                    let redacted_content = Redactor::redact(&content_nonempty);
+
+                    // Only print to the CLI when there is actual text content.
+                    if !content_nonempty.is_empty() {
+                        write_cli_line(&mut stdout, format!(
+                            "{} {}",
+                            cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB),
+                            redacted_content.truecolor(
+                                CLI_FG_RGB.0,
+                                CLI_FG_RGB.1,
+                                CLI_FG_RGB.2
+                            ),
+                        ))?;
+                        apply_cli_palette(&mut stdout)?;
+                    }
+
+                    // Record the assistant message whenever there is non-empty content OR
+                    // at least one tool call, so tool-result messages always have a
+                    // preceding tool_calls message (OpenAI-style APIs 400 otherwise).
+                    if !content_nonempty.is_empty() || assistant_tool_calls.is_some() {
+                        self.record_message(Message {
+                            role: Role::Assistant,
+                            content: redacted_content,
+                            timestamp: now_secs(),
+                            tool_calls: assistant_tool_calls,
+                            tool_call_id: None,
+                        });
                     }
 
                     if let Some(tool_calls) = response.tool_calls {
@@ -1619,16 +1652,23 @@ impl Agent {
                             let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
 
                             let result = match tool {
-                                Some(t) => {
-                                    let args: serde_json::Value =
-                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
-
-                                    // Use WorkerPool to isolate tool execution
-                                    match WorkerPool::execute_tool(t, args).await {
-                                        Ok(res) => res,
-                                        Err(e) => format!("Error: {}", e),
+                                Some(t) => match serde_json::from_str::<serde_json::Value>(if tc.arguments.trim().is_empty() { "{}" } else { &tc.arguments }) {
+                                    Err(err) => {
+                                        // Malformed tool arguments: do not call the tool. Surface
+                                        // the error back to the model so it can self-correct.
+                                        format!(
+                                            "Error: tool '{}' received invalid JSON arguments: {}",
+                                            tc.name, err
+                                        )
                                     }
-                                }
+                                    Ok(args) => {
+                                        // Use WorkerPool to isolate tool execution
+                                        match WorkerPool::execute_tool(t, args).await {
+                                            Ok(res) => res,
+                                            Err(e) => format!("Error: {}", e),
+                                        }
+                                    }
+                                },
                                 None => format!("Tool '{}' not found", tc.name),
                             };
 

@@ -24,6 +24,11 @@ use plugin_generated::swarmclaw_plugin::{
     PluginManifest, PluginRequest, PluginRequestArgs, PluginResponse,
 };
 
+/// Fuel budget granted to each guest instantiation. Generous enough for any
+/// legitimate workload, but bounded so a runaway/infinite-loop guest traps
+/// (with a fuel-exhaustion trap) rather than hanging the host thread forever.
+const WASM_FUEL_LIMIT: u64 = 10_000_000_000;
+
 struct WasmState {
     wasi: WasiCtx,
     capabilities: Vec<String>,
@@ -141,6 +146,9 @@ impl WasmSkill {
         pool.total_tables(100);
 
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+        // Enable fuel metering so a runaway guest (e.g. an infinite loop) traps
+        // instead of hanging the host worker thread forever.
+        config.consume_fuel(true);
         let engine =
             Engine::new(&config).context("Failed to create Wasmtime Engine with pooling")?;
 
@@ -198,7 +206,16 @@ struct WasmManifest {
 
 fn load_module(engine: &Engine, path: &Path) -> Result<Module> {
     let cwasm_path = path.with_extension("cwasm");
-    if cwasm_path.exists() {
+
+    // Only trust the cached `.cwasm` if it is at least as new as the source
+    // `.wasm`. A stale cache (source recompiled/replaced after the cache was
+    // written) must be discarded. If either mtime can't be read, fall back to
+    // recompiling rather than risk deserializing a stale/mismatched artifact.
+    if cwasm_path.exists() && cwasm_is_fresh(&cwasm_path, path) {
+        // SAFETY: `Module::deserialize_file` is unsafe because it trusts the
+        // serialized artifact to match this engine/version. The cache is a
+        // trusted, local-only file we wrote ourselves next to the source
+        // module, and the mtime guard above ensures it is not stale.
         unsafe {
             return Module::deserialize_file(engine, &cwasm_path)
                 .context("Failed to deserialize cached .cwasm module");
@@ -211,6 +228,18 @@ fn load_module(engine: &Engine, path: &Path) -> Result<Module> {
         let _ = fs::write(&cwasm_path, serialized);
     }
     Ok(module)
+}
+
+/// Returns true only if the cached `.cwasm` is at least as new as the source
+/// `.wasm`. Any failure to read either modified time is treated as "not fresh"
+/// so we recompile rather than use a possibly-stale cache.
+fn cwasm_is_fresh(cwasm_path: &Path, source_path: &Path) -> bool {
+    let cwasm_mtime = fs::metadata(cwasm_path).and_then(|m| m.modified());
+    let source_mtime = fs::metadata(source_path).and_then(|m| m.modified());
+    match (cwasm_mtime, source_mtime) {
+        (Ok(cwasm), Ok(source)) => cwasm >= source,
+        _ => false,
+    }
 }
 
 fn discover_manifest(engine: &Engine, module: &Module, path: &Path) -> Result<WasmManifest> {
@@ -281,6 +310,13 @@ fn instantiate(
             http_response: Vec::new(),
         },
     );
+
+    // Bound guest execution. Requires `Config::consume_fuel(true)` (set in
+    // `WasmSkill::new`). On wasmtime 41 this is `Store::set_fuel(u64)`; once the
+    // budget is exhausted the guest traps instead of looping forever.
+    store
+        .set_fuel(WASM_FUEL_LIMIT)
+        .context("Failed to set WASM fuel limit on store")?;
 
     let mut linker = Linker::new(engine);
     wasi_common::sync::add_to_linker(&mut linker, |s: &mut WasmState| &mut s.wasi)?;
@@ -377,7 +413,11 @@ fn execute_host_http_request(
         let handle = tokio::runtime::Handle::try_current()
             .context("host_http_request requires an active Tokio runtime")?;
         handle.block_on(async move {
-            let mut builder = client.request(method, &url);
+            let mut builder = client
+                .request(method, &url)
+                // Bound the request so a hung remote endpoint can't block the
+                // worker thread (inside `block_in_place`) forever.
+                .timeout(std::time::Duration::from_secs(30));
             for (name, value) in &headers {
                 builder = builder.header(name, value);
             }
@@ -444,15 +484,44 @@ fn build_plugin_request(tool_name: &str, args: &Value) -> Result<Vec<u8>> {
 }
 
 fn is_http_url_allowed(capabilities: &[String], url: &str) -> bool {
+    // Parse the request URL and extract its host. If it doesn't parse or has no
+    // host, deny — a prefix/string match would otherwise be exploitable
+    // (e.g. capability `http:https://api.good.com` must NOT authorize
+    // `https://api.good.com.evil.com`).
+    let request_host = match reqwest::Url::parse(url).ok().and_then(|u| {
+        u.host_str().map(|h| h.to_ascii_lowercase())
+    }) {
+        Some(host) => host,
+        None => return false,
+    };
+
     capabilities.iter().any(|capability| {
         if capability == "http:*" {
             return true;
         }
 
-        capability
-            .strip_prefix("http:")
-            .map(|prefix| url.starts_with(prefix))
-            .unwrap_or(false)
+        let value = match capability.strip_prefix("http:") {
+            Some(value) => value,
+            None => return false,
+        };
+
+        // The capability value may itself be a full URL or a bare host.
+        let cap_host = match reqwest::Url::parse(value)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        {
+            // Parsed as a URL: require an exact host match.
+            Some(cap_host) => return request_host == cap_host,
+            // Not a URL: treat the value as a bare host string.
+            None => value.trim().to_ascii_lowercase(),
+        };
+
+        if cap_host.is_empty() {
+            return false;
+        }
+
+        // Bare host: allow exact match or a subdomain of the capability host.
+        request_host == cap_host || request_host.ends_with(&format!(".{}", cap_host))
     })
 }
 
