@@ -17,3 +17,7 @@ Thumbs.db
 .env
 swarmclaw/swarmclaw_local.db
 swarmclaw_local.db
+
+# Backups and generated caches
+*.bak
+*.cwasm

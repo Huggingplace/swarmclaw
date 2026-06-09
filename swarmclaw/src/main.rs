@@ -874,8 +874,12 @@ async fn run_agent(workspace: Option<String>, agent_id: Option<String>) -> anyho
                             });
 
                             // Attempt to provision against the HuggingPlace API
+                            let base = std::env::var("HUGGINGPLACE_MEMORY_BASE_URL")
+                                .unwrap_or_else(|_| "http://localhost:8001".to_string());
+                            let base = base.trim_end_matches('/');
+                            let users_url = format!("{}/api/users", base);
                             let res = client
-                                .post("http://localhost:8001/api/users")
+                                .post(&users_url)
                                 .json(&payload)
                                 .send()
                                 .await;
