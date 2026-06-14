@@ -982,6 +982,24 @@ impl Agent {
 
             let mut history_to_send = self.state.history.clone();
 
+            // Context-pressure: bound the history we send to the model so that
+            // long-lived agents and chat gateways don't overflow the context
+            // window. The stored history (self.state.history) is untouched.
+            {
+                let before = history_to_send.len();
+                history_to_send = crate::core::context::trim_to_budget(
+                    &history_to_send,
+                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                );
+                if history_to_send.len() < before {
+                    debug!(
+                        kept = history_to_send.len(),
+                        dropped = before - history_to_send.len(),
+                        "Trimmed conversation history to context budget"
+                    );
+                }
+            }
+
             // Inject HuggingPlace Memory automatically if configured
             if let (Some(org_id), Some(api_key)) = (&self.memory_org_id, &self.memory_api_key) {
                 // Only run memory extraction if the last message was from the user
@@ -1463,6 +1481,24 @@ impl Agent {
             };
 
             let mut history_to_send = self.state.history.clone();
+
+            // Context-pressure: bound the history we send to the model so that
+            // long-lived agents and chat gateways don't overflow the context
+            // window. The stored history (self.state.history) is untouched.
+            {
+                let before = history_to_send.len();
+                history_to_send = crate::core::context::trim_to_budget(
+                    &history_to_send,
+                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                );
+                if history_to_send.len() < before {
+                    debug!(
+                        kept = history_to_send.len(),
+                        dropped = before - history_to_send.len(),
+                        "Trimmed conversation history to context budget"
+                    );
+                }
+            }
 
             // Inject HuggingPlace Memory automatically if configured
             if let (Some(org_id), Some(api_key)) = (&self.memory_org_id, &self.memory_api_key) {
