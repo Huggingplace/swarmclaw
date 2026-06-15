@@ -2142,6 +2142,40 @@ fn render_cli_logo(stdout: &mut io::Stdout, width: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Build the `termimad::MadSkin` used to render assistant markdown.
+///
+/// `bg` is the card background color (the charcoal panel). Body text uses the
+/// off-white foreground over that background, while fenced code blocks and
+/// inline code get a distinct, slightly elevated treatment so code reads as
+/// visually separate from prose. termimad does not perform language-aware
+/// syntax highlighting, so this only styles the code regions (background,
+/// foreground, border) rather than individual tokens.
+///
+/// Kept as a pure helper so it can be unit-tested and shared between the
+/// history render path and (potentially) the live streaming path.
+fn assistant_skin(bg: crossterm::style::Color) -> termimad::MadSkin {
+    use crossterm::style::Color;
+
+    let mut skin = termimad::MadSkin::default();
+    let fg = Color::Rgb { r: 245, g: 245, b: 250 };
+    skin.set_fg(fg);
+    skin.set_bg(bg);
+
+    // Elevated, darker panel for fenced code blocks with a soft monospace-ish
+    // foreground. Note: `set_bg` above intentionally skips code styles, so we
+    // configure them explicitly here.
+    let code_bg = Color::Rgb { r: 24, g: 26, b: 31 };
+    let code_fg = Color::Rgb { r: 173, g: 215, b: 175 }; // muted green, code-ish
+    skin.code_block.set_fgbg(code_fg, code_bg);
+
+    // Inline code: same elevated background but distinct (amber) foreground so
+    // it stands out within a line of prose.
+    let inline_fg = Color::Rgb { r: 220, g: 184, b: 120 };
+    skin.inline_code.set_fgbg(inline_fg, code_bg);
+
+    skin
+}
+
 fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Result<()> {
     let mut has_visible_messages = false;
 
@@ -2201,9 +2235,7 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                     let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
                     let _ = write!(stdout, "\r\n");
                     
-                    let mut skin = termimad::MadSkin::default();
-                    skin.set_fg(crossterm::style::Color::Rgb { r: 245, g: 245, b: 250 });
-                    skin.set_bg(bg);
+                    let skin = assistant_skin(bg);
                     let term_width = crossterm::terminal::size().unwrap_or((100, 40)).0 as usize;
                     let rendered = format!("{}", skin.text(&message.content, Some(term_width.saturating_sub(4))));
                     
@@ -2611,8 +2643,8 @@ fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        now_secs, prepare_turn_request, session_capability_notice, truncate_for_display,
-        wrap_text, TurnMode,
+        assistant_skin, now_secs, prepare_turn_request, session_capability_notice,
+        truncate_for_display, wrap_text, TurnMode,
     };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
@@ -2667,6 +2699,38 @@ mod tests {
         let (by_lines, t3) = truncate_for_display(many, 2, 1000);
         assert_eq!(by_lines, "a\nb");
         assert!(t3);
+    }
+
+    #[test]
+    fn assistant_skin_constructs_without_panicking() {
+        let bg = crossterm::style::Color::Rgb { r: 35, g: 38, b: 45 };
+        let skin = assistant_skin(bg);
+        // Body paragraph background should be the requested card bg.
+        assert_eq!(
+            skin.paragraph.compound_style.object_style.background_color,
+            Some(bg)
+        );
+    }
+
+    #[test]
+    fn assistant_skin_code_block_differs_from_body() {
+        let bg = crossterm::style::Color::Rgb { r: 35, g: 38, b: 45 };
+        let skin = assistant_skin(bg);
+
+        let body_bg = skin.paragraph.compound_style.object_style.background_color;
+        let body_fg = skin.paragraph.compound_style.object_style.foreground_color;
+        let code_bg = skin.code_block.compound_style.object_style.background_color;
+        let code_fg = skin.code_block.compound_style.object_style.foreground_color;
+        let inline_bg = skin.inline_code.object_style.background_color;
+        let inline_fg = skin.inline_code.object_style.foreground_color;
+
+        // Code blocks must be visually distinct from body text.
+        assert_ne!(code_bg, body_bg, "code block bg should differ from body bg");
+        assert_ne!(code_fg, body_fg, "code block fg should differ from body fg");
+        // Inline code should be elevated like code blocks but use a distinct fg.
+        assert_eq!(inline_bg, code_bg, "inline code shares the elevated code bg");
+        assert_ne!(inline_fg, body_fg, "inline code fg should differ from body fg");
+        assert_ne!(inline_fg, code_fg, "inline code fg should differ from block fg");
     }
 
     #[derive(Clone)]
