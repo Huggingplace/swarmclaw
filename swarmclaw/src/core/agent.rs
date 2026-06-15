@@ -982,6 +982,24 @@ impl Agent {
 
             let mut history_to_send = self.state.history.clone();
 
+            // Context-pressure: bound the history we send to the model so that
+            // long-lived agents and chat gateways don't overflow the context
+            // window. The stored history (self.state.history) is untouched.
+            {
+                let before = history_to_send.len();
+                history_to_send = crate::core::context::trim_to_budget(
+                    &history_to_send,
+                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                );
+                if history_to_send.len() < before {
+                    debug!(
+                        kept = history_to_send.len(),
+                        dropped = before - history_to_send.len(),
+                        "Trimmed conversation history to context budget"
+                    );
+                }
+            }
+
             // Inject HuggingPlace Memory automatically if configured
             if let (Some(org_id), Some(api_key)) = (&self.memory_org_id, &self.memory_api_key) {
                 // Only run memory extraction if the last message was from the user
@@ -1463,6 +1481,24 @@ impl Agent {
             };
 
             let mut history_to_send = self.state.history.clone();
+
+            // Context-pressure: bound the history we send to the model so that
+            // long-lived agents and chat gateways don't overflow the context
+            // window. The stored history (self.state.history) is untouched.
+            {
+                let before = history_to_send.len();
+                history_to_send = crate::core::context::trim_to_budget(
+                    &history_to_send,
+                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                );
+                if history_to_send.len() < before {
+                    debug!(
+                        kept = history_to_send.len(),
+                        dropped = before - history_to_send.len(),
+                        "Trimmed conversation history to context budget"
+                    );
+                }
+            }
 
             // Inject HuggingPlace Memory automatically if configured
             if let (Some(org_id), Some(api_key)) = (&self.memory_org_id, &self.memory_api_key) {
@@ -2106,6 +2142,40 @@ fn render_cli_logo(stdout: &mut io::Stdout, width: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Build the `termimad::MadSkin` used to render assistant markdown.
+///
+/// `bg` is the card background color (the charcoal panel). Body text uses the
+/// off-white foreground over that background, while fenced code blocks and
+/// inline code get a distinct, slightly elevated treatment so code reads as
+/// visually separate from prose. termimad does not perform language-aware
+/// syntax highlighting, so this only styles the code regions (background,
+/// foreground, border) rather than individual tokens.
+///
+/// Kept as a pure helper so it can be unit-tested and shared between the
+/// history render path and (potentially) the live streaming path.
+fn assistant_skin(bg: crossterm::style::Color) -> termimad::MadSkin {
+    use crossterm::style::Color;
+
+    let mut skin = termimad::MadSkin::default();
+    let fg = Color::Rgb { r: 245, g: 245, b: 250 };
+    skin.set_fg(fg);
+    skin.set_bg(bg);
+
+    // Elevated, darker panel for fenced code blocks with a soft monospace-ish
+    // foreground. Note: `set_bg` above intentionally skips code styles, so we
+    // configure them explicitly here.
+    let code_bg = Color::Rgb { r: 24, g: 26, b: 31 };
+    let code_fg = Color::Rgb { r: 173, g: 215, b: 175 }; // muted green, code-ish
+    skin.code_block.set_fgbg(code_fg, code_bg);
+
+    // Inline code: same elevated background but distinct (amber) foreground so
+    // it stands out within a line of prose.
+    let inline_fg = Color::Rgb { r: 220, g: 184, b: 120 };
+    skin.inline_code.set_fgbg(inline_fg, code_bg);
+
+    skin
+}
+
 fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Result<()> {
     let mut has_visible_messages = false;
 
@@ -2123,7 +2193,10 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                 let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
                 let _ = write!(stdout, "\r\n");
                 
-                let lines: Vec<&str> = message.content.split('\n').collect();
+                let width = (crossterm::terminal::size().unwrap_or((100, 40)).0 as usize)
+                    .saturating_sub(4)
+                    .max(20);
+                let lines = wrap_text(&message.content, width);
                 for (i, line) in lines.iter().enumerate() {
                     let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
                     if i == 0 {
@@ -2132,7 +2205,7 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                     } else {
                         let _ = write!(stdout, "   ");
                     }
-                    let _ = write!(stdout, "{}", line.replace("\r", ""));
+                    let _ = write!(stdout, "{}", line);
                     let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
                     let _ = write!(stdout, "\r\n");
                 }
@@ -2162,9 +2235,7 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                     let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
                     let _ = write!(stdout, "\r\n");
                     
-                    let mut skin = termimad::MadSkin::default();
-                    skin.set_fg(crossterm::style::Color::Rgb { r: 245, g: 245, b: 250 });
-                    skin.set_bg(bg);
+                    let skin = assistant_skin(bg);
                     let term_width = crossterm::terminal::size().unwrap_or((100, 40)).0 as usize;
                     let rendered = format!("{}", skin.text(&message.content, Some(term_width.saturating_sub(4))));
                     
@@ -2189,6 +2260,7 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                 }
 
                 if let Some(tool_calls) = &message.tool_calls {
+                    let width = terminal_width().saturating_sub(6).max(20);
                     for tool_call in tool_calls {
                         let name = tool_call
                             .get("function")
@@ -2202,37 +2274,82 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                             .unwrap_or("{}");
 
                         has_visible_messages = true;
+                        // Header: chip + tool name.
                         write_cli_line(
                             stdout,
                             format!(
-                                "{} {} {}",
+                                "{} {}",
                                 cli_chip("TOOL", CLI_FG_RGB, CLI_BORDER_RGB),
                                 name.truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2)
                                     .bold(),
-                                arguments.truecolor(
-                                    CLI_MUTED_RGB.0,
-                                    CLI_MUTED_RGB.1,
-                                    CLI_MUTED_RGB.2
-                                ),
                             ),
                         )?;
+                        // Body: wrapped + truncated arguments.
+                        let (shown, truncated) = truncate_for_display(arguments, 6, 600);
+                        for line in wrap_text(&shown, width) {
+                            if line.is_empty() {
+                                continue;
+                            }
+                            write_cli_line(
+                                stdout,
+                                format!(
+                                    "  {}",
+                                    line.truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    )
+                                ),
+                            )?;
+                        }
+                        if truncated {
+                            write_cli_line(
+                                stdout,
+                                format!(
+                                    "  {}",
+                                    "… (arguments truncated)".truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    )
+                                ),
+                            )?;
+                        }
                     }
                 }
             }
             Role::Tool => {
                 has_visible_messages = true;
-                write_cli_line(
-                    stdout,
-                    format!(
-                        "{} {}",
-                        cli_chip("RESULT", CLI_FG_RGB, CLI_RESULT_RGB),
-                        message.content.truecolor(
-                            CLI_MUTED_RGB.0,
-                            CLI_MUTED_RGB.1,
-                            CLI_MUTED_RGB.2
+                let width = terminal_width().saturating_sub(6).max(20);
+                // Header chip on its own line, then wrapped + truncated body so a
+                // large tool output can't flood the scrollback or overflow width.
+                write_cli_line(stdout, cli_chip("RESULT", CLI_FG_RGB, CLI_RESULT_RGB))?;
+                let (shown, truncated) = truncate_for_display(&message.content, 12, 4000);
+                for line in wrap_text(&shown, width) {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    write_cli_line(
+                        stdout,
+                        format!(
+                            "  {}",
+                            line.truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2)
                         ),
-                    ),
-                )?;
+                    )?;
+                }
+                if truncated {
+                    write_cli_line(
+                        stdout,
+                        format!(
+                            "  {}",
+                            "… (output truncated)".truecolor(
+                                CLI_MUTED_RGB.0,
+                                CLI_MUTED_RGB.1,
+                                CLI_MUTED_RGB.2
+                            )
+                        ),
+                    )?;
+                }
             }
         }
     }
@@ -2407,6 +2524,103 @@ fn fit_tail_text(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// Word-wrap `text` to `width` columns, preserving existing line breaks.
+///
+/// Used to keep TUI "cards" inside the viewport. Words longer than `width` are
+/// hard-split so a single long token (URLs, hashes, minified JSON) can't run
+/// off the edge. Always returns at least one line.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+
+    for raw_line in text.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_len = 0usize;
+
+        for word in line.split(' ') {
+            let word_len = word.chars().count();
+
+            // A word longer than the whole width: flush, then hard-split it.
+            if word_len > width {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                    current_len = 0;
+                }
+                let mut chunk = String::new();
+                let mut chunk_len = 0usize;
+                for ch in word.chars() {
+                    if chunk_len == width {
+                        out.push(std::mem::take(&mut chunk));
+                        chunk_len = 0;
+                    }
+                    chunk.push(ch);
+                    chunk_len += 1;
+                }
+                current = chunk;
+                current_len = chunk_len;
+                continue;
+            }
+
+            let needed = if current.is_empty() {
+                word_len
+            } else {
+                word_len + 1
+            };
+            if current_len + needed > width {
+                out.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            if current.is_empty() {
+                current.push_str(word);
+                current_len = word_len;
+            } else {
+                current.push(' ');
+                current.push_str(word);
+                current_len += word_len + 1;
+            }
+        }
+
+        out.push(current);
+    }
+
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Cap a tool result for display by both line count and character count,
+/// returning the (possibly shortened) text and whether anything was elided.
+/// Prevents a single large output (e.g. reading a big file) from flooding the
+/// scrollback.
+fn truncate_for_display(text: &str, max_lines: usize, max_chars: usize) -> (String, bool) {
+    let mut truncated = false;
+
+    let mut shown: String = if text.chars().count() > max_chars {
+        truncated = true;
+        text.chars().take(max_chars).collect()
+    } else {
+        text.to_string()
+    };
+
+    if shown.split('\n').count() > max_lines {
+        truncated = true;
+        shown = shown
+            .split('\n')
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    (shown, truncated)
+}
+
 fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
     format!(
         "\x1b[1m\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m {} \x1b[22m\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
@@ -2428,13 +2642,96 @@ fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{now_secs, prepare_turn_request, session_capability_notice, TurnMode};
+    use super::{
+        assistant_skin, now_secs, prepare_turn_request, session_capability_notice,
+        truncate_for_display, wrap_text, TurnMode,
+    };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::Arc;
+
+    #[test]
+    fn wrap_text_breaks_on_word_boundaries_within_width() {
+        let out = wrap_text("the quick brown fox", 9);
+        for line in &out {
+            assert!(line.chars().count() <= 9, "line too wide: {line:?}");
+        }
+        // Round-trips to the same words when joined.
+        assert_eq!(out.join(" ").split_whitespace().collect::<Vec<_>>(),
+                   vec!["the", "quick", "brown", "fox"]);
+    }
+
+    #[test]
+    fn wrap_text_hard_splits_oversized_words() {
+        let out = wrap_text("supercalifragilistic", 5);
+        assert!(out.len() > 1);
+        for line in &out {
+            assert!(line.chars().count() <= 5);
+        }
+        assert_eq!(out.concat(), "supercalifragilistic");
+    }
+
+    #[test]
+    fn wrap_text_preserves_blank_lines() {
+        let out = wrap_text("a\n\nb", 10);
+        assert_eq!(out, vec!["a".to_string(), String::new(), "b".to_string()]);
+    }
+
+    #[test]
+    fn wrap_text_always_returns_at_least_one_line() {
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn truncate_for_display_caps_chars_and_lines() {
+        let (short, t1) = truncate_for_display("hello", 10, 100);
+        assert_eq!(short, "hello");
+        assert!(!t1);
+
+        let (by_chars, t2) = truncate_for_display("abcdefghij", 10, 4);
+        assert_eq!(by_chars, "abcd");
+        assert!(t2);
+
+        let many = "a\nb\nc\nd\ne";
+        let (by_lines, t3) = truncate_for_display(many, 2, 1000);
+        assert_eq!(by_lines, "a\nb");
+        assert!(t3);
+    }
+
+    #[test]
+    fn assistant_skin_constructs_without_panicking() {
+        let bg = crossterm::style::Color::Rgb { r: 35, g: 38, b: 45 };
+        let skin = assistant_skin(bg);
+        // Body paragraph background should be the requested card bg.
+        assert_eq!(
+            skin.paragraph.compound_style.object_style.background_color,
+            Some(bg)
+        );
+    }
+
+    #[test]
+    fn assistant_skin_code_block_differs_from_body() {
+        let bg = crossterm::style::Color::Rgb { r: 35, g: 38, b: 45 };
+        let skin = assistant_skin(bg);
+
+        let body_bg = skin.paragraph.compound_style.object_style.background_color;
+        let body_fg = skin.paragraph.compound_style.object_style.foreground_color;
+        let code_bg = skin.code_block.compound_style.object_style.background_color;
+        let code_fg = skin.code_block.compound_style.object_style.foreground_color;
+        let inline_bg = skin.inline_code.object_style.background_color;
+        let inline_fg = skin.inline_code.object_style.foreground_color;
+
+        // Code blocks must be visually distinct from body text.
+        assert_ne!(code_bg, body_bg, "code block bg should differ from body bg");
+        assert_ne!(code_fg, body_fg, "code block fg should differ from body fg");
+        // Inline code should be elevated like code blocks but use a distinct fg.
+        assert_eq!(inline_bg, code_bg, "inline code shares the elevated code bg");
+        assert_ne!(inline_fg, body_fg, "inline code fg should differ from body fg");
+        assert_ne!(inline_fg, code_fg, "inline code fg should differ from block fg");
+    }
 
     #[derive(Clone)]
     struct DummyTool;
