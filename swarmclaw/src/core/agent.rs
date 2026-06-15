@@ -2159,7 +2159,10 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                 let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
                 let _ = write!(stdout, "\r\n");
                 
-                let lines: Vec<&str> = message.content.split('\n').collect();
+                let width = (crossterm::terminal::size().unwrap_or((100, 40)).0 as usize)
+                    .saturating_sub(4)
+                    .max(20);
+                let lines = wrap_text(&message.content, width);
                 for (i, line) in lines.iter().enumerate() {
                     let _ = crossterm::execute!(stdout, crossterm::style::SetBackgroundColor(bg));
                     if i == 0 {
@@ -2168,7 +2171,7 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                     } else {
                         let _ = write!(stdout, "   ");
                     }
-                    let _ = write!(stdout, "{}", line.replace("\r", ""));
+                    let _ = write!(stdout, "{}", line);
                     let _ = crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine));
                     let _ = write!(stdout, "\r\n");
                 }
@@ -2225,6 +2228,7 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                 }
 
                 if let Some(tool_calls) = &message.tool_calls {
+                    let width = terminal_width().saturating_sub(6).max(20);
                     for tool_call in tool_calls {
                         let name = tool_call
                             .get("function")
@@ -2238,37 +2242,82 @@ fn render_cli_history(stdout: &mut io::Stdout, history: &[Message]) -> io::Resul
                             .unwrap_or("{}");
 
                         has_visible_messages = true;
+                        // Header: chip + tool name.
                         write_cli_line(
                             stdout,
                             format!(
-                                "{} {} {}",
+                                "{} {}",
                                 cli_chip("TOOL", CLI_FG_RGB, CLI_BORDER_RGB),
                                 name.truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2)
                                     .bold(),
-                                arguments.truecolor(
-                                    CLI_MUTED_RGB.0,
-                                    CLI_MUTED_RGB.1,
-                                    CLI_MUTED_RGB.2
-                                ),
                             ),
                         )?;
+                        // Body: wrapped + truncated arguments.
+                        let (shown, truncated) = truncate_for_display(arguments, 6, 600);
+                        for line in wrap_text(&shown, width) {
+                            if line.is_empty() {
+                                continue;
+                            }
+                            write_cli_line(
+                                stdout,
+                                format!(
+                                    "  {}",
+                                    line.truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    )
+                                ),
+                            )?;
+                        }
+                        if truncated {
+                            write_cli_line(
+                                stdout,
+                                format!(
+                                    "  {}",
+                                    "… (arguments truncated)".truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    )
+                                ),
+                            )?;
+                        }
                     }
                 }
             }
             Role::Tool => {
                 has_visible_messages = true;
-                write_cli_line(
-                    stdout,
-                    format!(
-                        "{} {}",
-                        cli_chip("RESULT", CLI_FG_RGB, CLI_RESULT_RGB),
-                        message.content.truecolor(
-                            CLI_MUTED_RGB.0,
-                            CLI_MUTED_RGB.1,
-                            CLI_MUTED_RGB.2
+                let width = terminal_width().saturating_sub(6).max(20);
+                // Header chip on its own line, then wrapped + truncated body so a
+                // large tool output can't flood the scrollback or overflow width.
+                write_cli_line(stdout, cli_chip("RESULT", CLI_FG_RGB, CLI_RESULT_RGB))?;
+                let (shown, truncated) = truncate_for_display(&message.content, 12, 4000);
+                for line in wrap_text(&shown, width) {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    write_cli_line(
+                        stdout,
+                        format!(
+                            "  {}",
+                            line.truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2)
                         ),
-                    ),
-                )?;
+                    )?;
+                }
+                if truncated {
+                    write_cli_line(
+                        stdout,
+                        format!(
+                            "  {}",
+                            "… (output truncated)".truecolor(
+                                CLI_MUTED_RGB.0,
+                                CLI_MUTED_RGB.1,
+                                CLI_MUTED_RGB.2
+                            )
+                        ),
+                    )?;
+                }
             }
         }
     }
@@ -2443,6 +2492,103 @@ fn fit_tail_text(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// Word-wrap `text` to `width` columns, preserving existing line breaks.
+///
+/// Used to keep TUI "cards" inside the viewport. Words longer than `width` are
+/// hard-split so a single long token (URLs, hashes, minified JSON) can't run
+/// off the edge. Always returns at least one line.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+
+    for raw_line in text.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_len = 0usize;
+
+        for word in line.split(' ') {
+            let word_len = word.chars().count();
+
+            // A word longer than the whole width: flush, then hard-split it.
+            if word_len > width {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                    current_len = 0;
+                }
+                let mut chunk = String::new();
+                let mut chunk_len = 0usize;
+                for ch in word.chars() {
+                    if chunk_len == width {
+                        out.push(std::mem::take(&mut chunk));
+                        chunk_len = 0;
+                    }
+                    chunk.push(ch);
+                    chunk_len += 1;
+                }
+                current = chunk;
+                current_len = chunk_len;
+                continue;
+            }
+
+            let needed = if current.is_empty() {
+                word_len
+            } else {
+                word_len + 1
+            };
+            if current_len + needed > width {
+                out.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            if current.is_empty() {
+                current.push_str(word);
+                current_len = word_len;
+            } else {
+                current.push(' ');
+                current.push_str(word);
+                current_len += word_len + 1;
+            }
+        }
+
+        out.push(current);
+    }
+
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Cap a tool result for display by both line count and character count,
+/// returning the (possibly shortened) text and whether anything was elided.
+/// Prevents a single large output (e.g. reading a big file) from flooding the
+/// scrollback.
+fn truncate_for_display(text: &str, max_lines: usize, max_chars: usize) -> (String, bool) {
+    let mut truncated = false;
+
+    let mut shown: String = if text.chars().count() > max_chars {
+        truncated = true;
+        text.chars().take(max_chars).collect()
+    } else {
+        text.to_string()
+    };
+
+    if shown.split('\n').count() > max_lines {
+        truncated = true;
+        shown = shown
+            .split('\n')
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    (shown, truncated)
+}
+
 fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
     format!(
         "\x1b[1m\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m {} \x1b[22m\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
@@ -2464,13 +2610,64 @@ fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{now_secs, prepare_turn_request, session_capability_notice, TurnMode};
+    use super::{
+        now_secs, prepare_turn_request, session_capability_notice, truncate_for_display,
+        wrap_text, TurnMode,
+    };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::Arc;
+
+    #[test]
+    fn wrap_text_breaks_on_word_boundaries_within_width() {
+        let out = wrap_text("the quick brown fox", 9);
+        for line in &out {
+            assert!(line.chars().count() <= 9, "line too wide: {line:?}");
+        }
+        // Round-trips to the same words when joined.
+        assert_eq!(out.join(" ").split_whitespace().collect::<Vec<_>>(),
+                   vec!["the", "quick", "brown", "fox"]);
+    }
+
+    #[test]
+    fn wrap_text_hard_splits_oversized_words() {
+        let out = wrap_text("supercalifragilistic", 5);
+        assert!(out.len() > 1);
+        for line in &out {
+            assert!(line.chars().count() <= 5);
+        }
+        assert_eq!(out.concat(), "supercalifragilistic");
+    }
+
+    #[test]
+    fn wrap_text_preserves_blank_lines() {
+        let out = wrap_text("a\n\nb", 10);
+        assert_eq!(out, vec!["a".to_string(), String::new(), "b".to_string()]);
+    }
+
+    #[test]
+    fn wrap_text_always_returns_at_least_one_line() {
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn truncate_for_display_caps_chars_and_lines() {
+        let (short, t1) = truncate_for_display("hello", 10, 100);
+        assert_eq!(short, "hello");
+        assert!(!t1);
+
+        let (by_chars, t2) = truncate_for_display("abcdefghij", 10, 4);
+        assert_eq!(by_chars, "abcd");
+        assert!(t2);
+
+        let many = "a\nb\nc\nd\ne";
+        let (by_lines, t3) = truncate_for_display(many, 2, 1000);
+        assert_eq!(by_lines, "a\nb");
+        assert!(t3);
+    }
 
     #[derive(Clone)]
     struct DummyTool;
