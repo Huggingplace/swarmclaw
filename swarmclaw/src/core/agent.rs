@@ -2929,11 +2929,207 @@ fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
     )
 }
 
+/// Outcome of [`Agent::run_slash`]: either the input was one of the stateful
+/// slash-commands (and produced plain-text output to display in the transcript),
+/// or it was not handled (so the caller treats it as chat / another command).
+pub(crate) enum SlashAction {
+    /// Not one of the stateful slash-commands handled here.
+    NotHandled,
+    /// Handled; show this plain text in the transcript.
+    Message(String),
+}
+
+/// Construct an LLM provider from an explicit provider name, returning the
+/// provider plus the confirmation message, or an error message for unknown
+/// names. Mirrors the classic `/provider` handler in [`Agent::run`] but as a
+/// pure, testable helper (API keys are read from the environment, defaulting to
+/// empty as the classic path does).
+fn provider_from_name(
+    name: &str,
+) -> Result<(Arc<dyn LLMProvider>, &'static str), &'static str> {
+    match name {
+        "openai" => Ok((
+            Arc::new(crate::llm::openai::OpenAIProvider::new(
+                std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            )),
+            "Switched to OpenAI",
+        )),
+        "anthropic" | "claude" => Ok((
+            Arc::new(crate::llm::anthropic::AnthropicProvider::new(
+                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            )),
+            "Switched to Anthropic",
+        )),
+        "gemini" | "google" => Ok((
+            Arc::new(crate::llm::gemini::GeminiProvider::new(
+                std::env::var("GEMINI_API_KEY").unwrap_or_default(),
+            )),
+            "Switched to Gemini",
+        )),
+        "groq" => Ok((
+            Arc::new(crate::llm::openai::OpenAIProvider::groq(
+                std::env::var("GROQ_API_KEY").unwrap_or_default(),
+            )),
+            "Switched to Groq",
+        )),
+        "grok" | "xai" => Ok((
+            Arc::new(crate::llm::openai::OpenAIProvider::grok(
+                std::env::var("XAI_API_KEY")
+                    .or_else(|_| std::env::var("GROK_API_KEY"))
+                    .unwrap_or_default(),
+            )),
+            "Switched to Grok",
+        )),
+        "ollama" | "local" => Ok((
+            Arc::new(crate::llm::ollama::OllamaProvider::new(
+                std::env::var("OLLAMA_HOST").unwrap_or_default(),
+            )),
+            "Switched to Ollama",
+        )),
+        _ => Err("Unknown provider. Valid options: openai, anthropic, gemini, groq, grok, ollama"),
+    }
+}
+
+/// Infer an LLM provider from a model-name prefix, or `None` if no prefix
+/// matches. Mirrors the auto-detect logic in the classic `/model` handler.
+fn provider_from_model(model: &str) -> Option<Arc<dyn LLMProvider>> {
+    if model.starts_with("gemini") {
+        Some(Arc::new(crate::llm::gemini::GeminiProvider::new(
+            std::env::var("GEMINI_API_KEY").unwrap_or_default(),
+        )))
+    } else if model.starts_with("gpt-") || model.starts_with("o1-") || model.starts_with("o3-") {
+        Some(Arc::new(crate::llm::openai::OpenAIProvider::new(
+            std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+        )))
+    } else if model.starts_with("claude-") {
+        Some(Arc::new(crate::llm::anthropic::AnthropicProvider::new(
+            std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+        )))
+    } else if model.starts_with("grok-") {
+        Some(Arc::new(crate::llm::openai::OpenAIProvider::grok(
+            std::env::var("XAI_API_KEY")
+                .or_else(|_| std::env::var("GROK_API_KEY"))
+                .unwrap_or_default(),
+        )))
+    } else {
+        None
+    }
+}
+
+impl Agent {
+    /// Handle the stateful fullscreen slash-commands (`/key`, `/model`,
+    /// `/provider`, `/orchestrator`, `/multithread`).
+    ///
+    /// Returns [`SlashAction::Message`] with plain-text output to render in the
+    /// ratatui transcript when the input is one of these commands, or
+    /// [`SlashAction::NotHandled`] otherwise. This mirrors the behavior of the
+    /// classic CLI handlers in [`Agent::run`] but returns plain text instead of
+    /// writing ANSI escapes; the classic path is intentionally left untouched.
+    pub(crate) fn run_slash(&mut self, input: &str) -> SlashAction {
+        if input.starts_with("/key") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let new_key = parts[1].trim().to_string();
+                self.llm.update_api_key(new_key.clone());
+                let provider_name = self.llm.provider_name();
+                let env_key = match provider_name.to_lowercase().as_str() {
+                    "openai" => "OPENAI_API_KEY",
+                    "anthropic" => "ANTHROPIC_API_KEY",
+                    "gemini" => "GEMINI_API_KEY",
+                    "groq" => "GROQ_API_KEY",
+                    "grok" | "xai" => "XAI_API_KEY",
+                    _ => "API_KEY",
+                };
+                if let Ok(contents) = std::fs::read_to_string(".env") {
+                    let lines: Vec<String> = contents
+                        .lines()
+                        .filter(|line| !line.starts_with(env_key))
+                        .map(String::from)
+                        .collect();
+                    let new_contents = format!("{}\n{}={}\n", lines.join("\n"), env_key, new_key);
+                    let _ = std::fs::write(".env", new_contents);
+                } else {
+                    let _ = std::fs::write(".env", format!("{}={}\n", env_key, new_key));
+                }
+                return SlashAction::Message("API key updated successfully.".to_string());
+            }
+            return SlashAction::Message(format!(
+                "Usage: /key <your-api-key>\nCurrent Provider: {}",
+                self.llm.provider_name()
+            ));
+        }
+
+        if input.starts_with("/model") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let new_model = parts[1].trim().to_string();
+                self.config.model = Some(new_model.clone());
+                if let Some(p) = provider_from_model(&new_model) {
+                    self.llm = p;
+                }
+                return SlashAction::Message(format!(
+                    "Model updated to {} (Provider auto-detected: {})",
+                    new_model,
+                    self.llm.provider_name()
+                ));
+            }
+            let current = self.config.model.as_deref().unwrap_or("default");
+            return SlashAction::Message(format!(
+                "Usage: /model <model-name>\nCurrent Model: {current}\nExamples: gemini-3.1-pro-preview, claude-3-5-sonnet-latest, gpt-4o, o3-mini"
+            ));
+        }
+
+        if input.starts_with("/provider") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let new_provider = parts[1].trim().to_lowercase();
+                return match provider_from_name(&new_provider) {
+                    Ok((p, msg)) => {
+                        self.llm = p;
+                        SlashAction::Message(msg.to_string())
+                    }
+                    Err(msg) => SlashAction::Message(msg.to_string()),
+                };
+            }
+            return SlashAction::Message(format!(
+                "Usage: /provider <provider-name>\nCurrent Provider: {}\nAvailable: gemini, anthropic, openai, groq, grok, ollama",
+                self.llm.provider_name()
+            ));
+        }
+
+        if input.starts_with("/orchestrator") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let val = parts[1].trim().to_lowercase();
+                self.use_orchestrator = val == "on" || val == "true" || val == "1";
+            } else {
+                self.use_orchestrator = !self.use_orchestrator;
+            }
+            let state = if self.use_orchestrator { "ON" } else { "OFF" };
+            return SlashAction::Message(format!("Orchestrator Planner is now {state}"));
+        }
+
+        if input.starts_with("/multithread") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let val = parts[1].trim().to_lowercase();
+                self.use_multithread = val == "on" || val == "true" || val == "1";
+            } else {
+                self.use_multithread = !self.use_multithread;
+            }
+            let state = if self.use_multithread { "ON" } else { "OFF" };
+            return SlashAction::Message(format!("Multithreaded Execution is now {state}"));
+        }
+
+        SlashAction::NotHandled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_skin, now_secs, prepare_turn_request, session_capability_notice,
-        streaming_preview, truncate_for_display, wrap_text, TurnMode,
+        assistant_skin, now_secs, prepare_turn_request, provider_from_model, provider_from_name,
+        session_capability_notice, streaming_preview, truncate_for_display, wrap_text, TurnMode,
     };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
@@ -3010,6 +3206,55 @@ mod tests {
         assert!(out.starts_with('…'));
         // The newest word should remain visible.
         assert!(out.ends_with("six"));
+    }
+
+    #[test]
+    fn provider_from_name_known_and_unknown() {
+        for name in [
+            "openai",
+            "anthropic",
+            "claude",
+            "gemini",
+            "google",
+            "groq",
+            "grok",
+            "xai",
+            "ollama",
+            "local",
+        ] {
+            assert!(provider_from_name(name).is_ok(), "{name} should be known");
+        }
+        assert!(provider_from_name("nope").is_err());
+
+        let (p, msg) = provider_from_name("openai").unwrap();
+        assert_eq!(p.provider_name().to_lowercase(), "openai");
+        assert_eq!(msg, "Switched to OpenAI");
+        assert_eq!(
+            provider_from_name("anthropic").unwrap().0.provider_name().to_lowercase(),
+            "anthropic"
+        );
+        assert_eq!(
+            provider_from_name("gemini").unwrap().0.provider_name().to_lowercase(),
+            "gemini"
+        );
+    }
+
+    #[test]
+    fn provider_from_model_prefixes() {
+        for m in ["gemini-3.1-pro", "gpt-4o", "o1-mini", "o3-mini", "claude-3-5-sonnet", "grok-2"] {
+            assert!(provider_from_model(m).is_some(), "{m} should infer a provider");
+        }
+        assert!(provider_from_model("llama3").is_none());
+        assert!(provider_from_model("").is_none());
+
+        assert_eq!(
+            provider_from_model("gemini-x").unwrap().provider_name().to_lowercase(),
+            "gemini"
+        );
+        assert_eq!(
+            provider_from_model("claude-x").unwrap().provider_name().to_lowercase(),
+            "anthropic"
+        );
     }
 
     #[test]
