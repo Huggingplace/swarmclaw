@@ -1131,8 +1131,18 @@ impl Agent {
                             let elapsed = start_time.elapsed().as_secs_f32();
                             let chip = cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB);
                             
-                            // Re-draw in place
-                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), format!("Working... ({:.1}s)", elapsed).truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
+                            // Re-draw in place. Show a live one-line preview of
+                            // the streamed text once it starts arriving.
+                            let preview = streaming_preview(
+                                &full_content,
+                                terminal_width().saturating_sub(20).max(10),
+                            );
+                            let status = if preview.is_empty() {
+                                format!("Working... ({:.1}s)", elapsed)
+                            } else {
+                                preview
+                            };
+                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), status.truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
                             let _ = stdout.flush();
                             let _ = drain_resize_events(self, &mut stdout, &full_content);
                         }
@@ -1146,7 +1156,16 @@ impl Agent {
                         if cli_mode {
                             let elapsed = start_time.elapsed().as_secs_f32();
                             let chip = cli_chip("SWARMCLAW", CLI_DEEP_RGB, CLI_MAGENTA_RGB);
-                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), format!("Working... ({:.1}s)", elapsed).truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
+                            let preview = streaming_preview(
+                                &full_content,
+                                terminal_width().saturating_sub(20).max(10),
+                            );
+                            let status = if preview.is_empty() {
+                                format!("Working... ({:.1}s)", elapsed)
+                            } else {
+                                preview
+                            };
+                            let _ = write!(stdout, "\r\x1b[K{} {} {}", chip, spinner_frames[spinner_idx].to_string().truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2), status.truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2));
                             let _ = stdout.flush();
                         }
 
@@ -2621,6 +2640,30 @@ fn truncate_for_display(text: &str, max_lines: usize, max_chars: usize) -> (Stri
     (shown, truncated)
 }
 
+/// Build a single-line live preview of the in-progress streamed response.
+///
+/// All whitespace (including newlines) is collapsed to single spaces so the
+/// preview always occupies exactly one terminal line — this is rendered with
+/// the same `\r\x1b[K` in-place mechanism as the spinner, deliberately avoiding
+/// any multi-line cursor movement (the source of the previously-reverted
+/// "staircase" raw-mode rendering bug). When the text is longer than `width`,
+/// the most recent tail is kept with a leading ellipsis so the newest tokens
+/// stay visible. Returns an empty string when there is nothing to show yet.
+fn streaming_preview(content: &str, width: usize) -> String {
+    let width = width.max(1);
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= width {
+        flat
+    } else {
+        let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
+        format!("…{tail}")
+    }
+}
+
 fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
     format!(
         "\x1b[1m\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m {} \x1b[22m\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
@@ -2644,7 +2687,7 @@ fn cli_chip(label: &str, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> String {
 mod tests {
     use super::{
         assistant_skin, now_secs, prepare_turn_request, session_capability_notice,
-        truncate_for_display, wrap_text, TurnMode,
+        streaming_preview, truncate_for_display, wrap_text, TurnMode,
     };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
@@ -2699,6 +2742,28 @@ mod tests {
         let (by_lines, t3) = truncate_for_display(many, 2, 1000);
         assert_eq!(by_lines, "a\nb");
         assert!(t3);
+    }
+
+    #[test]
+    fn streaming_preview_empty_when_no_content() {
+        assert_eq!(streaming_preview("", 40), "");
+        assert_eq!(streaming_preview("   \n  ", 40), "");
+    }
+
+    #[test]
+    fn streaming_preview_flattens_to_single_line() {
+        let out = streaming_preview("hello\nworld\n  spaced", 80);
+        assert_eq!(out, "hello world spaced");
+        assert!(!out.contains('\n'));
+    }
+
+    #[test]
+    fn streaming_preview_keeps_recent_tail_within_width() {
+        let out = streaming_preview("one two three four five six", 12);
+        assert!(out.chars().count() <= 12, "preview too wide: {out:?}");
+        assert!(out.starts_with('…'));
+        // The newest word should remain visible.
+        assert!(out.ends_with("six"));
     }
 
     #[test]
