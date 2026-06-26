@@ -66,6 +66,7 @@ thirtyfour = "0.36.1"
 enigo = "0.6.1"
 xcap = { version = "0.9.3", features = ["image"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "underline-color"] }
+arboard = "3.6.1"
 
 # Workspace internal dependencies (optional for now)
 # mothership-common = { path = "../mothership-common" }
