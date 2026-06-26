@@ -66,6 +66,7 @@ html2text = "0.16.4"
 thirtyfour = "0.36.1"
 enigo = "0.6.1"
 xcap = { version = "0.9.3", features = ["image"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "underline-color"] }
 
 # Workspace internal dependencies (optional for now)
 # mothership-common = { path = "../mothership-common" }
