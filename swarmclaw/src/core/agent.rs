@@ -515,6 +515,9 @@ impl Agent {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        if crate::tui::supported() {
+            return self.run_fullscreen().await;
+        }
         let mut stdout = io::stdout();
         {
             let _ui = TerminalUiGuard::enter(&mut stdout)?;
@@ -860,6 +863,249 @@ impl Agent {
                 .bold(),
             "session closed.".truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2),
         );
+        Ok(())
+    }
+
+    /// Opt-in fullscreen (ratatui) interactive loop. Reached only when
+    /// `crate::tui::supported()` is true; the default path is byte-for-byte
+    /// unchanged. Delegates the event loop to `tui::run_app`, which drives this
+    /// agent and calls back into `run_fullscreen_turn` for each submission.
+    pub async fn run_fullscreen(&mut self) -> anyhow::Result<()> {
+        crate::tui::run_app(self).await
+    }
+
+    /// Execute a single agent turn rendered through ratatui. This is a
+    /// self-contained parallel of `stream_think` (intentional duplication so the
+    /// default CLI path is untouched): it builds the request via
+    /// `prepare_turn_request`, streams provider chunks updating the status line +
+    /// redrawing flicker-free, accumulates and executes tool calls in a loop
+    /// until the provider returns none, and records every message via
+    /// `record_message`. Esc / Ctrl+C during the turn cancels it.
+    pub async fn run_fullscreen_turn(
+        &mut self,
+        terminal: &mut ratatui::Terminal<
+            ratatui::backend::CrosstermBackend<std::io::Stdout>,
+        >,
+        state: &mut crate::tui::TuiState,
+        events: &mut crossterm::event::EventStream,
+    ) -> anyhow::Result<()> {
+        let capabilities = self.llm.capabilities();
+        if !capabilities.supports_streaming {
+            anyhow::bail!(
+                "Provider '{}' does not support streaming responses in this SwarmClaw adapter.",
+                self.llm.provider_name()
+            );
+        }
+
+        // Outer loop: LLM <-> tools turn loop (mirrors stream_think's outer loop).
+        loop {
+            let options = CompletionOptions {
+                model: self.config.model.clone(),
+                ..Default::default()
+            };
+
+            let history_to_send = {
+                let history = self.state.history.clone();
+                crate::core::context::trim_to_budget(
+                    &history,
+                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                )
+            };
+
+            let prepared = prepare_turn_request(
+                history_to_send,
+                self.skills.iter().flat_map(|s| s.tools()).collect(),
+                self.llm.provider_name(),
+                capabilities,
+                TurnMode::Streaming,
+                now_secs(),
+            );
+            let history_to_send = prepared.history;
+            let tools = prepared.tools;
+
+            if let Some(notice) = prepared.disabled_tool_notice {
+                self.record_message(Message {
+                    role: Role::System,
+                    content: notice,
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                state.sync_transcript(&self.state.history);
+            }
+
+            let mut stream = self.llm.stream(&history_to_send, &options, &tools).await?;
+
+            let mut full_content = String::new();
+            let mut tool_calls: Vec<crate::llm::ToolCall> = Vec::new();
+            let mut current_tool_id = String::new();
+            let mut current_tool_name = String::new();
+            let mut current_tool_args = String::new();
+            let mut current_thought_signature: Option<String> = None;
+
+            state.status = Some("Working…".to_string());
+            terminal.draw(|frame| crate::tui::draw(frame, state))?;
+
+            // Inner loop: consume the provider stream while remaining responsive
+            // to cancel (Esc / Ctrl+C) and to scroll/typing events.
+            'stream: loop {
+                tokio::select! {
+                    chunk_opt = stream.next() => {
+                        let chunk = match chunk_opt {
+                            Some(c) => c,
+                            None => break 'stream,
+                        };
+                        match chunk {
+                            Ok(ChatChunk::Content(delta)) => {
+                                full_content.push_str(&delta);
+                                let width = terminal
+                                    .size()
+                                    .map(|s| s.width as usize)
+                                    .unwrap_or(80)
+                                    .saturating_sub(12)
+                                    .max(10);
+                                state.status =
+                                    Some(crate::tui::streaming_preview(&full_content, width));
+                                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+                            }
+                            Ok(ChatChunk::ToolCallStart { id, name, thought_signature }) => {
+                                if !current_tool_name.is_empty() {
+                                    tool_calls.push(crate::llm::ToolCall {
+                                        id: current_tool_id.clone(),
+                                        name: current_tool_name.clone(),
+                                        arguments: current_tool_args.clone(),
+                                        thought_signature: current_thought_signature.take(),
+                                    });
+                                }
+                                current_tool_id = id;
+                                current_tool_name = name;
+                                current_tool_args.clear();
+                                current_thought_signature = thought_signature;
+                                state.status = Some(format!("Calling tool {current_tool_name}…"));
+                                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+                            }
+                            Ok(ChatChunk::ToolCallDelta { arguments }) => {
+                                current_tool_args.push_str(&arguments);
+                            }
+                            Ok(ChatChunk::Done) => {
+                                if !current_tool_name.is_empty() {
+                                    tool_calls.push(crate::llm::ToolCall {
+                                        id: current_tool_id.clone(),
+                                        name: current_tool_name.clone(),
+                                        arguments: current_tool_args.clone(),
+                                        thought_signature: current_thought_signature.take(),
+                                    });
+                                    current_tool_name.clear();
+                                }
+                                break 'stream;
+                            }
+                            Err(error) => {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    ev = events.next() => {
+                        if let Some(Ok(crossterm::event::Event::Key(key))) = ev {
+                            if key.kind == crossterm::event::KeyEventKind::Press {
+                                let is_cancel = key.code == crossterm::event::KeyCode::Esc
+                                    || (key.code == crossterm::event::KeyCode::Char('c')
+                                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL));
+                                if is_cancel {
+                                    anyhow::bail!("[Operation Cancelled] User cancelled the turn.");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build assistant tool_calls payload (same shape as stream_think).
+            let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
+            if !tool_calls.is_empty() {
+                let mut tc_vec = Vec::new();
+                for tc in &tool_calls {
+                    tc_vec.push(serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            "thought_signature": tc.thought_signature,
+                        }
+                    }));
+                }
+                assistant_tool_calls = Some(tc_vec);
+            }
+
+            if !full_content.is_empty() || assistant_tool_calls.is_some() {
+                let redacted_content = Redactor::redact(&full_content);
+                self.record_message(Message {
+                    role: Role::Assistant,
+                    content: redacted_content,
+                    timestamp: now_secs(),
+                    tool_calls: assistant_tool_calls,
+                    tool_call_id: None,
+                });
+                state.sync_transcript(&self.state.history);
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+            }
+
+            if tool_calls.is_empty() {
+                break;
+            }
+
+            // Execute each tool call, record the result, then loop to feed back.
+            for tc in tool_calls {
+                state.status = Some(format!("Executing tool {}…", tc.name));
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+
+                let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
+                let result = match tool {
+                    Some(t) => {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&tc.arguments).unwrap_or_default();
+                        let mut tool_fut = Box::pin(WorkerPool::execute_tool(t, args));
+                        loop {
+                            tokio::select! {
+                                res = &mut tool_fut => {
+                                    break match res {
+                                        Ok(res) => res,
+                                        Err(e) => format!("Error: {}", e),
+                                    };
+                                }
+                                ev = events.next() => {
+                                    if let Some(Ok(crossterm::event::Event::Key(key))) = ev {
+                                        if key.kind == crossterm::event::KeyEventKind::Press {
+                                            let is_cancel = key.code == crossterm::event::KeyCode::Esc
+                                                || (key.code == crossterm::event::KeyCode::Char('c')
+                                                    && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL));
+                                            if is_cancel {
+                                                anyhow::bail!("[Operation Cancelled] User cancelled tool execution.");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => format!("Tool '{}' not found", tc.name),
+                };
+
+                let redacted_result = Redactor::redact(&result);
+                self.record_message(Message {
+                    role: Role::Tool,
+                    content: redacted_result,
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: Some(tc.id.clone()),
+                });
+                state.sync_transcript(&self.state.history);
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+            }
+            // Continue outer loop to let the LLM process tool results.
+        }
+
+        state.status = None;
         Ok(())
     }
 
@@ -1864,7 +2110,7 @@ fn next_turn_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

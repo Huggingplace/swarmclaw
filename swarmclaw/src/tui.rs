@@ -86,6 +86,123 @@ impl TuiState {
             status: None,
         }
     }
+
+    /// Replace the transcript with a freshly-built view of `history`, preserving
+    /// the current input, cursor, scroll and status. Used mid-turn after the live
+    /// session history is mutated (e.g. assistant / tool messages recorded) so the
+    /// transcript reflects the engine state while the user keeps typing.
+    pub fn sync_transcript(&mut self, history: &[Message]) {
+        self.transcript = history
+            .iter()
+            .map(|m| MessageView {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+    }
+
+    /// Insert a printable char at the cursor (byte offset) and advance the cursor.
+    pub fn insert_char(&mut self, c: char) {
+        let cursor = self.cursor.min(self.input.len());
+        self.input.insert(cursor, c);
+        self.cursor = cursor + c.len_utf8();
+    }
+
+    /// Delete the char immediately before the cursor (Backspace).
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // Find the start of the char preceding the cursor.
+        let prev = prev_char_boundary(&self.input, self.cursor);
+        self.input.replace_range(prev..self.cursor, "");
+        self.cursor = prev;
+    }
+
+    /// Move the cursor one char to the left.
+    pub fn cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = prev_char_boundary(&self.input, self.cursor);
+        }
+    }
+
+    /// Move the cursor one char to the right.
+    pub fn cursor_right(&mut self) {
+        if self.cursor < self.input.len() {
+            self.cursor = next_char_boundary(&self.input, self.cursor);
+        }
+    }
+
+    /// Clear the input box and reset the cursor.
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    /// Take the current input (trimmed for command/submit purposes is the
+    /// caller's job); resets the input box.
+    pub fn take_input(&mut self) -> String {
+        let out = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        out
+    }
+}
+
+/// Byte offset of the char boundary immediately before `idx`.
+fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Byte offset of the char boundary immediately after `idx`.
+fn next_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = (idx + 1).min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Clamp a desired scroll offset so the transcript can never scroll past its
+/// content. `content_rows` is the total number of rendered transcript rows and
+/// `viewport_rows` is the height (in rows) of the visible transcript area. The
+/// maximum scroll is `content_rows - viewport_rows` (0 when everything fits).
+pub fn clamp_scroll(desired: u16, content_rows: u16, viewport_rows: u16) -> u16 {
+    let max = content_rows.saturating_sub(viewport_rows);
+    desired.min(max)
+}
+
+/// Apply a signed scroll delta (positive = down, negative = up) to `current`,
+/// clamped to `[0, max_scroll]`. Used for PageUp/PageDown and the mouse wheel.
+pub fn scroll_by(current: u16, delta: i32, content_rows: u16, viewport_rows: u16) -> u16 {
+    let next = (current as i32 + delta).max(0) as u16;
+    clamp_scroll(next, content_rows, viewport_rows)
+}
+
+/// A single-line, whitespace-flattened preview of the streamed content, kept to
+/// `width` chars (with a leading ellipsis when truncated). Mirrors the private
+/// `streaming_preview` in `core::agent` so the fullscreen status line matches the
+/// classic CLI spinner preview.
+pub fn streaming_preview(content: &str, width: usize) -> String {
+    let width = width.max(1);
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= width {
+        flat
+    } else {
+        let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
+        format!("…{tail}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +312,275 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
         .block(input_block);
     frame.render_widget(input, chunks[2]);
 }
+
+// ---------------------------------------------------------------------------
+// Live event loop (opt-in, default-OFF; see `supported`)
+// ---------------------------------------------------------------------------
+
+use ratatui::crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::Terminal;
+
+/// RAII guard that puts the terminal into the fullscreen TUI state on creation
+/// and ALWAYS restores it on drop (normal return, `?` early-return, or panic).
+///
+/// This is the single point that owns raw-mode / alternate-screen / mouse-capture
+/// so the user's terminal can never be left in a broken state.
+pub struct TerminalGuard {
+    restored: bool,
+}
+
+impl TerminalGuard {
+    /// Enter raw mode, switch to the alternate screen, and enable mouse capture.
+    pub fn enter() -> std::io::Result<Self> {
+        enable_raw_mode()?;
+        let mut out = std::io::stdout();
+        execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+        Ok(Self { restored: false })
+    }
+
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        let mut out = std::io::stdout();
+        // Best-effort teardown in the exact reverse order of setup. We ignore
+        // errors here because we are usually unwinding and must not panic.
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// What the key handler decided the event loop should do next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoopAction {
+    /// Nothing special; continue (state may have been mutated for redraw).
+    Continue,
+    /// The user submitted a line that should be processed as input/command.
+    Submit(String),
+    /// The user requested to exit the application.
+    Quit,
+}
+
+/// Approximate the transcript viewport height for a given total terminal height.
+/// Mirrors the layout in [`draw`]: 1 status line + 5-row input box are reserved,
+/// the rest is transcript. Kept pure for clamping/scroll math and unit tests.
+pub fn transcript_viewport_height(total_height: u16) -> u16 {
+    total_height.saturating_sub(6).max(1)
+}
+
+/// Estimate the number of rendered transcript rows for scroll clamping. This is a
+/// lightweight upper-bound proxy (each message contributes its label row plus a
+/// blank spacer; wrapping is not precisely modeled). It only needs to be a sane
+/// clamp bound so the user cannot scroll into a void of blank rows.
+pub fn estimate_content_rows(state: &TuiState) -> u16 {
+    let mut rows: usize = 0;
+    for view in &state.transcript {
+        // chip/body line + spacer
+        rows += 2;
+        // rough wrap estimate at 80 cols so long messages remain scrollable
+        rows += view.content.len() / 80;
+    }
+    rows.min(u16::MAX as usize) as u16
+}
+
+/// Pure key-event reducer: applies a key press to `state` and reports the action
+/// the event loop should take. Factored out of the terminal loop so it is unit
+/// testable. `turn_in_flight` controls Esc semantics (cancel vs clear).
+pub fn handle_key(
+    state: &mut TuiState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    turn_in_flight: bool,
+) -> LoopAction {
+    let content_rows = estimate_content_rows(state);
+    let viewport = transcript_viewport_height(0); // height unknown here; loop re-clamps on draw
+    match code {
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => LoopAction::Quit,
+        KeyCode::Char(c) => {
+            state.insert_char(c);
+            LoopAction::Continue
+        }
+        KeyCode::Backspace => {
+            state.backspace();
+            LoopAction::Continue
+        }
+        KeyCode::Left => {
+            state.cursor_left();
+            LoopAction::Continue
+        }
+        KeyCode::Right => {
+            state.cursor_right();
+            LoopAction::Continue
+        }
+        KeyCode::Enter => {
+            let line = state.take_input();
+            if line.trim().is_empty() {
+                LoopAction::Continue
+            } else {
+                LoopAction::Submit(line)
+            }
+        }
+        KeyCode::Esc => {
+            // Esc clears the input box; if there is nothing to clear and a turn is
+            // running, the loop treats it as a cancel (handled by the caller).
+            if !state.input.is_empty() {
+                state.clear_input();
+            }
+            if turn_in_flight {
+                // Signal handled by caller via separate cancel path; keep input cleared.
+            }
+            LoopAction::Continue
+        }
+        KeyCode::PageUp => {
+            state.scroll = scroll_by(state.scroll, -(viewport.max(1) as i32), content_rows, viewport);
+            LoopAction::Continue
+        }
+        KeyCode::PageDown => {
+            state.scroll = scroll_by(state.scroll, viewport.max(1) as i32, content_rows, viewport);
+            LoopAction::Continue
+        }
+        _ => LoopAction::Continue,
+    }
+}
+
+/// Pure mouse-wheel reducer for scroll. Returns the new scroll offset.
+pub fn handle_mouse_scroll(state: &TuiState, kind: MouseEventKind, viewport_rows: u16) -> u16 {
+    let content_rows = estimate_content_rows(state);
+    match kind {
+        MouseEventKind::ScrollUp => scroll_by(state.scroll, -3, content_rows, viewport_rows),
+        MouseEventKind::ScrollDown => scroll_by(state.scroll, 3, content_rows, viewport_rows),
+        _ => state.scroll,
+    }
+}
+
+/// Run the fullscreen interactive loop, driving the supplied agent.
+///
+/// This is the opt-in counterpart to the classic `Agent::run` REPL. It owns
+/// terminal setup/teardown (via [`TerminalGuard`]) and an async `crossterm`
+/// `EventStream`. Each input submission is dispatched to
+/// [`crate::core::agent::Agent::run_fullscreen_turn`], which is a self-contained
+/// parallel of `stream_think` rendered through ratatui.
+pub async fn run_app(agent: &mut crate::core::agent::Agent) -> anyhow::Result<()> {
+    use futures::StreamExt;
+
+    let mut guard = TerminalGuard::enter()?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = TuiState::from_history(&agent.state.history);
+    let mut events = EventStream::new();
+
+    loop {
+        terminal.draw(|frame| draw(frame, &state))?;
+
+        let Some(ev) = events.next().await else {
+            break;
+        };
+        let ev = match ev {
+            Ok(ev) => ev,
+            Err(_) => break,
+        };
+
+        match ev {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                match handle_key(&mut state, key.code, key.modifiers, false) {
+                    LoopAction::Continue => {}
+                    LoopAction::Quit => break,
+                    LoopAction::Submit(line) => {
+                        let trimmed = line.trim().to_string();
+                        if trimmed.eq_ignore_ascii_case("exit")
+                            || trimmed.eq_ignore_ascii_case("quit")
+                        {
+                            break;
+                        }
+                        if trimmed.eq_ignore_ascii_case("/help")
+                            || trimmed.eq_ignore_ascii_case("/helpp")
+                        {
+                            agent.record_message(Message {
+                                role: Role::System,
+                                content: help_text(),
+                                timestamp: now_secs(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                            state.sync_transcript(&agent.state.history);
+                            continue;
+                        }
+
+                        // Record the user message, reflect it, redraw, then run the turn.
+                        agent.record_message(Message {
+                            role: Role::User,
+                            content: trimmed.clone(),
+                            timestamp: now_secs(),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        state.sync_transcript(&agent.state.history);
+                        terminal.draw(|frame| draw(frame, &state))?;
+
+                        // Run the agent turn, rendering through ratatui.
+                        if let Err(e) = agent
+                            .run_fullscreen_turn(&mut terminal, &mut state, &mut events)
+                            .await
+                        {
+                            agent.record_message(Message {
+                                role: Role::System,
+                                content: format!("[ERROR] {e}"),
+                                timestamp: now_secs(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                        }
+                        state.sync_transcript(&agent.state.history);
+                        state.status = None;
+                    }
+                }
+            }
+            Event::Mouse(m) => {
+                let size = terminal.size()?;
+                let viewport = transcript_viewport_height(size.height);
+                state.scroll = handle_mouse_scroll(&state, m.kind, viewport);
+            }
+            Event::Resize(_, _) => { /* next draw re-lays out automatically */ }
+            _ => {}
+        }
+    }
+
+    // Explicit restore (Drop would also handle it) before returning to the shell.
+    guard.restore();
+    drop(terminal);
+    Ok(())
+}
+
+/// Help text shown in-transcript for `/help` in the fullscreen loop.
+fn help_text() -> String {
+    [
+        "SwarmClaw Commands (fullscreen)",
+        "  /help, /helpp  - Show this help",
+        "  exit, quit     - Exit SwarmClaw",
+        "  Esc            - Clear input / cancel an in-flight turn",
+        "  Ctrl+C         - Exit",
+        "  PageUp/Down, mouse wheel - Scroll transcript",
+        "  (other slash-commands deferred to the classic CLI for now)",
+    ]
+    .join("\n")
+}
+
+use crate::core::agent::now_secs;
 
 // ---------------------------------------------------------------------------
 // Feature gate
@@ -346,6 +732,160 @@ mod tests {
             buffer_contains(&rows, "streaming preview"),
             "status line text missing"
         );
+    }
+
+    #[test]
+    fn clamp_scroll_bounds() {
+        // Everything fits: max scroll is 0.
+        assert_eq!(clamp_scroll(5, 3, 10), 0);
+        // Content taller than viewport: max = content - viewport.
+        assert_eq!(clamp_scroll(100, 20, 10), 10);
+        assert_eq!(clamp_scroll(3, 20, 10), 3);
+        // Exactly filling viewport => 0.
+        assert_eq!(clamp_scroll(7, 10, 10), 0);
+    }
+
+    #[test]
+    fn scroll_by_clamps_both_ends() {
+        // Cannot go below 0.
+        assert_eq!(scroll_by(0, -5, 50, 10), 0);
+        // Going down clamps to max (50 - 10 = 40).
+        assert_eq!(scroll_by(38, 10, 50, 10), 40);
+        // Normal in-range move.
+        assert_eq!(scroll_by(5, 3, 50, 10), 8);
+    }
+
+    #[test]
+    fn insert_and_backspace_edit_input_and_cursor() {
+        let mut s = TuiState::default();
+        s.insert_char('h');
+        s.insert_char('i');
+        assert_eq!(s.input, "hi");
+        assert_eq!(s.cursor, 2);
+        s.backspace();
+        assert_eq!(s.input, "h");
+        assert_eq!(s.cursor, 1);
+        s.backspace();
+        s.backspace(); // no-op at start
+        assert_eq!(s.input, "");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn cursor_movement_and_midline_insert() {
+        let mut s = TuiState::default();
+        for c in "abc".chars() {
+            s.insert_char(c);
+        }
+        s.cursor_left();
+        s.cursor_left();
+        assert_eq!(s.cursor, 1);
+        s.insert_char('Z');
+        assert_eq!(s.input, "aZbc");
+        assert_eq!(s.cursor, 2);
+        s.cursor_right();
+        s.cursor_right();
+        s.cursor_right(); // clamps at end
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn multibyte_editing_respects_char_boundaries() {
+        let mut s = TuiState::default();
+        s.insert_char('é'); // 2 bytes
+        s.insert_char('x');
+        assert_eq!(s.cursor, 3);
+        s.cursor_left();
+        assert_eq!(s.cursor, 2);
+        s.backspace(); // removes 'é'
+        assert_eq!(s.input, "x");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn handle_key_enter_submits_nonempty_and_clears() {
+        let mut s = TuiState::default();
+        for c in "hello".chars() {
+            s.insert_char(c);
+        }
+        let action = handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE, false);
+        assert_eq!(action, LoopAction::Submit("hello".to_string()));
+        assert_eq!(s.input, "");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn handle_key_enter_on_blank_is_continue() {
+        let mut s = TuiState::default();
+        let action = handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE, false);
+        assert_eq!(action, LoopAction::Continue);
+    }
+
+    #[test]
+    fn handle_key_ctrl_c_quits() {
+        let mut s = TuiState::default();
+        let action = handle_key(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL, false);
+        assert_eq!(action, LoopAction::Quit);
+    }
+
+    #[test]
+    fn handle_key_esc_clears_input() {
+        let mut s = TuiState::default();
+        for c in "draft".chars() {
+            s.insert_char(c);
+        }
+        let action = handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE, false);
+        assert_eq!(action, LoopAction::Continue);
+        assert_eq!(s.input, "");
+    }
+
+    #[test]
+    fn handle_mouse_scroll_wheel() {
+        let mut s = TuiState::default();
+        // Two messages, each ~2 rows => content_rows ~4, give a small viewport.
+        s.transcript = vec![
+            MessageView { role: Role::User, content: "a".repeat(200) },
+            MessageView { role: Role::Assistant, content: "b".repeat(200) },
+        ];
+        s.scroll = 0;
+        let down = handle_mouse_scroll(&s, MouseEventKind::ScrollDown, 2);
+        assert!(down >= s.scroll, "scroll down should not decrease offset");
+        let mut s2 = s.clone();
+        s2.scroll = 1;
+        let up = handle_mouse_scroll(&s2, MouseEventKind::ScrollUp, 2);
+        assert!(up < s2.scroll || up == 0, "scroll up should decrease toward 0");
+    }
+
+    #[test]
+    fn streaming_preview_truncates_with_ellipsis() {
+        assert_eq!(streaming_preview("", 10), "");
+        assert_eq!(streaming_preview("hi   there", 80), "hi there");
+        let long = "x".repeat(100);
+        let p = streaming_preview(&long, 10);
+        assert!(p.starts_with('…'));
+        assert_eq!(p.chars().count(), 10);
+    }
+
+    #[test]
+    fn sync_transcript_preserves_input_and_status() {
+        let mut s = TuiState::default();
+        s.insert_char('q');
+        s.status = Some("Working…".to_string());
+        s.scroll = 3;
+        let history = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
+        s.sync_transcript(&history);
+        assert_eq!(s.transcript.len(), 2);
+        assert_eq!(s.input, "q");
+        assert_eq!(s.cursor, 1);
+        assert_eq!(s.status.as_deref(), Some("Working…"));
+        assert_eq!(s.scroll, 3);
+    }
+
+    #[test]
+    fn transcript_viewport_height_reserves_chrome() {
+        assert_eq!(transcript_viewport_height(24), 18);
+        // Never zero even on tiny terminals.
+        assert_eq!(transcript_viewport_height(3), 1);
     }
 
     #[test]
