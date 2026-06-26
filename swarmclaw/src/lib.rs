@@ -9,6 +9,7 @@ pub mod security;
 pub mod services;
 pub mod skills;
 pub mod tools;
+pub mod tui;
 pub mod worker;
 
 // Placeholder for generated FlatBuffers
