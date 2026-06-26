@@ -50,6 +50,18 @@ pub struct MessageView {
     pub content: String,
 }
 
+/// An active mouse drag-selection over the rendered transcript, in terminal
+/// cell coordinates (`(col, row)`). `anchor` is where the drag began (mouse
+/// down) and `cursor` is the current/last drag position. The two are ordered
+/// in row-major order at extraction/highlight time (see [`normalize_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// Where the selection started (mouse-down), in `(col, row)` cell coords.
+    pub anchor: (u16, u16),
+    /// The current end of the selection (last drag position), in `(col, row)`.
+    pub cursor: (u16, u16),
+}
+
 /// All state required to render one frame of the fullscreen TUI.
 ///
 /// This is intentionally plain data: it is constructed from the live session
@@ -66,6 +78,10 @@ pub struct TuiState {
     pub scroll: u16,
     /// Optional status / streaming-preview line shown above the input box.
     pub status: Option<String>,
+    /// Active mouse drag-selection over the transcript, if any. `None` when no
+    /// selection is in progress / shown. Highlighted by [`draw`] and extracted
+    /// (for copy) on mouse-up.
+    pub selection: Option<Selection>,
 }
 
 impl TuiState {
@@ -84,6 +100,7 @@ impl TuiState {
             cursor: 0,
             scroll: 0,
             status: None,
+            selection: None,
         }
     }
 
@@ -206,6 +223,104 @@ pub fn streaming_preview(content: &str, width: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Selection (mouse drag-select over rendered cells)
+// ---------------------------------------------------------------------------
+
+/// Order two `(col, row)` cell coordinates into `(start, end)` in row-major
+/// order (top-to-bottom, then left-to-right). After this, `start` is always
+/// at or before `end` when scanning rows then columns.
+pub fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    // Compare by row first, then by column.
+    let a_key = (a.1, a.0);
+    let b_key = (b.1, b.0);
+    if a_key <= b_key {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Extract the WYSIWYG text covered by a selection over already-rendered rows.
+///
+/// `rows` are the rendered terminal lines (one `String` per terminal row, each
+/// `width` cells wide). `start`/`end` are `(col, row)` cell coordinates; they
+/// are normalized internally so callers may pass them in any order.
+///
+/// Column rules per row `r` in `[start.row, end.row]`:
+/// - left bound is `start.col` if `r == start.row`, else `0`.
+/// - right bound (inclusive) is `end.col` if `r == end.row`, else the last column.
+///
+/// Each line's trailing whitespace is trimmed; lines are joined with `'\n'`.
+/// Because it reads the rendered cells, this matches exactly what the user sees
+/// regardless of wrapping or scroll.
+pub fn extract_selection(rows: &[String], width: u16, start: (u16, u16), end: (u16, u16)) -> String {
+    if rows.is_empty() || width == 0 {
+        return String::new();
+    }
+    let (start, end) = normalize_selection(start, end);
+    let last_col = width.saturating_sub(1);
+    let max_row = rows.len().saturating_sub(1) as u16;
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let first_row = start.1.min(max_row);
+    let last_row = end.1.min(max_row);
+
+    for r in first_row..=last_row {
+        let row_chars: Vec<char> = rows[r as usize].chars().collect();
+        let left = if r == start.1 { start.0 } else { 0 };
+        let right = if r == end.1 { end.0 } else { last_col };
+        // Clamp to actual rendered width.
+        let left = left.min(last_col);
+        let right = right.min(last_col);
+        if right < left {
+            out_lines.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for c in left..=right {
+            if let Some(ch) = row_chars.get(c as usize) {
+                line.push(*ch);
+            }
+        }
+        // Trim trailing whitespace per line (WYSIWYG selections include the
+        // blank padding cells of the terminal buffer).
+        line.truncate(line.trim_end().len());
+        out_lines.push(line);
+    }
+
+    out_lines.join("\n")
+}
+
+/// Read a rendered [`ratatui::buffer::Buffer`] into one `String` per row (each
+/// the buffer's full width). Used so [`run_app`] can extract the selected text
+/// from the most recently drawn frame, mirroring the test backend's row reader.
+pub fn buffer_to_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+    let area = buffer.area;
+    let mut rows = Vec::with_capacity(area.height as usize);
+    for y in area.top()..area.bottom() {
+        let mut row = String::new();
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell((x, y)) {
+                row.push_str(cell.symbol());
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// Encode `text` as an OSC 52 clipboard escape sequence: `ESC ] 52 ; c ; <b64> BEL`.
+/// The payload is the standard-alphabet base64 of the UTF-8 bytes. Terminals
+/// that support OSC 52 (including most over SSH) copy the payload to the system
+/// clipboard. Pure; performs no I/O.
+pub fn osc52(text: &str) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    let encoded = STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
+// ---------------------------------------------------------------------------
 // Role chips
 // ---------------------------------------------------------------------------
 
@@ -311,6 +426,48 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
         .wrap(Wrap { trim: false })
         .block(input_block);
     frame.render_widget(input, chunks[2]);
+
+    // --- Selection highlight --------------------------------------------
+    // Applied last so it overlays the normal widgets. Uses the same normalized
+    // linear range as `extract_selection`, clamped to the frame area, and paints
+    // a reversed style onto the covered cells.
+    if let Some(sel) = state.selection {
+        highlight_selection(frame, area, sel.anchor, sel.cursor);
+    }
+}
+
+/// Paint a reversed highlight over the cells covered by the selection
+/// `anchor`..`cursor` (in `(col, row)` cell coords), clamped to `area`. Mirrors
+/// the per-row column rules of [`extract_selection`] so the highlight matches
+/// exactly what will be copied.
+fn highlight_selection(frame: &mut Frame, area: ratatui::layout::Rect, anchor: (u16, u16), cursor: (u16, u16)) {
+    let (start, end) = normalize_selection(anchor, cursor);
+    let buf = frame.buffer_mut();
+    let last_col = area.right().saturating_sub(1);
+    let first_row = start.1.max(area.top());
+    let last_row = end.1.min(area.bottom().saturating_sub(1));
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let highlight = Style::default().add_modifier(Modifier::REVERSED);
+    let mut r = first_row;
+    while r <= last_row {
+        let left = if r == start.1 { start.0 } else { area.left() };
+        let right = if r == end.1 { end.0 } else { last_col };
+        let left = left.max(area.left()).min(last_col);
+        let right = right.min(last_col);
+        if right >= left {
+            for c in left..=right {
+                if let Some(cell) = buf.cell_mut((c, r)) {
+                    cell.set_style(highlight);
+                }
+            }
+        }
+        if r == u16::MAX {
+            break;
+        }
+        r += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +476,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
 
 use ratatui::crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -483,9 +640,17 @@ pub async fn run_app(agent: &mut crate::core::agent::Agent) -> anyhow::Result<()
 
     let mut state = TuiState::from_history(&agent.state.history);
     let mut events = EventStream::new();
+    // Snapshot of the most recently rendered buffer rows, used to extract the
+    // WYSIWYG text under a mouse selection on release. Refreshed after each draw
+    // because `terminal.draw` swaps buffers (so `current_buffer_mut` would be the
+    // cleared next buffer, not what is on screen).
+    let mut last_rows: Vec<String>;
+    let mut last_width: u16;
 
     loop {
-        terminal.draw(|frame| draw(frame, &state))?;
+        let completed = terminal.draw(|frame| draw(frame, &state))?;
+        last_rows = buffer_to_rows(completed.buffer);
+        last_width = completed.area.width;
 
         let Some(ev) = events.next().await else {
             break;
@@ -571,11 +736,46 @@ pub async fn run_app(agent: &mut crate::core::agent::Agent) -> anyhow::Result<()
                     }
                 }
             }
-            Event::Mouse(m) => {
-                let size = terminal.size()?;
-                let viewport = transcript_viewport_height(size.height);
-                state.scroll = handle_mouse_scroll(&state, m.kind, viewport);
-            }
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let size = terminal.size()?;
+                    let viewport = transcript_viewport_height(size.height);
+                    state.scroll = handle_mouse_scroll(&state, m.kind, viewport);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Begin a new selection anchored at the click cell.
+                    let pos = (m.column, m.row);
+                    state.selection = Some(Selection {
+                        anchor: pos,
+                        cursor: pos,
+                    });
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(sel) = state.selection.as_mut() {
+                        sel.cursor = (m.column, m.row);
+                    }
+                    // Redraw at top of loop reflects the moving highlight.
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(sel) = state.selection {
+                        // A plain click (no drag) selects nothing.
+                        if sel.anchor == sel.cursor {
+                            state.selection = None;
+                        } else {
+                            // Extract from the most recently rendered buffer snapshot.
+                            let text =
+                                extract_selection(&last_rows, last_width, sel.anchor, sel.cursor);
+                            if !text.is_empty() {
+                                copy_to_clipboard(&text);
+                                state.status = Some(format!("Copied {} chars", text.chars().count()));
+                            }
+                            // Keep the highlight visible; the next click/keypress
+                            // begins a fresh selection (Down(Left) re-anchors).
+                        }
+                    }
+                }
+                _ => {}
+            },
             Event::Resize(_, _) => { /* next draw re-lays out automatically */ }
             _ => {}
         }
@@ -585,6 +785,23 @@ pub async fn run_app(agent: &mut crate::core::agent::Agent) -> anyhow::Result<()
     guard.restore();
     drop(terminal);
     Ok(())
+}
+
+/// Copy `text` to the clipboard, best-effort, via two independent mechanisms so
+/// at least one succeeds across environments:
+/// - OSC 52: written to stdout and flushed (works over SSH / inside tmux-aware
+///   terminals, and in headless CI where no display clipboard exists).
+/// - `arboard`: the local OS clipboard (fails silently on headless / no-display
+///   hosts — that's expected and must not break the loop).
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+    // OSC 52 — never let an I/O error escape.
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc52(text).as_bytes());
+    let _ = out.flush();
+
+    // arboard — best-effort; ignore any error (headless / no-display).
+    let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string()));
 }
 
 /// Help text shown in-transcript for `/help` in the fullscreen loop.
@@ -601,6 +818,7 @@ fn help_text() -> String {
         "  Esc                - Clear input / cancel an in-flight turn",
         "  Ctrl+C             - Exit",
         "  PageUp/Down, mouse wheel - Scroll transcript",
+        "  Click+drag to select, release to copy",
     ]
     .join("\n")
 }
@@ -911,6 +1129,132 @@ mod tests {
         assert_eq!(transcript_viewport_height(24), 18);
         // Never zero even on tiny terminals.
         assert_eq!(transcript_viewport_height(3), 1);
+    }
+
+    // --- Selection / clipboard --------------------------------------------
+
+    #[test]
+    fn normalize_selection_orders_row_major() {
+        // Already ordered.
+        assert_eq!(
+            normalize_selection((2, 1), (5, 3)),
+            ((2, 1), (5, 3))
+        );
+        // Reversed by row.
+        assert_eq!(
+            normalize_selection((5, 3), (2, 1)),
+            ((2, 1), (5, 3))
+        );
+        // Same row, reversed by column.
+        assert_eq!(
+            normalize_selection((8, 2), (3, 2)),
+            ((3, 2), (8, 2))
+        );
+    }
+
+    #[test]
+    fn extract_selection_single_line_subrange() {
+        let rows = vec!["hello world".to_string()];
+        // Columns 0..=4 inclusive on row 0 => "hello".
+        let got = extract_selection(&rows, 11, (0, 0), (4, 0));
+        assert_eq!(got, "hello");
+        // Columns 6..=10 => "world".
+        let got = extract_selection(&rows, 11, (6, 0), (10, 0));
+        assert_eq!(got, "world");
+    }
+
+    #[test]
+    fn extract_selection_reversed_start_end_normalizes() {
+        let rows = vec!["hello world".to_string()];
+        let forward = extract_selection(&rows, 11, (0, 0), (4, 0));
+        let reversed = extract_selection(&rows, 11, (4, 0), (0, 0));
+        assert_eq!(forward, reversed);
+        assert_eq!(reversed, "hello");
+    }
+
+    #[test]
+    fn extract_selection_multiline_column_rules() {
+        // Three rows, each padded to width 10 (terminal buffer style).
+        let rows = vec![
+            "abcdefghij".to_string(), // row 0
+            "klmnopqrst".to_string(), // row 1
+            "uvwxyz    ".to_string(), // row 2 (trailing spaces)
+        ];
+        // Select from (3, row0) to (2, row2):
+        //  row0: from col 3 to last col (9)  => "defghij"
+        //  row1: full row (middle)           => "klmnopqrst"
+        //  row2: from col 0 to col 2         => "uvw"
+        let got = extract_selection(&rows, 10, (3, 0), (2, 2));
+        assert_eq!(got, "defghij\nklmnopqrst\nuvw");
+    }
+
+    #[test]
+    fn extract_selection_trims_trailing_whitespace() {
+        // Row padded with spaces (as a real terminal buffer row would be).
+        let rows = vec!["hi        ".to_string()];
+        // Select the whole width; trailing blanks must be trimmed.
+        let got = extract_selection(&rows, 10, (0, 0), (9, 0));
+        assert_eq!(got, "hi");
+    }
+
+    #[test]
+    fn extract_selection_empty_inputs() {
+        assert_eq!(extract_selection(&[], 10, (0, 0), (5, 0)), "");
+        let rows = vec!["abc".to_string()];
+        assert_eq!(extract_selection(&rows, 0, (0, 0), (2, 0)), "");
+    }
+
+    #[test]
+    fn osc52_encodes_known_string() {
+        // base64("hi") == "aGk=".
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+        // base64("") == "" -> sequence with empty payload.
+        assert_eq!(osc52(""), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn selection_highlight_marks_cells_reversed() {
+        let mut state = TuiState::default();
+        state.input = "select me".to_string();
+        // Highlight a small range on row 0.
+        state.selection = Some(Selection {
+            anchor: (0, 0),
+            cursor: (3, 0),
+        });
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw frame");
+        let buffer = terminal.backend().buffer();
+        // Cells (0,0)..=(3,0) should carry the REVERSED modifier.
+        for x in 0u16..=3 {
+            let cell = buffer.cell((x, 0)).expect("cell exists");
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "cell ({x},0) should be reversed-highlighted"
+            );
+        }
+        // A cell well outside the selection should not be highlighted.
+        let outside = buffer.cell((10, 0)).expect("cell exists");
+        assert!(
+            !outside.modifier.contains(Modifier::REVERSED),
+            "cell outside selection must not be highlighted"
+        );
+    }
+
+    #[test]
+    fn buffer_to_rows_matches_render() {
+        let mut state = TuiState::default();
+        state.input = "xyz".to_string();
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+        let completed = terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw frame");
+        let rows = buffer_to_rows(completed.buffer);
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().any(|r| r.contains("xyz")), "input text missing");
     }
 
     #[test]
