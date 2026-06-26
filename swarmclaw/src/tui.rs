@@ -521,6 +521,27 @@ pub async fn run_app(agent: &mut crate::core::agent::Agent) -> anyhow::Result<()
                             continue;
                         }
 
+                        // Stateful slash-commands (/key, /model, /provider,
+                        // /orchestrator, /multithread). Any other "/..." input is
+                        // reported as unknown rather than sent to the model.
+                        if trimmed.starts_with('/') {
+                            let output = match agent.run_slash(&trimmed) {
+                                crate::core::agent::SlashAction::Message(msg) => msg,
+                                crate::core::agent::SlashAction::NotHandled => format!(
+                                    "Unknown command: {trimmed}. Type /help for available commands."
+                                ),
+                            };
+                            agent.record_message(Message {
+                                role: Role::System,
+                                content: output,
+                                timestamp: now_secs(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                            state.sync_transcript(&agent.state.history);
+                            continue;
+                        }
+
                         // Record the user message, reflect it, redraw, then run the turn.
                         agent.record_message(Message {
                             role: Role::User,
@@ -570,12 +591,16 @@ pub async fn run_app(agent: &mut crate::core::agent::Agent) -> anyhow::Result<()
 fn help_text() -> String {
     [
         "SwarmClaw Commands (fullscreen)",
-        "  /help, /helpp  - Show this help",
-        "  exit, quit     - Exit SwarmClaw",
-        "  Esc            - Clear input / cancel an in-flight turn",
-        "  Ctrl+C         - Exit",
+        "  /help, /helpp      - Show this help",
+        "  /key <API_KEY>     - Update the API key for the current provider",
+        "  /model <name>      - Switch model (provider auto-detected)",
+        "  /provider <name>   - Switch provider (openai, anthropic, gemini, groq, grok, ollama)",
+        "  /orchestrator [on|off] - Toggle the orchestrator planner",
+        "  /multithread [on|off]  - Toggle multithreaded execution",
+        "  exit, quit         - Exit SwarmClaw",
+        "  Esc                - Clear input / cancel an in-flight turn",
+        "  Ctrl+C             - Exit",
         "  PageUp/Down, mouse wheel - Scroll transcript",
-        "  (other slash-commands deferred to the classic CLI for now)",
     ]
     .join("\n")
 }
