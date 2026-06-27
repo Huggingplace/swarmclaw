@@ -668,6 +668,101 @@ mod tests {
         assert_eq!(results[0]["summary"], "done: only");
     }
 
+    // A mock executor that returns a per-goal summary, or an error for any goal
+    // containing "fail" — used to drive DelegateTaskTool::execute() fan-out/join
+    // and per-task error handling without any LLM round-trip.
+    struct MockExecutor;
+    #[async_trait]
+    impl SubAgentExecutor for MockExecutor {
+        async fn run_subtask(&self, goal: &str, _context: &str) -> Result<String> {
+            if goal.contains("fail") {
+                return Err(anyhow!("subtask blew up: {goal}"));
+            }
+            Ok(format!("summary: {goal}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_fanout_returns_summaries_in_original_order() {
+        // Distinguishable goals; results must come back in submission order even
+        // though they run concurrently (bounded by MAX_DELEGATES).
+        let tool = DelegateTaskTool::new(Arc::new(MockExecutor));
+        let out = tool
+            .execute(json!({
+                "tasks": [
+                    { "goal": "alpha" },
+                    { "goal": "bravo" },
+                    { "goal": "charlie" },
+                    { "goal": "delta" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0]["goal"], "alpha");
+        assert_eq!(results[0]["summary"], "summary: alpha");
+        assert_eq!(results[1]["summary"], "summary: bravo");
+        assert_eq!(results[2]["summary"], "summary: charlie");
+        assert_eq!(results[3]["summary"], "summary: delta");
+    }
+
+    #[tokio::test]
+    async fn execute_failing_subtask_becomes_error_entry_not_whole_failure() {
+        // The middle task fails; the call still succeeds and the failing task
+        // surfaces as an [error] summary while the others return normally.
+        let tool = DelegateTaskTool::new(Arc::new(MockExecutor));
+        let out = tool
+            .execute(json!({
+                "tasks": [
+                    { "goal": "ok one" },
+                    { "goal": "please fail here" },
+                    { "goal": "ok two" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "all tasks produce an entry");
+        assert_eq!(results[0]["summary"], "summary: ok one");
+        let failed = results[1]["summary"].as_str().unwrap();
+        assert!(failed.starts_with("[error]"), "got: {failed}");
+        assert!(failed.contains("subtask blew up"), "got: {failed}");
+        assert_eq!(results[2]["summary"], "summary: ok two");
+    }
+
+    #[tokio::test]
+    async fn execute_missing_tasks_is_graceful_with_mock_executor() {
+        let tool = DelegateTaskTool::new(Arc::new(MockExecutor));
+        let out = tool.execute(json!({})).await.unwrap();
+        assert!(out.contains("No tasks"), "got: {out}");
+        // Empty array is equally graceful.
+        let out = tool.execute(json!({ "tasks": [] })).await.unwrap();
+        assert!(out.contains("No tasks"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_more_tasks_than_max_delegates_still_completes_in_order() {
+        // Submit more tasks than the concurrency bound (MAX_DELEGATES) to prove
+        // the bounded buffer_unordered still drains every task and order is
+        // restored. We assert values/order, not timing.
+        let n = MAX_DELEGATES * 2 + 1;
+        let tasks: Vec<Value> = (0..n)
+            .map(|i| json!({ "goal": format!("task-{i}") }))
+            .collect();
+        let tool = DelegateTaskTool::new(Arc::new(MockExecutor));
+        let out = tool.execute(json!({ "tasks": tasks })).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), n);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r["goal"], format!("task-{i}"));
+            assert_eq!(r["summary"], format!("summary: task-{i}"));
+        }
+    }
+
     // ---- Fleet executor tests (mock provider, no real infra, no real sleeps) ----
 
     use crate::fleet::{FleetError, FleetJobStatus};

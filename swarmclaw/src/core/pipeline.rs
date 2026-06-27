@@ -680,6 +680,115 @@ mod tests {
         assert!(out.contains("[tool_pipeline] error"), "got: {out}");
     }
 
+    #[tokio::test]
+    async fn execute_chains_step_output_into_next_step_args() {
+        // step1 echoes "abc"; step2 uppercases ${step1}. Only step2 (the last,
+        // unmarked) is returned, and its output is the chained, transformed value.
+        let tool = pipeline_with(vec![Arc::new(EchoTool), Arc::new(UpperTool)]);
+        let out = tool
+            .execute(json!({
+                "steps": [
+                    { "id": "step1", "tool": "echo", "args": { "text": "abc" } },
+                    { "tool": "upper", "args": { "text": "${step1}" } }
+                ]
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "only the returned (last) step appears");
+        assert_eq!(results[0]["output"], "ABC");
+        // The intermediate "abc" output never leaves execute() verbatim.
+        assert!(!out.contains("\"output\":\"abc\""), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_return_true_selects_over_last_step_fallback() {
+        // An explicit `return: true` on step1 must override the last-step
+        // fallback: step1 ("first") is returned, the last step ("last") is not.
+        let tool = pipeline_with(vec![Arc::new(EchoTool)]);
+        let out = tool
+            .execute(json!({
+                "steps": [
+                    { "id": "a", "tool": "echo", "args": { "text": "first" }, "return": true },
+                    { "id": "b", "tool": "echo", "args": { "text": "last" } }
+                ]
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "only the marked step is returned");
+        assert_eq!(results[0]["id"], "a");
+        assert_eq!(results[0]["output"], "first");
+        // The unmarked last step's output is NOT in the payload.
+        assert!(!out.contains("last"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_no_return_falls_back_to_last_step() {
+        // With NO step marked return, only the LAST step's output comes back.
+        let tool = pipeline_with(vec![Arc::new(EchoTool)]);
+        let out = tool
+            .execute(json!({
+                "steps": [
+                    { "id": "a", "tool": "echo", "args": { "text": "first" } },
+                    { "id": "b", "tool": "echo", "args": { "text": "second" } }
+                ]
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], "b");
+        assert_eq!(results[0]["output"], "second");
+    }
+
+    #[tokio::test]
+    async fn execute_unknown_tool_lists_available_and_stops_before_later_steps() {
+        // The unknown tool is step 0, so a would-be step 1 echo must never run:
+        // the pipeline stops at the unknown tool and names the available tools.
+        let tool = pipeline_with(vec![Arc::new(EchoTool), Arc::new(UpperTool)]);
+        let out = tool
+            .execute(json!({
+                "steps": [
+                    { "tool": "does_not_exist", "args": {} },
+                    { "tool": "echo", "args": { "text": "should not run" } }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("unknown tool"), "got: {out}");
+        assert!(out.contains("step 0"), "got: {out}");
+        // Error message lists the available tools (sorted).
+        assert!(out.contains("echo"), "got: {out}");
+        assert!(out.contains("upper"), "got: {out}");
+        // The later echo step never executed.
+        assert!(!out.contains("should not run"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_error_names_failing_step_and_stops() {
+        // step 0 succeeds, step 1 errors -> structured error naming step 1 and
+        // the failing tool, and the (unreached) step 2 never runs.
+        let tool = pipeline_with(vec![Arc::new(EchoTool), Arc::new(FailTool)]);
+        let out = tool
+            .execute(json!({
+                "steps": [
+                    { "tool": "echo", "args": { "text": "ok" } },
+                    { "tool": "fail", "args": {} },
+                    { "tool": "echo", "args": { "text": "unreached" } }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("error at step 1"), "got: {out}");
+        assert!(out.contains("\"fail\""), "should name the failing tool: {out}");
+        assert!(out.contains("boom"), "got: {out}");
+        assert!(!out.contains("unreached"), "later step must not run: {out}");
+    }
+
     #[test]
     fn pipeline_excludes_itself_recursion_guard() {
         // A tool literally named "tool_pipeline" must be dropped from the map.
