@@ -366,9 +366,9 @@ fn display_value(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::gateways::test_support::{test_agent_template, wait_for_outbox_message};
-    use crate::outbox::{reset_local_db_for_tests, test_db_lock};
+    use crate::outbox::{list_outbox_messages, reset_local_db_for_tests, test_db_lock};
     use anyhow::Result;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
@@ -413,6 +413,228 @@ mod tests {
 
         let message = wait_for_outbox_message("discord", "channel-123").await?;
         assert!(message.payload_preview.contains("gateway ok"));
+        Ok(())
+    }
+
+    fn discord_command_body(id: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "type": 2,
+            "token": "discord-token",
+            "application_id": "app-123",
+            "channel_id": "channel-123",
+            "data": {
+                "name": "chat",
+                "options": [
+                    { "name": "prompt", "value": "hello from discord" }
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    async fn discord_pending_count() -> Result<usize> {
+        Ok(list_outbox_messages(Some("pending"), 50)?
+            .into_iter()
+            .filter(|message| message.platform == "discord" && message.channel_id == "channel-123")
+            .count())
+    }
+
+    #[tokio::test]
+    async fn rejects_signature_from_wrong_key() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        // Sign with one key, but configure the router with a different key.
+        let attacker_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let server_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let body = discord_command_body("discord-wrong-key");
+        let timestamp = "1712345678";
+        let signature = attacker_key.sign(format!("{}{}", timestamp, body).as_bytes());
+
+        let response =
+            DiscordWebhookGateway::router(server_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .header("x-signature-ed25519", hex::encode(signature.to_bytes()))
+                        .header("x-signature-timestamp", timestamp)
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(discord_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_tampered_body_after_signing() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let signed_body = discord_command_body("discord-tampered");
+        let timestamp = "1712345678";
+        let signature = signing_key.sign(format!("{}{}", timestamp, signed_body).as_bytes());
+
+        // Mutate the body after signing.
+        let tampered_body = signed_body.replace("hello from discord", "tampered payload");
+        assert_ne!(signed_body, tampered_body);
+
+        let response =
+            DiscordWebhookGateway::router(signing_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .header("x-signature-ed25519", hex::encode(signature.to_bytes()))
+                        .header("x-signature-timestamp", timestamp)
+                        .body(Body::from(tampered_body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(discord_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_signature_hex() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let body = discord_command_body("discord-bad-hex");
+        let timestamp = "1712345678";
+
+        let response =
+            DiscordWebhookGateway::router(signing_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .header("x-signature-ed25519", "not-valid-hex")
+                        .header("x-signature-timestamp", timestamp)
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(discord_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_signature_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let body = discord_command_body("discord-missing-sig");
+        let timestamp = "1712345678";
+
+        let response =
+            DiscordWebhookGateway::router(signing_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .header("x-signature-timestamp", timestamp)
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(discord_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_timestamp_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let body = discord_command_body("discord-missing-ts");
+        let timestamp = "1712345678";
+        let signature = signing_key.sign(format!("{}{}", timestamp, body).as_bytes());
+
+        let response =
+            DiscordWebhookGateway::router(signing_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .header("x-signature-ed25519", hex::encode(signature.to_bytes()))
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(discord_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responds_to_signed_ping_interaction() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        // PING interaction (type 1) must be validly signed and acked with type 1.
+        let body = serde_json::json!({ "id": "discord-ping", "type": 1 }).to_string();
+        let timestamp = "1712345678";
+        let signature = signing_key.sign(format!("{}{}", timestamp, body).as_bytes());
+
+        let response =
+            DiscordWebhookGateway::router(signing_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .header("x-signature-ed25519", hex::encode(signature.to_bytes()))
+                        .header("x-signature-timestamp", timestamp)
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(value["type"], 1);
+        // A PING must never produce a chat reply.
+        assert_eq!(discord_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_unsigned_ping_interaction() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let body = serde_json::json!({ "id": "discord-ping-unsigned", "type": 1 }).to_string();
+
+        let response =
+            DiscordWebhookGateway::router(signing_key.verifying_key(), test_agent_template())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/discord/interactions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         Ok(())
     }
 }

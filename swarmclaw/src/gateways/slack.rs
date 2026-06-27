@@ -483,4 +483,180 @@ mod tests {
         mac.update(format!("v0:{timestamp}:{body}").as_bytes());
         format!("v0={}", hex::encode(mac.finalize().into_bytes()))
     }
+
+    fn slack_event_body(event_id: &str) -> String {
+        serde_json::json!({
+            "type": "event_callback",
+            "event_id": event_id,
+            "event": {
+                "type": "app_mention",
+                "channel": "C123",
+                "user": "U123",
+                "text": "<@Ubot> hello from slack",
+                "ts": "1712345678.1234"
+            }
+        })
+        .to_string()
+    }
+
+    async fn slack_pending_count() -> Result<usize> {
+        Ok(list_outbox_messages(Some("pending"), 50)?
+            .into_iter()
+            .filter(|message| message.platform == "slack" && message.channel_id == "C123")
+            .count())
+    }
+
+    #[tokio::test]
+    async fn rejects_signature_signed_with_wrong_secret() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let body = slack_event_body("Ev_wrong_secret");
+        let timestamp = Utc::now().timestamp().to_string();
+        // Correctly-shaped signature, but computed with a different signing secret.
+        let signature = slack_signature("not-the-real-secret", &timestamp, &body);
+
+        let response = SlackWebhookGateway::router(
+            "xoxb-test".to_string(),
+            "slack-secret".to_string(),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/slack/events")
+                .header("content-type", "application/json")
+                .header("x-slack-request-timestamp", timestamp.as_str())
+                .header("x-slack-signature", signature.as_str())
+                .body(Body::from(body))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(slack_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_tampered_body_after_signing() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signed_body = slack_event_body("Ev_tampered");
+        let timestamp = Utc::now().timestamp().to_string();
+        let signature = slack_signature("slack-secret", &timestamp, &signed_body);
+
+        // Mutate the body after signing so the HMAC no longer matches.
+        let tampered_body = signed_body.replace("hello from slack", "tampered payload");
+        assert_ne!(signed_body, tampered_body);
+
+        let response = SlackWebhookGateway::router(
+            "xoxb-test".to_string(),
+            "slack-secret".to_string(),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/slack/events")
+                .header("content-type", "application/json")
+                .header("x-slack-request-timestamp", timestamp.as_str())
+                .header("x-slack-signature", signature.as_str())
+                .body(Body::from(tampered_body))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(slack_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_signature_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let body = slack_event_body("Ev_missing_sig");
+        let timestamp = Utc::now().timestamp().to_string();
+
+        let response = SlackWebhookGateway::router(
+            "xoxb-test".to_string(),
+            "slack-secret".to_string(),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/slack/events")
+                .header("content-type", "application/json")
+                .header("x-slack-request-timestamp", timestamp.as_str())
+                .body(Body::from(body))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(slack_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_timestamp_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let body = slack_event_body("Ev_missing_ts");
+        let timestamp = Utc::now().timestamp().to_string();
+        let signature = slack_signature("slack-secret", &timestamp, &body);
+
+        let response = SlackWebhookGateway::router(
+            "xoxb-test".to_string(),
+            "slack-secret".to_string(),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/slack/events")
+                .header("content-type", "application/json")
+                .header("x-slack-signature", signature.as_str())
+                .body(Body::from(body))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(slack_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_timestamp_outside_freshness_window() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let body = slack_event_body("Ev_stale_ts");
+        // Far outside the +/- 5 minute freshness window. Sign correctly so the
+        // only failure is the timestamp freshness check.
+        let timestamp = (Utc::now().timestamp() - 60 * 60).to_string();
+        let signature = slack_signature("slack-secret", &timestamp, &body);
+
+        let response = SlackWebhookGateway::router(
+            "xoxb-test".to_string(),
+            "slack-secret".to_string(),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/slack/events")
+                .header("content-type", "application/json")
+                .header("x-slack-request-timestamp", timestamp.as_str())
+                .header("x-slack-signature", signature.as_str())
+                .body(Body::from(body))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(slack_pending_count().await?, 0);
+        Ok(())
+    }
 }

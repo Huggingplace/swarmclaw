@@ -444,7 +444,7 @@ fn empty_twiml_response() -> Response {
 mod tests {
     use super::*;
     use crate::gateways::test_support::{test_agent_template, wait_for_outbox_message};
-    use crate::outbox::{reset_local_db_for_tests, test_db_lock};
+    use crate::outbox::{list_outbox_messages, reset_local_db_for_tests, test_db_lock};
     use anyhow::Result;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
@@ -510,5 +510,145 @@ mod tests {
         let mut mac = HmacSha1::new_from_slice(auth_token.as_bytes()).expect("hmac");
         mac.update(data.as_bytes());
         BASE64.encode(mac.finalize().into_bytes())
+    }
+
+    fn whatsapp_params() -> Vec<(String, String)> {
+        vec![
+            ("AccountSid".to_string(), "AC123".to_string()),
+            ("MessageSid".to_string(), "SM123".to_string()),
+            ("From".to_string(), "whatsapp:+15550002222".to_string()),
+            ("To".to_string(), "whatsapp:+15550001111".to_string()),
+            ("Body".to_string(), "hello from whatsapp".to_string()),
+            ("NumMedia".to_string(), "0".to_string()),
+        ]
+    }
+
+    fn whatsapp_router() -> Router {
+        WhatsAppWebhookGateway::router(
+            "AC123".to_string(),
+            "auth-token".to_string(),
+            Some("whatsapp:+15550001111".to_string()),
+            Some("https://example.com/twilio/whatsapp".to_string()),
+            test_agent_template(),
+        )
+    }
+
+    async fn whatsapp_pending_count() -> Result<usize> {
+        Ok(list_outbox_messages(Some("pending"), 50)?
+            .into_iter()
+            .filter(|message| {
+                message.platform == "whatsapp" && message.channel_id == "whatsapp:+15550002222"
+            })
+            .count())
+    }
+
+    #[tokio::test]
+    async fn rejects_signature_signed_with_wrong_token() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let params = whatsapp_params();
+        let body = serde_urlencoded::to_string(&params)?;
+        // Correctly-shaped signature computed with the wrong auth token.
+        let signature =
+            twilio_signature("https://example.com/twilio/whatsapp", &params, "wrong-token");
+
+        let response = whatsapp_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/twilio/whatsapp")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-twilio-signature", signature)
+                    .body(Body::from(body))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(whatsapp_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_tampered_body_after_signing() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let signed_params = whatsapp_params();
+        let signature = twilio_signature(
+            "https://example.com/twilio/whatsapp",
+            &signed_params,
+            "auth-token",
+        );
+
+        // Mutate the form body after signing; signature now covers stale params.
+        let mut tampered_params = signed_params.clone();
+        for entry in tampered_params.iter_mut() {
+            if entry.0 == "Body" {
+                entry.1 = "tampered payload".to_string();
+            }
+        }
+        let tampered_body = serde_urlencoded::to_string(&tampered_params)?;
+
+        let response = whatsapp_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/twilio/whatsapp")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-twilio-signature", signature)
+                    .body(Body::from(tampered_body))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(whatsapp_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_signature_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let body = serde_urlencoded::to_string(&whatsapp_params())?;
+
+        let response = whatsapp_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/twilio/whatsapp")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(whatsapp_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_base64_signature() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let body = serde_urlencoded::to_string(&whatsapp_params())?;
+
+        let response = whatsapp_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/twilio/whatsapp")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    // Not valid base64 -> decode failure path.
+                    .header("x-twilio-signature", "!!!not-base64!!!")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(whatsapp_pending_count().await?, 0);
+        Ok(())
     }
 }
