@@ -197,9 +197,10 @@ impl Agent {
         self.skills.push(skill);
     }
 
-    /// Assemble the tool set for one turn: every skill's tools, plus — only
-    /// when this agent is an opt-in orchestrator (`use_orchestrator == true`)
-    /// — the `delegate_task` tool.
+    /// Assemble the tool set for one turn: every skill's tools, the always-on
+    /// `tool_pipeline` tool (built from the skill tools), plus — only when this
+    /// agent is an opt-in orchestrator (`use_orchestrator == true`) — the
+    /// `delegate_task` tool.
     ///
     /// SAFETY / RECURSION GUARD: the delegate tool spawns ephemeral sub-agents
     /// built with `use_orchestrator = false`, so sub-agents never reach this
@@ -209,6 +210,17 @@ impl Agent {
     fn assemble_tools(&self) -> Vec<Arc<dyn crate::tools::Tool>> {
         let mut tools: Vec<Arc<dyn crate::tools::Tool>> =
             self.skills.iter().flat_map(|s| s.tools()).collect();
+
+        // Programmatic tool pipeline (PR-5): always available. It only invokes
+        // the OTHER tools the agent already has (the skills' tools collected
+        // above) and spawns no LLM calls, so it is a pure efficiency wrapper and
+        // is added UNGATED. RECURSION EXCLUSION: build it from the skill tools
+        // only — never the pipeline itself (and not the delegate tool, which is
+        // appended below), so a pipeline can never call itself or fan out into
+        // nested delegation. `from_tools` defensively drops any "tool_pipeline".
+        let pipeline = crate::core::pipeline::PipelineTool::from_tools(&tools);
+        tools.push(Arc::new(pipeline));
+
         if self.use_orchestrator {
             let executor = crate::core::delegation::InProcessExecutor::new(
                 self.llm.clone(),
