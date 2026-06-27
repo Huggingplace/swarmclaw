@@ -224,6 +224,16 @@ pub struct Agent {
     /// injection, behavior byte-for-byte unchanged. Populated from
     /// `SWARMCLAW_SESSION_MEMORY` (`1`/`true`) in [`Agent::new`].
     pub session_memory: bool,
+    /// Self-improving learned skills (PR-9), a CONSERVATIVE v1. Strictly OPT-IN
+    /// and DEFAULT-OFF. When true AND a `workspace_root` is set, after a
+    /// "complex" turn (>= [`crate::core::skill_memory::DEFAULT_SKILL_TOOL_THRESHOLD`]
+    /// tool calls) the agent best-effort authors a reusable MARKDOWN PROCEDURE
+    /// NOTE (never executable code) under `<workspace_root>/.swarmclaw/skills/`.
+    /// Default `false` => the agent never authors anything and behavior is
+    /// byte-for-byte unchanged. Populated from `SWARMCLAW_SELF_IMPROVE`
+    /// (`1`/`true`/`on`/`yes`) in [`Agent::new`]. See
+    /// [`Agent::maybe_author_skill`].
+    pub self_improve: bool,
 }
 
 impl Agent {
@@ -269,6 +279,15 @@ impl Agent {
             // unless `SWARMCLAW_SESSION_MEMORY` is `1`/`true`, nothing is
             // searched or injected and behavior is byte-for-byte unchanged.
             session_memory: std::env::var("SWARMCLAW_SESSION_MEMORY")
+                .map(|raw| {
+                    let v = raw.trim().to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "on" || v == "yes"
+                })
+                .unwrap_or(false),
+            // Self-improving learned skills (PR-9), strictly opt-in. DEFAULT-OFF:
+            // unless `SWARMCLAW_SELF_IMPROVE` is `1`/`true`/`on`/`yes`, no skill
+            // is ever authored and behavior is byte-for-byte unchanged.
+            self_improve: std::env::var("SWARMCLAW_SELF_IMPROVE")
                 .map(|raw| {
                     let v = raw.trim().to_ascii_lowercase();
                     v == "1" || v == "true" || v == "on" || v == "yes"
@@ -382,6 +401,7 @@ impl Agent {
         agent.memory_org_id = self.memory_org_id.clone();
         agent.memory_api_key = self.memory_api_key.clone();
         agent.workspace_root = self.workspace_root.clone();
+        agent.self_improve = self.self_improve;
 
         if let Some(state_path) = self.session_state_path(&session_id) {
             agent = agent.with_state_path(state_path);
@@ -958,6 +978,9 @@ impl Agent {
                     write_cli_line(&mut stdout, format!("  {} - {}", "/fallback [a,b,c|off]".truecolor(200, 150, 255), "Set backup providers tried if the primary fails"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/recall <query>".truecolor(200, 150, 255), "Search past sessions for relevant messages"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/usage".truecolor(200, 150, 255), "Show session usage summary"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/skills".truecolor(200, 150, 255), "List learned skills for this workspace"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/skill <slug>".truecolor(200, 150, 255), "Show one learned skill's content"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/forget <slug>".truecolor(200, 150, 255), "Delete a learned skill"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "exit, quit".truecolor(200, 150, 255), "Exit SwarmClaw"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "ctrl+c".truecolor(200, 150, 255), "Cancel the current tool execution or LLM response"))?;
                     write_cli_line(&mut stdout, "")?;
@@ -1091,6 +1114,31 @@ impl Agent {
                         self.config.model.as_deref().unwrap_or("auto"),
                     );
                     write_cli_line(&mut stdout, format!("{} {}", cli_chip("USAGE", CLI_DEEP_RGB, CLI_CYAN_RGB), summary.truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
+                    continue;
+                }
+
+                // Learned skills (PR-9). Reading is always allowed; authoring is
+                // automatic only when self-improve is enabled. Check `/skills`
+                // before `/skill`.
+                if input.starts_with("/skills") {
+                    let msg = self.handle_skills_list_command();
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SKILLS", CLI_DEEP_RGB, CLI_CYAN_RGB), msg.truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/skill") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+                    let msg = self.handle_skill_show_command(arg);
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SKILL", CLI_DEEP_RGB, CLI_CYAN_RGB), msg.truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/forget") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+                    let msg = self.handle_skill_forget_command(arg);
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SKILL", CLI_DEEP_RGB, CLI_GREEN_RGB), msg.truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
                     continue;
                 }
 
@@ -1353,6 +1401,9 @@ impl Agent {
         // signatures for repeated-call detection. See `core::loop_guard`.
         let mut step: usize = 0;
         let mut tool_call_sigs: Vec<String> = Vec::new();
+        // Count tool executions across this whole turn for the opt-in
+        // self-improve feature (see `maybe_author_skill`). Unused when off.
+        let mut tool_calls_this_turn: usize = 0;
 
         // Outer loop: LLM <-> tools turn loop (mirrors stream_think's outer loop).
         loop {
@@ -1683,6 +1734,10 @@ impl Agent {
                 break;
             }
 
+            // Self-improve bookkeeping: tally the tool calls executed this turn
+            // (used only by the opt-in learned-skill author at end of turn).
+            tool_calls_this_turn += tool_calls.len();
+
             // `/trace` diagnostics: each tool call's name + arg byte-size,
             // before execution. Cheap and fully gated behind `self.trace`.
             if self.trace {
@@ -1837,6 +1892,11 @@ impl Agent {
             // Continue outer loop to let the LLM process tool results.
         }
 
+        // End-of-turn, NORMAL exit only (errors `return Err`/`bail!` above and
+        // never reach here). Best-effort, gated, non-fatal learned-skill author.
+        let goal = self.latest_user_goal();
+        self.maybe_author_skill(&goal, tool_calls_this_turn).await;
+
         state.status = None;
         Ok(())
     }
@@ -1951,6 +2011,11 @@ impl Agent {
         // signatures for repeated-call detection. See `core::loop_guard`.
         let mut step: usize = 0;
         let mut tool_call_sigs: Vec<String> = Vec::new();
+        // Count tool executions across this whole turn, used only by the opt-in
+        // self-improve feature to decide if the turn was "complex" enough to
+        // author a learned skill. Pure bookkeeping; unused when the feature is
+        // off (default).
+        let mut tool_calls_this_turn: usize = 0;
 
         loop {
             // Max-step guard: stop gracefully if the model keeps reasoning past
@@ -2520,6 +2585,11 @@ impl Agent {
             }
 
             if !tool_calls.is_empty() {
+                // Self-improve bookkeeping: tally the tool calls executed this
+                // turn (used only by the opt-in learned-skill author at end of
+                // turn). No effect when the feature is off.
+                tool_calls_this_turn += tool_calls.len();
+
                 // `/trace` diagnostics: each tool call's name + arg byte-size,
                 // before execution. Cheap and fully gated behind `self.trace`.
                 if self.trace {
@@ -2815,6 +2885,13 @@ impl Agent {
             break;
         }
 
+        // End-of-turn, NORMAL exit only (errors `return Err` above and never
+        // reach here; cancellation propagates as an error too). Best-effort,
+        // gated, and non-fatal: authors a learned skill if self-improve is on,
+        // a workspace is set, and the turn was complex. See `maybe_author_skill`.
+        let goal = self.latest_user_goal();
+        self.maybe_author_skill(&goal, tool_calls_this_turn).await;
+
         Ok(())
     }
 
@@ -2828,6 +2905,9 @@ impl Agent {
         }
 
         let mut stdout = io::stdout();
+        // Count tool executions across this whole turn for the opt-in
+        // self-improve feature (see `maybe_author_skill`). Unused when off.
+        let mut tool_calls_this_turn: usize = 0;
 
         loop {
             print!("Thinking...");
@@ -3114,6 +3194,9 @@ impl Agent {
                             break;
                         }
 
+                        // Self-improve bookkeeping (opt-in; unused when off).
+                        tool_calls_this_turn += tool_calls.len();
+
                         for tc in tool_calls {
                             // `/trace`: tool name + arg byte-size before exec.
                             if self.trace {
@@ -3195,6 +3278,11 @@ impl Agent {
             }
         }
 
+        // End-of-turn, NORMAL exit only. Best-effort, gated, non-fatal
+        // learned-skill author (see `maybe_author_skill`).
+        let goal = self.latest_user_goal();
+        self.maybe_author_skill(&goal, tool_calls_this_turn).await;
+
         if self.config.enable_analytics.unwrap_or(true) {
             self.log_analytics_turn().await;
         }
@@ -3206,6 +3294,133 @@ impl Agent {
         }
 
         Ok(())
+    }
+
+    /// Best-effort author of a learned skill at the END of a completed turn
+    /// (PR-9). A learned skill is a MARKDOWN PROCEDURE NOTE distilled from the
+    /// just-finished task — never executable code; it is only stored on disk and
+    /// (optionally) shown later. It is NOT added to the executable tool/Skill
+    /// system.
+    ///
+    /// GATING (all must hold or this is an immediate no-op):
+    /// 1. `self.self_improve` is true (env `SWARMCLAW_SELF_IMPROVE`, default off),
+    /// 2. a `workspace_root` is configured (writes are confined there), and
+    /// 3. the turn was "complex": `should_author_skill(tool_calls_in_turn,
+    ///    DEFAULT_SKILL_TOOL_THRESHOLD)`.
+    ///
+    /// SAFETY: fully best-effort. Any failure (provider error, empty/blank
+    /// output, write error) is logged via `warn!` and SWALLOWED — it must NEVER
+    /// affect the turn result. Callers invoke it only on NORMAL turn exit (never
+    /// on cancellation/error) so a learned skill is authored from successful
+    /// work. Writes go ONLY to `<workspace_root>/.swarmclaw/skills/`.
+    async fn maybe_author_skill(&self, turn_user_goal: &str, tool_calls_in_turn: usize) {
+        if !self.self_improve {
+            return;
+        }
+        if !crate::core::skill_memory::should_author_skill(
+            tool_calls_in_turn,
+            crate::core::skill_memory::DEFAULT_SKILL_TOOL_THRESHOLD,
+        ) {
+            return;
+        }
+        let Some(workspace_root) = &self.workspace_root else {
+            return;
+        };
+
+        let goal = turn_user_goal.trim();
+        let prompt = format!(
+            "You just completed a multi-step task. Write a concise, REUSABLE \
+             \"skill\": a titled, step-by-step procedure another agent could \
+             follow to handle a similar task in the future. Output PLAIN \
+             MARKDOWN ONLY (no code fences around the whole note). The FIRST \
+             line must be a short descriptive title (no leading '#'). Then a \
+             blank line, then a numbered list of the key steps, kept general \
+             and free of one-off specifics. Do not include secrets or \
+             credentials.\n\nThe task was:\n{goal}"
+        );
+
+        let request = vec![Message {
+            role: Role::User,
+            content: prompt,
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let options = CompletionOptions {
+            model: self.config.model.clone(),
+            max_tokens: Some(768),
+            ..Default::default()
+        };
+
+        let llm = self.llm.clone();
+        let text = match llm.complete(&request, &options).await {
+            Ok(resp) => resp.content.unwrap_or_default(),
+            Err(error) => {
+                warn!(
+                    agent_id = %self.id,
+                    "Learned-skill authoring failed (skipping): {error}"
+                );
+                return;
+            }
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            warn!(
+                agent_id = %self.id,
+                "Learned-skill authoring returned empty content (skipping)"
+            );
+            return;
+        }
+
+        // The first non-empty line is the title; the rest is the body.
+        let mut lines = text.lines();
+        let title = lines
+            .by_ref()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('#')
+            .trim();
+        if title.is_empty() {
+            warn!(agent_id = %self.id, "Learned-skill authoring produced no title (skipping)");
+            return;
+        }
+        let slug = crate::core::skill_memory::slugify(title);
+        let skill = crate::core::skill_memory::LearnedSkill {
+            name: title.to_string(),
+            slug,
+            content: text.to_string(),
+        };
+
+        let dir = crate::core::skill_memory::skills_dir(workspace_root);
+        match crate::core::skill_memory::save_skill(&dir, &skill) {
+            Ok(path) => {
+                info!(
+                    agent_id = %self.id,
+                    skill = %skill.name,
+                    path = %path.display(),
+                    "Authored learned skill"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    agent_id = %self.id,
+                    "Saving learned skill failed (skipping): {error}"
+                );
+            }
+        }
+    }
+
+    /// Return the latest `User` message content (the current turn's goal), or an
+    /// empty string if none exists. Used to feed [`Agent::maybe_author_skill`].
+    fn latest_user_goal(&self) -> String {
+        self.state
+            .history
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
     }
 
     async fn log_analytics_turn(&self) {
@@ -4441,6 +4656,24 @@ impl Agent {
             ));
         }
 
+        // NOTE: check `/skills` BEFORE `/skill` (the former is a prefix of the
+        // latter only in the other direction, but ordering keeps it explicit).
+        if input.starts_with("/skills") {
+            return SlashAction::Message(self.handle_skills_list_command());
+        }
+
+        if input.starts_with("/skill") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+            return SlashAction::Message(self.handle_skill_show_command(arg));
+        }
+
+        if input.starts_with("/forget") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+            return SlashAction::Message(self.handle_skill_forget_command(arg));
+        }
+
         SlashAction::NotHandled
     }
 
@@ -4550,6 +4783,69 @@ impl Agent {
             msg.push_str(&format!(" (ignored unknown: {})", unknown.join(", ")));
         }
         msg
+    }
+
+    /// Shared `/skills` command logic for both the classic CLI (`run`) and
+    /// fullscreen (`run_slash`) paths: list the names/slugs of learned skills
+    /// stored for the current workspace. Returns a plain-text message. When no
+    /// workspace is configured, the learned-skills feature is unavailable and a
+    /// clear notice is returned. Reading is always allowed regardless of the
+    /// opt-in `self_improve` authoring flag.
+    fn handle_skills_list_command(&self) -> String {
+        let Some(workspace_root) = &self.workspace_root else {
+            return "Learned skills are unavailable: no workspace configured.".to_string();
+        };
+        let dir = crate::core::skill_memory::skills_dir(workspace_root);
+        match crate::core::skill_memory::list_skills(&dir) {
+            Ok(skills) if skills.is_empty() => {
+                "No learned skills yet.".to_string()
+            }
+            Ok(skills) => {
+                let mut out = format!("Learned skills ({}):", skills.len());
+                for s in &skills {
+                    out.push_str(&format!("\n- {} [{}]", s.name, s.slug));
+                }
+                out.push_str("\nUse /skill <slug> to view one.");
+                out
+            }
+            Err(error) => format!("Failed to list learned skills: {error}"),
+        }
+    }
+
+    /// Shared `/skill <slug>` command logic: show the markdown content of one
+    /// learned skill for the current workspace. Returns a plain-text message.
+    fn handle_skill_show_command(&self, slug: &str) -> String {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            return "Usage: /skill <slug>".to_string();
+        }
+        let Some(workspace_root) = &self.workspace_root else {
+            return "Learned skills are unavailable: no workspace configured.".to_string();
+        };
+        let dir = crate::core::skill_memory::skills_dir(workspace_root);
+        match crate::core::skill_memory::get_skill(&dir, slug) {
+            Ok(Some(skill)) => format!("{}\n\n{}", skill.name, skill.content),
+            Ok(None) => format!("No learned skill named '{slug}'. Try /skills."),
+            Err(error) => format!("Failed to read learned skill: {error}"),
+        }
+    }
+
+    /// Shared `/forget <slug>` command logic: delete one learned skill for the
+    /// current workspace. Returns a plain-text message.
+    fn handle_skill_forget_command(&self, slug: &str) -> String {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            return "Usage: /forget <slug>".to_string();
+        }
+        let Some(workspace_root) = &self.workspace_root else {
+            return "Learned skills are unavailable: no workspace configured.".to_string();
+        };
+        let dir = crate::core::skill_memory::skills_dir(workspace_root);
+        match crate::core::skill_memory::forget_skill(&dir, slug) {
+            Ok(true) => format!("Forgot learned skill '{slug}'."),
+            Ok(false) => format!("No learned skill named '{slug}'."),
+            Err(error) => format!("Failed to forget learned skill: {error}"),
+        }
     }
 }
 
