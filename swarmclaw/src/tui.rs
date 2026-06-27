@@ -816,6 +816,7 @@ fn help_text() -> String {
         "  /multithread [on|off]  - Toggle multithreaded execution",
         "  /think <off|low|medium|high> - Set reasoning verbosity",
         "  /trace [on|off]    - Toggle per-turn diagnostic lines",
+        "  /fallback [a,b,c|off] - Set backup providers tried if the primary fails",
         "  /usage             - Show session usage summary",
         "  exit, quit         - Exit SwarmClaw",
         "  Esc                - Clear input / cancel an in-flight turn",

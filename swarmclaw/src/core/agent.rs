@@ -210,6 +210,12 @@ pub struct Agent {
     /// When true (set via `/trace`), the turn loops emit extra diagnostic
     /// lines. Default `false` = no diagnostics, behavior unchanged.
     pub trace: bool,
+    /// Ordered backup provider names tried (in addition to the primary) when a
+    /// provider call fails. Default EMPTY = strictly the primary, byte-for-byte
+    /// today's behavior. Populated from `LLM_FALLBACK_PROVIDERS` in
+    /// [`Agent::new`] or set live via `/fallback`. See
+    /// [`Agent::fallback_provider_list`].
+    pub fallback_providers: Vec<String>,
 }
 
 impl Agent {
@@ -243,6 +249,14 @@ impl Agent {
             // emits no diagnostics. Both keep today's behavior byte-for-byte.
             think_level: ThinkLevel::Off,
             trace: false,
+            // Provider fallback chains (PR-7), strictly opt-in. Default EMPTY:
+            // with no fallbacks configured the outer provider loop has exactly
+            // ONE entry (the primary) and every call site behaves byte-for-byte
+            // as before. Populated from `LLM_FALLBACK_PROVIDERS` (comma list of
+            // provider names, e.g. "anthropic,openai"); unset/empty -> empty.
+            fallback_providers: std::env::var("LLM_FALLBACK_PROVIDERS")
+                .map(|raw| parse_fallback_providers(&raw))
+                .unwrap_or_default(),
         }
     }
 
@@ -291,6 +305,40 @@ impl Agent {
             )));
         }
         tools
+    }
+
+    /// Build the ordered list of providers to try for a single LLM call: the
+    /// PRIMARY (`self.llm`) first, then each configured fallback provider
+    /// constructed by name via [`provider_from_name`]. Unknown names are simply
+    /// SKIPPED so a bad entry can never break the chain. Each entry carries a
+    /// human-readable label for diagnostics.
+    ///
+    /// SAFETY / NO-OP DEFAULT: with `fallback_providers` empty (the default),
+    /// this returns EXACTLY ONE entry — the primary — so the outer provider
+    /// loop at each call site runs the provider exactly once, identical to
+    /// today. Construction reads env API keys internally; a keyless fallback
+    /// provider will simply fail its own call and the loop moves on, which is
+    /// acceptable (no panics here).
+    fn fallback_provider_list(&self) -> Vec<(Arc<dyn LLMProvider>, String)> {
+        let mut list: Vec<(Arc<dyn LLMProvider>, String)> =
+            vec![(self.llm.clone(), self.llm.provider_name().to_string())];
+        for name in &self.fallback_providers {
+            match provider_from_name(name) {
+                Ok((provider, _msg)) => {
+                    let label = provider.provider_name().to_string();
+                    list.push((provider, label));
+                }
+                Err(_) => {
+                    // Unknown provider name: skip it rather than abort the chain.
+                    warn!(
+                        agent_id = %self.id,
+                        provider = %name,
+                        "Skipping unknown fallback provider name"
+                    );
+                }
+            }
+        }
+        list
     }
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
@@ -824,6 +872,7 @@ impl Agent {
                     write_cli_line(&mut stdout, format!("  {} - {}", "/provider <NAME>".truecolor(200, 150, 255), "Switch AI provider (openai, anthropic, gemini, etc.)"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/think <off|low|medium|high>".truecolor(200, 150, 255), "Set reasoning verbosity (system-prompt directive)"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/trace [on|off]".truecolor(200, 150, 255), "Toggle per-turn diagnostic lines"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/fallback [a,b,c|off]".truecolor(200, 150, 255), "Set backup providers tried if the primary fails"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/usage".truecolor(200, 150, 255), "Show session usage summary"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "exit, quit".truecolor(200, 150, 255), "Exit SwarmClaw"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "ctrl+c".truecolor(200, 150, 255), "Cancel the current tool execution or LLM response"))?;
@@ -932,6 +981,14 @@ impl Agent {
                     }
                     let state = if self.trace { "ON" } else { "OFF" };
                     write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Trace diagnostics are now {}", state).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/fallback") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+                    let msg = self.handle_fallback_command(arg);
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), msg.truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
                     continue;
                 }
 
@@ -1288,40 +1345,97 @@ impl Agent {
                 state.sync_transcript(&self.state.history);
             }
 
-            // Context-overflow recovery: if establishing the stream fails
-            // because the prompt is too large, recompact the (already prepared)
-            // history at a progressively shrunken budget and retry, up to
-            // MAX_OVERFLOW_RETRIES attempts total. Overflow that only surfaces
-            // mid-stream (after chunks have started) is not retried here, since
-            // partial output has already been consumed; that case propagates
-            // as before. The at-stream-start case (the common one) is covered.
+            // Provider fallback chain (PR-7) wrapping context-overflow recovery,
+            // applied at stream ESTABLISHMENT.
+            //
+            // OUTER loop: try each provider from `fallback_provider_list()` in
+            // order (primary first, then configured fallbacks). Empty config =>
+            // exactly one entry (primary) => identical to today.
+            //
+            // INNER block (unchanged): context-overflow recovery — if
+            // establishing the stream on the CURRENT provider fails because the
+            // prompt is too large, recompact at a shrunken budget and retry up
+            // to MAX_OVERFLOW_RETRIES. Overflow that only surfaces mid-stream
+            // (after chunks have started) is NOT retried here, since partial
+            // output has already been consumed; that case propagates as before.
+            // LIKEWISE, provider fallback applies only at stream establishment:
+            // a mid-stream provider error after chunks are consumed is NOT
+            // retried on another provider (same limitation as overflow
+            // recovery). On final failure of the LAST provider we `return
+            // Err(e)` exactly as before; cancellation is never retried.
+            let provider_list = self.fallback_provider_list();
+            let provider_count = provider_list.len();
             let mut stream = {
-                let base_history = history_to_send.clone();
-                let mut current_history = history_to_send;
-                let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
-                let mut attempt = 0usize;
-                loop {
-                    attempt += 1;
-                    match self.llm.stream(&current_history, &options, &tools).await {
-                        Ok(s) => break s,
+                let mut established = None;
+                let mut last_err: Option<anyhow::Error> = None;
+                for (provider_idx, (provider, provider_label)) in provider_list.iter().enumerate() {
+                    let base_history = history_to_send.clone();
+                    let mut current_history = base_history.clone();
+                    let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
+                    let mut attempt = 0usize;
+                    let attempt_result = loop {
+                        attempt += 1;
+                        match provider.stream(&current_history, &options, &tools).await {
+                            Ok(s) => break Ok(s),
+                            Err(e) => {
+                                if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
+                                    && crate::core::context::is_context_overflow_error(&e)
+                                {
+                                    budget = (budget as f64 * 0.6) as usize;
+                                    warn!(
+                                        agent_id = %self.id,
+                                        attempt,
+                                        new_budget = budget,
+                                        "Context overflow establishing stream; recompacting harder and retrying"
+                                    );
+                                    current_history = self
+                                        .compact_history_for_send(&base_history, budget)
+                                        .await;
+                                    continue;
+                                }
+                                break Err(e);
+                            }
+                        }
+                    };
+                    match attempt_result {
+                        Ok(s) => {
+                            established = Some(s);
+                            break;
+                        }
                         Err(e) => {
-                            if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
-                                && crate::core::context::is_context_overflow_error(&e)
-                            {
-                                budget = (budget as f64 * 0.6) as usize;
+                            let is_cancel = e.to_string().contains("[Operation Cancelled]");
+                            let has_next = provider_idx + 1 < provider_count;
+                            if !is_cancel && has_next {
+                                let next_label = provider_list[provider_idx + 1].1.clone();
                                 warn!(
                                     agent_id = %self.id,
-                                    attempt,
-                                    new_budget = budget,
-                                    "Context overflow establishing stream; recompacting harder and retrying"
+                                    "provider {provider_label} failed: {e}; falling back to {next_label}"
                                 );
-                                current_history = self
-                                    .compact_history_for_send(&base_history, budget)
-                                    .await;
+                                self.record_message(Message {
+                                    role: Role::System,
+                                    content: format!(
+                                        "[Provider {provider_label} failed; falling back to {next_label}.]"
+                                    ),
+                                    timestamp: now_secs(),
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                });
+                                state.sync_transcript(&self.state.history);
+                                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+                                last_err = Some(e);
                                 continue;
                             }
-                            return Err(e);
+                            last_err = Some(e);
+                            break;
                         }
+                    }
+                }
+                match established {
+                    Some(s) => s,
+                    None => {
+                        return Err(last_err.unwrap_or_else(|| {
+                            anyhow::anyhow!("no providers configured")
+                        }));
                     }
                 }
             };
@@ -1915,38 +2029,96 @@ impl Agent {
                 }
             }
 
-            // Context-overflow recovery: if establishing the stream fails
-            // because the prompt is too large, recompact the (already prepared)
-            // history at a progressively shrunken budget and retry, up to
-            // MAX_OVERFLOW_RETRIES attempts total. Overflow that only surfaces
-            // mid-stream (handled by the Err(error) chunk arm below) is not
-            // retried, since partial output has already been consumed; that
-            // case propagates as before. The at-stream-start case is covered.
+            // Provider fallback chain (PR-7) wrapping context-overflow recovery,
+            // applied at stream ESTABLISHMENT.
+            //
+            // OUTER loop: try each provider from `fallback_provider_list()` in
+            // order (primary first, then configured fallbacks). Empty config =>
+            // exactly one entry (primary) => identical to today.
+            //
+            // INNER block (unchanged): context-overflow recovery — if
+            // establishing the stream fails because the prompt is too large,
+            // recompact at a shrunken budget and retry up to
+            // MAX_OVERFLOW_RETRIES. Overflow that only surfaces mid-stream
+            // (handled by the Err(error) chunk arm below) is not retried, since
+            // partial output has already been consumed; that case propagates as
+            // before. LIKEWISE provider fallback applies only at establishment:
+            // a mid-stream provider error after chunks are consumed is NOT
+            // retried on another provider (same limitation). On final failure
+            // of the LAST provider we emit the gateway error (if any) and
+            // `return Err(e)` exactly as before; cancellation is never retried.
+            let provider_list = self.fallback_provider_list();
+            let provider_count = provider_list.len();
             let mut stream = {
-                let base_history = history_to_send.clone();
-                let mut current_history = history_to_send;
-                let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
-                let mut attempt = 0usize;
-                loop {
-                    attempt += 1;
-                    match self.llm.stream(&current_history, &options, &tools).await {
-                        Ok(s) => break s,
+                let mut established = None;
+                let mut last_err: Option<anyhow::Error> = None;
+                for (provider_idx, (provider, provider_label)) in provider_list.iter().enumerate() {
+                    let base_history = history_to_send.clone();
+                    let mut current_history = base_history.clone();
+                    let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
+                    let mut attempt = 0usize;
+                    let attempt_result = loop {
+                        attempt += 1;
+                        match provider.stream(&current_history, &options, &tools).await {
+                            Ok(s) => break Ok(s),
+                            Err(e) => {
+                                if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
+                                    && crate::core::context::is_context_overflow_error(&e)
+                                {
+                                    budget = (budget as f64 * 0.6) as usize;
+                                    warn!(
+                                        agent_id = %self.id,
+                                        attempt,
+                                        new_budget = budget,
+                                        "Context overflow establishing stream; recompacting harder and retrying"
+                                    );
+                                    current_history = self
+                                        .compact_history_for_send(&base_history, budget)
+                                        .await;
+                                    continue;
+                                }
+                                break Err(e);
+                            }
+                        }
+                    };
+                    match attempt_result {
+                        Ok(s) => {
+                            established = Some(s);
+                            break;
+                        }
                         Err(e) => {
-                            if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
-                                && crate::core::context::is_context_overflow_error(&e)
-                            {
-                                budget = (budget as f64 * 0.6) as usize;
+                            let is_cancel = e.to_string().contains("[Operation Cancelled]");
+                            let has_next = provider_idx + 1 < provider_count;
+                            if !is_cancel && has_next {
+                                let next_label = provider_list[provider_idx + 1].1.clone();
                                 warn!(
                                     agent_id = %self.id,
-                                    attempt,
-                                    new_budget = budget,
-                                    "Context overflow establishing stream; recompacting harder and retrying"
+                                    "provider {provider_label} failed: {e}; falling back to {next_label}"
                                 );
-                                current_history = self
-                                    .compact_history_for_send(&base_history, budget)
-                                    .await;
+                                let notice = format!(
+                                    "Provider {provider_label} failed; falling back to {next_label}"
+                                );
+                                if cli_mode {
+                                    let _ = write_cli_line(
+                                        &mut stdout,
+                                        format!(
+                                            "{} {}",
+                                            cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB),
+                                            notice.truecolor(
+                                                CLI_AMBER_RGB.0,
+                                                CLI_AMBER_RGB.1,
+                                                CLI_AMBER_RGB.2,
+                                            ),
+                                        ),
+                                    );
+                                } else if let Some(channel_info) = &channel_info {
+                                    queue_gateway_text(channel_info, &notice);
+                                }
+                                last_err = Some(e);
                                 continue;
                             }
+                            // Last provider (or cancellation): emit + propagate
+                            // exactly as before.
                             if let Some(channel_info) = &channel_info {
                                 queue_gateway_text(
                                     channel_info,
@@ -1955,6 +2127,14 @@ impl Agent {
                             }
                             return Err(e);
                         }
+                    }
+                }
+                match established {
+                    Some(s) => s,
+                    None => {
+                        return Err(last_err.unwrap_or_else(|| {
+                            anyhow::anyhow!("no providers configured")
+                        }));
                     }
                 }
             };
@@ -2683,43 +2863,95 @@ impl Agent {
                 apply_cli_palette(&mut stdout)?;
             }
 
-            // Context-overflow recovery: if the provider rejects the request
-            // because the prompt is too large, recompact the (already prepared)
-            // history at a progressively shrunken budget and retry, up to
-            // MAX_OVERFLOW_RETRIES attempts total, before surfacing the error.
+            // Provider fallback chain (PR-7) wrapping context-overflow recovery.
+            //
+            // OUTER loop: try each provider in `fallback_provider_list()` in
+            // order — primary first, then any configured fallbacks. With no
+            // fallbacks configured (the default) the list has exactly ONE entry
+            // (the primary), so this collapses to today's behavior byte-for-byte.
+            //
+            // INNER block (unchanged): context-overflow recovery — if the
+            // CURRENT provider rejects the request because the prompt is too
+            // large, recompact the (already prepared) history at a progressively
+            // shrunken budget and retry, up to MAX_OVERFLOW_RETRIES attempts.
+            //
+            // On a provider's failure that surfaces out of the inner block:
+            // overflow has already been handled by the recovery above, so we
+            // treat the error as "this provider is exhausted". If a NEXT
+            // provider exists we warn + fall back; on the LAST provider we
+            // propagate the error EXACTLY as before. User cancellation
+            // (`[Operation Cancelled]`) is never retried — it propagates
+            // immediately.
+            let provider_list = self.fallback_provider_list();
+            let provider_count = provider_list.len();
             let call_result = {
-                let base_history = history_to_send.clone();
-                let mut current_history = history_to_send;
-                let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
-                let mut attempt = 0usize;
-                loop {
-                    attempt += 1;
-                    match self
-                        .llm
-                        .complete_with_tools(&current_history, &options, &tools)
-                        .await
-                    {
-                        Ok(resp) => break Ok(resp),
+                let mut result: anyhow::Result<_> = Err(anyhow::anyhow!("no providers configured"));
+                for (provider_idx, (provider, provider_label)) in provider_list.iter().enumerate() {
+                    let base_history = history_to_send.clone();
+                    let mut current_history = base_history.clone();
+                    let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
+                    let mut attempt = 0usize;
+                    let attempt_result: anyhow::Result<_> = loop {
+                        attempt += 1;
+                        match provider
+                            .complete_with_tools(&current_history, &options, &tools)
+                            .await
+                        {
+                            Ok(resp) => break Ok(resp),
+                            Err(e) => {
+                                if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
+                                    && crate::core::context::is_context_overflow_error(&e)
+                                {
+                                    budget = (budget as f64 * 0.6) as usize;
+                                    warn!(
+                                        agent_id = %self.id,
+                                        attempt,
+                                        new_budget = budget,
+                                        "Context overflow on provider call; recompacting harder and retrying"
+                                    );
+                                    current_history = self
+                                        .compact_history_for_send(&base_history, budget)
+                                        .await;
+                                    continue;
+                                }
+                                break Err(e);
+                            }
+                        }
+                    };
+                    match attempt_result {
+                        Ok(resp) => {
+                            result = Ok(resp);
+                            break;
+                        }
                         Err(e) => {
-                            if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
-                                && crate::core::context::is_context_overflow_error(&e)
-                            {
-                                budget = (budget as f64 * 0.6) as usize;
+                            // Never fall back on user cancellation.
+                            let is_cancel = e.to_string().contains("[Operation Cancelled]");
+                            let has_next = provider_idx + 1 < provider_count;
+                            if !is_cancel && has_next {
+                                let next_label = &provider_list[provider_idx + 1].1;
                                 warn!(
                                     agent_id = %self.id,
-                                    attempt,
-                                    new_budget = budget,
-                                    "Context overflow on provider call; recompacting harder and retrying"
+                                    "provider {provider_label} failed: {e}; falling back to {next_label}"
                                 );
-                                current_history = self
-                                    .compact_history_for_send(&base_history, budget)
-                                    .await;
+                                let _ = write_cli_line(
+                                    &mut stdout,
+                                    format!(
+                                        "{} {}",
+                                        cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB),
+                                        format!("Provider {provider_label} failed; falling back to {next_label}")
+                                            .truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2),
+                                    ),
+                                );
+                                result = Err(e);
                                 continue;
                             }
-                            break Err(e);
+                            // Last provider (or cancellation): propagate as before.
+                            result = Err(e);
+                            break;
                         }
                     }
                 }
+                result
             };
 
             match call_result {
@@ -3850,6 +4082,27 @@ pub(crate) enum SlashAction {
 /// names. Mirrors the classic `/provider` handler in [`Agent::run`] but as a
 /// pure, testable helper (API keys are read from the environment, defaulting to
 /// empty as the classic path does).
+/// Parse a comma-separated list of provider names (e.g. from
+/// `LLM_FALLBACK_PROVIDERS` or the `/fallback` command) into a clean,
+/// ordered, de-duplicated list: split on commas, trim whitespace, lowercase,
+/// drop empties, and remove duplicates while preserving first-seen order.
+///
+/// Pure (no I/O, no env reads), so it is unit-testable. An empty or
+/// whitespace-only input yields an empty vec — the safe no-op default.
+fn parse_fallback_providers(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim().to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == &name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn provider_from_name(
     name: &str,
 ) -> Result<(Arc<dyn LLMProvider>, &'static str), &'static str> {
@@ -4061,6 +4314,12 @@ impl Agent {
             return SlashAction::Message(format!("Trace diagnostics are now {state}"));
         }
 
+        if input.starts_with("/fallback") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+            return SlashAction::Message(self.handle_fallback_command(arg));
+        }
+
         if input.starts_with("/usage") {
             return SlashAction::Message(usage_summary(
                 &self.state.history,
@@ -4071,14 +4330,82 @@ impl Agent {
 
         SlashAction::NotHandled
     }
+
+    /// Shared `/fallback` command logic for both the classic CLI (`run`) and
+    /// fullscreen (`run_slash`) paths. Returns a plain-text status message.
+    ///
+    /// - empty arg => show the current chain (primary + configured fallbacks).
+    /// - `off` | `none` | `clear` => empty the fallback list.
+    /// - `<a,b,c>` => parse via [`parse_fallback_providers`] and store. Names
+    ///   are validated against [`provider_from_name`]; UNKNOWN names are dropped
+    ///   with a warning in the returned message, but all KNOWN names are stored
+    ///   (so one typo can't wipe the whole request).
+    pub(crate) fn handle_fallback_command(&mut self, arg: &str) -> String {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            if self.fallback_providers.is_empty() {
+                return format!(
+                    "Provider fallback: OFF (only primary '{}'). Usage: /fallback <a,b,c> | /fallback off",
+                    self.llm.provider_name()
+                );
+            }
+            return format!(
+                "Provider fallback chain: {} -> {}",
+                self.llm.provider_name(),
+                self.fallback_providers.join(" -> ")
+            );
+        }
+
+        let lowered = trimmed.to_lowercase();
+        if lowered == "off" || lowered == "none" || lowered == "clear" {
+            self.fallback_providers.clear();
+            return "Provider fallback disabled (primary only).".to_string();
+        }
+
+        let parsed = parse_fallback_providers(trimmed);
+        let mut known: Vec<String> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
+        for name in parsed {
+            if provider_from_name(&name).is_ok() {
+                known.push(name);
+            } else {
+                unknown.push(name);
+            }
+        }
+        if known.is_empty() {
+            // Don't touch the existing chain on an all-unknown arg.
+            return format!(
+                "No valid providers in '{}'; fallback unchanged (now: {}). Valid: openai, anthropic, gemini, groq, grok, ollama.",
+                trimmed,
+                if self.fallback_providers.is_empty() {
+                    "OFF".to_string()
+                } else {
+                    self.fallback_providers.join(", ")
+                }
+            );
+        }
+
+        self.fallback_providers = known.clone();
+
+        let mut msg = format!(
+            "Provider fallback chain set: {} -> {}",
+            self.llm.provider_name(),
+            known.join(" -> ")
+        );
+        if !unknown.is_empty() {
+            msg.push_str(&format!(" (ignored unknown: {})", unknown.join(", ")));
+        }
+        msg
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_skin, now_secs, order_results, prepare_turn_request, provider_from_model,
-        provider_from_name, session_capability_notice, streaming_preview, think_directive,
-        truncate_for_display, usage_summary, wrap_text, ThinkLevel, TurnMode, MAX_PARALLEL_TOOLS,
+        assistant_skin, now_secs, order_results, parse_fallback_providers, prepare_turn_request,
+        provider_from_model, provider_from_name, session_capability_notice, streaming_preview,
+        think_directive, truncate_for_display, usage_summary, wrap_text, Agent, ThinkLevel,
+        TurnMode, MAX_PARALLEL_TOOLS,
     };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
@@ -4122,6 +4449,101 @@ mod tests {
     #[test]
     fn max_parallel_tools_is_positive() {
         assert!(MAX_PARALLEL_TOOLS > 0);
+    }
+
+    // --- Provider fallback chains (PR-7) -----------------------------------
+
+    #[test]
+    fn parse_fallback_providers_trims_lowercases_dedupes() {
+        assert_eq!(
+            parse_fallback_providers(" Anthropic , OpenAI , anthropic "),
+            vec!["anthropic".to_string(), "openai".to_string()],
+            "should trim, lowercase, and drop the duplicate (first-seen order kept)"
+        );
+    }
+
+    #[test]
+    fn parse_fallback_providers_empty_and_garbage() {
+        assert!(parse_fallback_providers("").is_empty());
+        assert!(parse_fallback_providers("   ").is_empty());
+        assert!(parse_fallback_providers(",, ,").is_empty());
+        // Garbage names are still returned (validation happens elsewhere);
+        // only empties are dropped.
+        assert_eq!(
+            parse_fallback_providers("foo, , bar"),
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+    }
+
+    fn test_agent(primary: &str) -> Agent {
+        let (llm, _) = provider_from_name(primary).expect("known primary");
+        Agent::new(
+            "test-agent".to_string(),
+            crate::config::AgentConfig::default(),
+            llm,
+        )
+    }
+
+    #[test]
+    fn fallback_provider_list_empty_config_is_primary_only() {
+        let mut agent = test_agent("anthropic");
+        // Force a no-op config regardless of the test environment.
+        agent.fallback_providers = Vec::new();
+        let list = agent.fallback_provider_list();
+        assert_eq!(list.len(), 1, "empty config => exactly the primary");
+        assert_eq!(list[0].1.to_lowercase(), "anthropic");
+    }
+
+    #[test]
+    fn fallback_provider_list_appends_valid_in_order() {
+        let mut agent = test_agent("anthropic");
+        agent.fallback_providers =
+            vec!["openai".to_string(), "gemini".to_string()];
+        let list = agent.fallback_provider_list();
+        assert_eq!(list.len(), 3, "primary + 2 valid fallbacks");
+        let labels: Vec<String> = list.iter().map(|(_, l)| l.to_lowercase()).collect();
+        assert_eq!(labels, vec!["anthropic", "openai", "gemini"]);
+    }
+
+    #[test]
+    fn fallback_provider_list_skips_unknown_names() {
+        let mut agent = test_agent("anthropic");
+        agent.fallback_providers = vec![
+            "openai".to_string(),
+            "not-a-provider".to_string(),
+            "gemini".to_string(),
+        ];
+        let list = agent.fallback_provider_list();
+        // Unknown name dropped; primary + 2 valid remain, in order.
+        assert_eq!(list.len(), 3);
+        let labels: Vec<String> = list.iter().map(|(_, l)| l.to_lowercase()).collect();
+        assert_eq!(labels, vec!["anthropic", "openai", "gemini"]);
+    }
+
+    #[test]
+    fn handle_fallback_command_set_show_and_clear() {
+        let mut agent = test_agent("anthropic");
+        agent.fallback_providers = Vec::new();
+
+        // Set a valid chain (with an unknown one ignored).
+        let msg = agent.handle_fallback_command("openai, bogus, gemini");
+        assert_eq!(agent.fallback_providers, vec!["openai".to_string(), "gemini".to_string()]);
+        assert!(msg.contains("openai -> gemini"), "msg: {msg}");
+        assert!(msg.contains("bogus"), "should mention the ignored unknown: {msg}");
+
+        // No-arg shows the chain.
+        let shown = agent.handle_fallback_command("");
+        assert!(shown.contains("openai -> gemini"), "shown: {shown}");
+
+        // All-unknown arg leaves the chain unchanged.
+        let unchanged = agent.handle_fallback_command("nope, nada");
+        assert_eq!(agent.fallback_providers, vec!["openai".to_string(), "gemini".to_string()]);
+        assert!(unchanged.contains("unchanged"), "unchanged: {unchanged}");
+
+        // Clear.
+        let cleared = agent.handle_fallback_command("off");
+        assert!(agent.fallback_providers.is_empty());
+        assert!(cleared.to_lowercase().contains("disabled"), "cleared: {cleared}");
     }
 
     #[test]
