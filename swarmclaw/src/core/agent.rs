@@ -1,6 +1,6 @@
 use crate::config::AgentConfig;
 use crate::core::session_store::{
-    derive_store_path, load_session_state, persist_message, persist_seed_state,
+    derive_store_path, load_session_state, persist_message, persist_seed_state, search_messages,
 };
 use crate::core::state::{Message, Role, State};
 use crate::llm::{ChatChunk, CompletionOptions, LLMProvider, ProviderCapabilities};
@@ -216,6 +216,14 @@ pub struct Agent {
     /// [`Agent::new`] or set live via `/fallback`. See
     /// [`Agent::fallback_provider_list`].
     pub fallback_providers: Vec<String>,
+    /// Cross-session retrieval (PR-8), strictly OPT-IN and DEFAULT-OFF. When
+    /// true, before each provider call the latest user message is used to search
+    /// the SQLite FTS5 index of PAST sessions, and any relevant hits are
+    /// injected as a single `System` message into the SENT history copy only
+    /// (stored history is never mutated). Default `false` => no search, no
+    /// injection, behavior byte-for-byte unchanged. Populated from
+    /// `SWARMCLAW_SESSION_MEMORY` (`1`/`true`) in [`Agent::new`].
+    pub session_memory: bool,
 }
 
 impl Agent {
@@ -257,6 +265,15 @@ impl Agent {
             fallback_providers: std::env::var("LLM_FALLBACK_PROVIDERS")
                 .map(|raw| parse_fallback_providers(&raw))
                 .unwrap_or_default(),
+            // Cross-session retrieval (PR-8), strictly opt-in. DEFAULT-OFF:
+            // unless `SWARMCLAW_SESSION_MEMORY` is `1`/`true`, nothing is
+            // searched or injected and behavior is byte-for-byte unchanged.
+            session_memory: std::env::var("SWARMCLAW_SESSION_MEMORY")
+                .map(|raw| {
+                    let v = raw.trim().to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "on" || v == "yes"
+                })
+                .unwrap_or(false),
         }
     }
 
@@ -549,6 +566,72 @@ impl Agent {
                 tool_call_id: None,
             });
         }
+    }
+
+    /// Cross-session retrieval injection (PR-8). When `session_memory` is
+    /// enabled, take the latest `User` message in the SENT history, search the
+    /// FTS5 index of PAST sessions (excluding the current one), and, if there
+    /// are hits, append a single capped `System` message summarizing them to the
+    /// SENT history copy. The stored `self.state.history` is NEVER mutated.
+    ///
+    /// SAFETY / NO-OP DEFAULT: with `session_memory == false` (the default) this
+    /// returns immediately, so behavior is byte-for-byte unchanged. It is also
+    /// fully best-effort: no configured store path, an empty query, a search
+    /// error, or zero hits all result in injecting nothing.
+    fn inject_session_memory(&self, history: &mut Vec<Message>) {
+        if !self.session_memory {
+            return;
+        }
+        let Some(store_path) = &self.state_store_path else {
+            return;
+        };
+        // The most recent user message drives retrieval.
+        let Some(user_text) = history
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.clone())
+        else {
+            return;
+        };
+
+        let hits = match search_messages(store_path, &user_text, 3, Some(&self.id)) {
+            Ok(hits) => hits,
+            Err(error) => {
+                warn!(
+                    agent_id = %self.id,
+                    "Cross-session retrieval search failed (skipping): {error}"
+                );
+                return;
+            }
+        };
+        if hits.is_empty() {
+            return;
+        }
+
+        let mut block = String::from("[Relevant context from earlier sessions]");
+        for hit in &hits {
+            // Flatten each hit to a single line to keep the block compact.
+            let line: String = hit.message.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if line.is_empty() {
+                continue;
+            }
+            block.push_str("\n- ");
+            block.push_str(&line);
+        }
+        // Cap the injected text so retrieval can never blow the context budget.
+        let capped = crate::core::context::cap_tool_result(
+            &block,
+            crate::core::context::MAX_TOOL_RESULT_TOKENS,
+        );
+
+        history.push(Message {
+            role: Role::System,
+            content: capped,
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
 
     fn persist_state_best_effort(&self) {
@@ -873,6 +956,7 @@ impl Agent {
                     write_cli_line(&mut stdout, format!("  {} - {}", "/think <off|low|medium|high>".truecolor(200, 150, 255), "Set reasoning verbosity (system-prompt directive)"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/trace [on|off]".truecolor(200, 150, 255), "Toggle per-turn diagnostic lines"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/fallback [a,b,c|off]".truecolor(200, 150, 255), "Set backup providers tried if the primary fails"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/recall <query>".truecolor(200, 150, 255), "Search past sessions for relevant messages"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/usage".truecolor(200, 150, 255), "Show session usage summary"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "exit, quit".truecolor(200, 150, 255), "Exit SwarmClaw"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "ctrl+c".truecolor(200, 150, 255), "Cancel the current tool execution or LLM response"))?;
@@ -989,6 +1073,14 @@ impl Agent {
                     let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
                     let msg = self.handle_fallback_command(arg);
                     write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), msg.truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/recall") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+                    let msg = self.handle_recall_command(arg);
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("RECALL", CLI_DEEP_RGB, CLI_CYAN_RGB), msg.truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
                     continue;
                 }
 
@@ -1328,6 +1420,11 @@ impl Agent {
             // SENT copy only (stored history untouched). Off = no-op.
             let mut history_to_send = history_to_send;
             self.inject_think_directive(&mut history_to_send);
+
+            // Cross-session retrieval (PR-8): inject relevant past-session
+            // context into the SENT copy only. Default-OFF (`session_memory`),
+            // so this is a no-op unless explicitly enabled.
+            self.inject_session_memory(&mut history_to_send);
 
             // `/trace` diagnostics: model/provider at turn start.
             if self.trace {
@@ -2007,6 +2104,11 @@ impl Agent {
             // SENT copy only (stored history untouched). Off = no-op.
             let mut history_to_send = history_to_send;
             self.inject_think_directive(&mut history_to_send);
+
+            // Cross-session retrieval (PR-8): inject relevant past-session
+            // context into the SENT copy only. Default-OFF (`session_memory`),
+            // so this is a no-op unless explicitly enabled.
+            self.inject_session_memory(&mut history_to_send);
 
             // `/trace` diagnostics: model/provider at turn start.
             if self.trace {
@@ -2844,6 +2946,11 @@ impl Agent {
             // SENT copy only (stored history untouched). Off = no-op.
             let mut history_to_send = history_to_send;
             self.inject_think_directive(&mut history_to_send);
+
+            // Cross-session retrieval (PR-8): inject relevant past-session
+            // context into the SENT copy only. Default-OFF (`session_memory`),
+            // so this is a no-op unless explicitly enabled.
+            self.inject_session_memory(&mut history_to_send);
 
             // `/trace` diagnostics: model/provider at turn start.
             if self.trace {
@@ -4320,6 +4427,12 @@ impl Agent {
             return SlashAction::Message(self.handle_fallback_command(arg));
         }
 
+        if input.starts_with("/recall") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let arg = if parts.len() == 2 { parts[1].trim() } else { "" };
+            return SlashAction::Message(self.handle_recall_command(arg));
+        }
+
         if input.starts_with("/usage") {
             return SlashAction::Message(usage_summary(
                 &self.state.history,
@@ -4329,6 +4442,47 @@ impl Agent {
         }
 
         SlashAction::NotHandled
+    }
+
+    /// Shared `/recall <query>` command logic for both the classic CLI (`run`)
+    /// and fullscreen (`run_slash`) paths. Manually searches PAST sessions
+    /// (excluding the current one) via the FTS5 index and returns a plain-text
+    /// list of the top matches. Independent of the auto-injection
+    /// (`session_memory`) flag, so it works as a search tool regardless.
+    fn handle_recall_command(&self, query: &str) -> String {
+        let query = query.trim();
+        if query.is_empty() {
+            return "Usage: /recall <query>".to_string();
+        }
+        let Some(store_path) = &self.state_store_path else {
+            return "Cross-session recall is unavailable (no session store configured).".to_string();
+        };
+        match search_messages(store_path, query, 5, Some(&self.id)) {
+            Ok(hits) if hits.is_empty() => {
+                format!("No past-session messages matched '{query}'.")
+            }
+            Ok(hits) => {
+                let mut out = format!("Top matches for '{query}':");
+                for hit in &hits {
+                    let role = match hit.message.role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    };
+                    let line: String = hit
+                        .message
+                        .content
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let preview: String = line.chars().take(200).collect();
+                    out.push_str(&format!("\n- [{role}] {preview}"));
+                }
+                out
+            }
+            Err(error) => format!("Recall search failed: {error}"),
+        }
     }
 
     /// Shared `/fallback` command logic for both the classic CLI (`run`) and
