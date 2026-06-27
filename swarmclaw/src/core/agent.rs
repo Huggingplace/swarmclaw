@@ -174,7 +174,11 @@ impl Agent {
             memory_org_id: None,
             memory_api_key: None,
             use_orchestrator: true,
-            use_multithread: true,
+            // Parallel tool execution is opt-in via `/multithread on`. It was a
+            // dead flag historically, so the safe default keeps today's real
+            // behavior (sequential) until parallelism is validated on a real
+            // terminal. See `MAX_PARALLEL_TOOLS` and `order_results`.
+            use_multithread: false,
         }
     }
 
@@ -1109,53 +1113,136 @@ impl Agent {
                 break;
             }
 
-            // Execute each tool call, record the result, then loop to feed back.
-            for tc in tool_calls {
-                state.status = Some(format!("Executing tool {}…", tc.name));
+            // Execute the tool calls, record the results in original order, then
+            // loop to feed them back. When parallelism is enabled and there is
+            // more than one call this turn, run them concurrently (capped at
+            // `MAX_PARALLEL_TOOLS`); otherwise keep the sequential path. In both
+            // cases results are recorded in the original tool-call order.
+            if self.use_multithread && tool_calls.len() > 1 {
+                // --- Parallel path -------------------------------------------
+                state.status = Some(format!("Executing {} tools…", tool_calls.len()));
                 terminal.draw(|frame| crate::tui::draw(frame, state))?;
 
-                let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
-                let result = match tool {
-                    Some(t) => {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or_default();
-                        let mut tool_fut = Box::pin(WorkerPool::execute_tool(t, args));
-                        loop {
-                            tokio::select! {
-                                res = &mut tool_fut => {
-                                    break match res {
-                                        Ok(res) => res,
-                                        Err(e) => format!("Error: {}", e),
-                                    };
+                // Resolve every call up front. Unresolved tools yield the same
+                // "not found" string the sequential path produces, recorded in
+                // place (so ordering and counts stay identical).
+                let mut futs = Vec::new();
+                let mut pre_results: Vec<(usize, String)> = Vec::new();
+                for (idx, tc) in tool_calls.iter().enumerate() {
+                    let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
+                    match tool {
+                        Some(t) => {
+                            let args: serde_json::Value =
+                                serde_json::from_str(&tc.arguments).unwrap_or_default();
+                            futs.push(async move {
+                                let res = match WorkerPool::execute_tool(t, args).await {
+                                    Ok(res) => res,
+                                    Err(e) => format!("Error: {}", e),
+                                };
+                                (idx, res)
+                            });
+                        }
+                        None => pre_results.push((idx, format!("Tool '{}' not found", tc.name))),
+                    }
+                }
+
+                // Cap concurrency at MAX_PARALLEL_TOOLS via buffer_unordered.
+                // Wrap the whole batch in a cancel select so Esc/Ctrl+C aborts
+                // (drops) it.
+                let mut completed: Vec<(usize, String)> = pre_results;
+                let batch = async {
+                    use futures::StreamExt as _;
+                    let mut buffered =
+                        futures::stream::iter(futs).buffer_unordered(MAX_PARALLEL_TOOLS);
+                    while let Some(pair) = buffered.next().await {
+                        completed.push(pair);
+                    }
+                    completed
+                };
+                let mut batch_fut = Box::pin(batch);
+                let completed = loop {
+                    tokio::select! {
+                        done = &mut batch_fut => break done,
+                        ev = events.next() => {
+                            if let Some(Ok(crossterm::event::Event::Key(key))) = ev {
+                                if key.kind == crossterm::event::KeyEventKind::Press {
+                                    let is_cancel = key.code == crossterm::event::KeyCode::Esc
+                                        || (key.code == crossterm::event::KeyCode::Char('c')
+                                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL));
+                                    if is_cancel {
+                                        anyhow::bail!("[Operation Cancelled] User cancelled tool execution.");
+                                    }
                                 }
-                                ev = events.next() => {
-                                    if let Some(Ok(crossterm::event::Event::Key(key))) = ev {
-                                        if key.kind == crossterm::event::KeyEventKind::Press {
-                                            let is_cancel = key.code == crossterm::event::KeyCode::Esc
-                                                || (key.code == crossterm::event::KeyCode::Char('c')
-                                                    && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL));
-                                            if is_cancel {
-                                                anyhow::bail!("[Operation Cancelled] User cancelled tool execution.");
+                            }
+                        }
+                    }
+                };
+
+                // Reorder to original tool-call order, then record each result
+                // exactly as the sequential path does (the loop-guard signatures
+                // were already accumulated above for every call).
+                let ordered = order_results(completed);
+                for (tc, result) in tool_calls.iter().zip(ordered.into_iter()) {
+                    let redacted_result = Redactor::redact(&result);
+                    self.record_message(Message {
+                        role: Role::Tool,
+                        content: redacted_result,
+                        timestamp: now_secs(),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                    });
+                }
+                state.sync_transcript(&self.state.history);
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+            } else {
+                // --- Sequential path (unchanged behavior) --------------------
+                for tc in tool_calls {
+                    state.status = Some(format!("Executing tool {}…", tc.name));
+                    terminal.draw(|frame| crate::tui::draw(frame, state))?;
+
+                    let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
+                    let result = match tool {
+                        Some(t) => {
+                            let args: serde_json::Value =
+                                serde_json::from_str(&tc.arguments).unwrap_or_default();
+                            let mut tool_fut = Box::pin(WorkerPool::execute_tool(t, args));
+                            loop {
+                                tokio::select! {
+                                    res = &mut tool_fut => {
+                                        break match res {
+                                            Ok(res) => res,
+                                            Err(e) => format!("Error: {}", e),
+                                        };
+                                    }
+                                    ev = events.next() => {
+                                        if let Some(Ok(crossterm::event::Event::Key(key))) = ev {
+                                            if key.kind == crossterm::event::KeyEventKind::Press {
+                                                let is_cancel = key.code == crossterm::event::KeyCode::Esc
+                                                    || (key.code == crossterm::event::KeyCode::Char('c')
+                                                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL));
+                                                if is_cancel {
+                                                    anyhow::bail!("[Operation Cancelled] User cancelled tool execution.");
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                    None => format!("Tool '{}' not found", tc.name),
-                };
+                        None => format!("Tool '{}' not found", tc.name),
+                    };
 
-                let redacted_result = Redactor::redact(&result);
-                self.record_message(Message {
-                    role: Role::Tool,
-                    content: redacted_result,
-                    timestamp: now_secs(),
-                    tool_calls: None,
-                    tool_call_id: Some(tc.id.clone()),
-                });
-                state.sync_transcript(&self.state.history);
-                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+                    let redacted_result = Redactor::redact(&result);
+                    self.record_message(Message {
+                        role: Role::Tool,
+                        content: redacted_result,
+                        timestamp: now_secs(),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                    });
+                    state.sync_transcript(&self.state.history);
+                    terminal.draw(|frame| crate::tui::draw(frame, state))?;
+                }
             }
             // Continue outer loop to let the LLM process tool results.
         }
@@ -1700,6 +1787,132 @@ impl Agent {
             }
 
             if !tool_calls.is_empty() {
+                if self.use_multithread && tool_calls.len() > 1 {
+                    // --- Parallel path -----------------------------------------
+                    // Run the independent tool calls concurrently (capped at
+                    // MAX_PARALLEL_TOOLS). The loop-guard signatures for every
+                    // call were already accumulated above; here we only execute,
+                    // then render + record results in the original order. We
+                    // render the TOOL chips up front and the RESULT chips after
+                    // the batch (per-tool spinners can't interleave cleanly).
+                    if cli_mode {
+                        for tc in &tool_calls {
+                            write_cli_line(
+                                &mut stdout,
+                                format!(
+                                    "{} {} {}",
+                                    cli_chip("TOOL", CLI_FG_RGB, CLI_BORDER_RGB),
+                                    tc.name
+                                        .truecolor(CLI_FG_RGB.0, CLI_FG_RGB.1, CLI_FG_RGB.2)
+                                        .bold(),
+                                    tc.arguments.truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    ),
+                                ),
+                            )?;
+                        }
+                    }
+
+                    // Resolve every call. Unresolved tools yield the same
+                    // "not found" string the sequential path uses.
+                    let mut futs = Vec::new();
+                    let mut pre_results: Vec<(usize, String)> = Vec::new();
+                    for (idx, tc) in tool_calls.iter().enumerate() {
+                        let tool = tools.iter().find(|t| t.name() == tc.name).cloned();
+                        match tool {
+                            Some(t) => {
+                                debug!(tool_name = %tc.name, "Executing tool (parallel)");
+                                let args: serde_json::Value =
+                                    serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                futs.push(async move {
+                                    let res = match WorkerPool::execute_tool(t, args).await {
+                                        Ok(res) => res,
+                                        Err(e) => format!("Error: {}", e),
+                                    };
+                                    (idx, res)
+                                });
+                            }
+                            None => {
+                                pre_results.push((idx, format!("Tool '{}' not found", tc.name)))
+                            }
+                        }
+                    }
+
+                    let mut completed: Vec<(usize, String)> = pre_results;
+                    let batch = async {
+                        use futures::StreamExt as _;
+                        let mut buffered =
+                            futures::stream::iter(futs).buffer_unordered(MAX_PARALLEL_TOOLS);
+                        while let Some(pair) = buffered.next().await {
+                            completed.push(pair);
+                        }
+                        completed
+                    };
+                    let mut batch_fut = Box::pin(batch);
+                    // Wrap the batch in a cancel select. Ctrl+C aborts (drops)
+                    // the batch; other keystrokes accumulate into queued_input
+                    // exactly as the sequential path handles them.
+                    let completed = loop {
+                        tokio::select! {
+                            done = &mut batch_fut => break done,
+                            event_opt = event_stream.next() => {
+                                if let Some(Ok(crossterm::event::Event::Key(key))) = event_opt {
+                                    if key.kind == crossterm::event::KeyEventKind::Press {
+                                        if key.code == crossterm::event::KeyCode::Char('c')
+                                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                                        {
+                                            anyhow::bail!("[Operation Cancelled] User cancelled tool execution.");
+                                        }
+                                        match key.code {
+                                            crossterm::event::KeyCode::Char(c) => queued_input.push(c),
+                                            crossterm::event::KeyCode::Backspace => { queued_input.pop(); },
+                                            crossterm::event::KeyCode::Enter => { queued_input.push('\n'); },
+                                            crossterm::event::KeyCode::Esc => { queued_input.clear(); },
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    // Reorder to original tool-call order, then render + record
+                    // each result exactly as the sequential path does.
+                    let ordered = order_results(completed);
+                    for (tc, result) in tool_calls.iter().zip(ordered.into_iter()) {
+                        debug!(
+                            tool_name = %tc.name,
+                            result_bytes = result.len(),
+                            "Tool execution finished"
+                        );
+                        let redacted_result = Redactor::redact(&result);
+                        if cli_mode {
+                            write_cli_line(
+                                &mut stdout,
+                                format!(
+                                    "{} {}",
+                                    cli_chip("RESULT", CLI_FG_RGB, CLI_RESULT_RGB),
+                                    redacted_result.truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    ),
+                                ),
+                            )?;
+                        }
+                        self.record_message(Message {
+                            role: Role::Tool,
+                            content: redacted_result,
+                            timestamp: now_secs(),
+                            tool_calls: None,
+                            tool_call_id: Some(tc.id.clone()),
+                        });
+                    }
+                    // Continue loop to let LLM process tool results
+                    continue;
+                }
                 for tc in tool_calls {
                     if cli_mode {
                         write_cli_line(
@@ -2235,6 +2448,25 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Maximum number of tool executions that may run concurrently within a single
+/// turn when parallel mode (`Agent::use_multithread`) is enabled. Caps fan-out
+/// so a turn with many independent tool calls can't spawn an unbounded number
+/// of in-flight tool tasks at once.
+pub const MAX_PARALLEL_TOOLS: usize = 8;
+
+/// Reorder out-of-order `(index, result)` pairs into a `Vec<String>` ordered by
+/// the original tool-call index.
+///
+/// Parallel execution completes tool calls in arbitrary order, but the recorded
+/// `Role::Tool` messages (and the loop-guard signatures, rendering, etc.) must
+/// follow the original tool-call order. This pure helper centralizes that
+/// reordering so both turn loops stay consistent and it can be unit-tested
+/// without a provider or real tools.
+fn order_results(mut completed: Vec<(usize, String)>) -> Vec<String> {
+    completed.sort_by_key(|(idx, _)| *idx);
+    completed.into_iter().map(|(_, result)| result).collect()
 }
 
 fn seeded_state(config: &AgentConfig) -> State {
@@ -3248,8 +3480,9 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_skin, now_secs, prepare_turn_request, provider_from_model, provider_from_name,
-        session_capability_notice, streaming_preview, truncate_for_display, wrap_text, TurnMode,
+        assistant_skin, now_secs, order_results, prepare_turn_request, provider_from_model,
+        provider_from_name, session_capability_notice, streaming_preview, truncate_for_display,
+        wrap_text, TurnMode, MAX_PARALLEL_TOOLS,
     };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
@@ -3257,6 +3490,43 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::Arc;
+
+    #[test]
+    fn order_results_sorts_out_of_order_by_index() {
+        let completed = vec![
+            (2, "c".to_string()),
+            (0, "a".to_string()),
+            (1, "b".to_string()),
+        ];
+        assert_eq!(order_results(completed), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn order_results_already_ordered_is_unchanged() {
+        let completed = vec![
+            (0, "a".to_string()),
+            (1, "b".to_string()),
+            (2, "c".to_string()),
+        ];
+        assert_eq!(order_results(completed), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn order_results_empty() {
+        let completed: Vec<(usize, String)> = Vec::new();
+        assert!(order_results(completed).is_empty());
+    }
+
+    #[test]
+    fn order_results_single() {
+        let completed = vec![(0, "only".to_string())];
+        assert_eq!(order_results(completed), vec!["only"]);
+    }
+
+    #[test]
+    fn max_parallel_tools_is_positive() {
+        assert!(MAX_PARALLEL_TOOLS > 0);
+    }
 
     #[test]
     fn wrap_text_breaks_on_word_boundaries_within_width() {
