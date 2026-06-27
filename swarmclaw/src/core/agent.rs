@@ -2951,8 +2951,28 @@ impl Agent {
         // Count tool executions across this whole turn for the opt-in
         // self-improve feature (see `maybe_author_skill`). Unused when off.
         let mut tool_calls_this_turn: usize = 0;
+        // Loop guards (mirror stream_think): bound total reasoning steps and
+        // detect a model stuck repeating the same tool call. `think()` is the
+        // turn loop used by delegated sub-agents, so an unbounded loop here is
+        // a real risk.
+        let mut step: usize = 0;
+        let mut tool_call_sigs: Vec<String> = Vec::new();
 
         loop {
+            step += 1;
+            if step > crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS {
+                self.record_message(Message {
+                    role: Role::System,
+                    content: format!(
+                        "[Reached the maximum of {} reasoning steps; stopping. Ask me to continue if needed.]",
+                        crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS
+                    ),
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                break;
+            }
             print!("Thinking...");
             stdout.flush()?;
 
@@ -3234,6 +3254,33 @@ impl Agent {
 
                     if let Some(tool_calls) = response.tool_calls {
                         if tool_calls.is_empty() {
+                            break;
+                        }
+
+                        // Loop guard: stop if the model is repeating an identical
+                        // tool call (mirrors stream_think).
+                        let mut repeated: Option<String> = None;
+                        for tc in &tool_calls {
+                            let sig = crate::core::loop_guard::tool_call_signature(
+                                &tc.name,
+                                &tc.arguments,
+                            );
+                            if crate::core::loop_guard::is_repeated_call(&tool_call_sigs, &sig) {
+                                repeated = Some(tc.name.clone());
+                            }
+                            tool_call_sigs.push(sig);
+                        }
+                        if let Some(name) = repeated {
+                            self.record_message(Message {
+                                role: Role::System,
+                                content: format!(
+                                    "[Detected a repeated tool call to '{}'; stopping to avoid an infinite loop.]",
+                                    name
+                                ),
+                                timestamp: now_secs(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
                             break;
                         }
 
@@ -4914,15 +4961,23 @@ mod tests {
     use super::{
         assistant_skin, now_secs, order_results, parse_fallback_providers, prepare_turn_request,
         provider_from_model, provider_from_name, session_capability_notice, streaming_preview,
-        think_directive, truncate_for_display, usage_summary, wrap_text, Agent, ThinkLevel,
-        TurnMode, MAX_PARALLEL_TOOLS,
+        think_directive, truncate_for_display, usage_summary, wrap_text, Agent, SlashAction,
+        ThinkLevel, TurnMode, MAX_PARALLEL_TOOLS,
     };
+    use crate::config::AgentConfig;
     use crate::core::state::{Message, Role};
-    use crate::llm::ProviderCapabilities;
+    use crate::llm::{
+        ChatChunk, CompletionOptions, CompletionResponse, LLMProvider, ProviderCapabilities,
+        ToolCall,
+    };
+    use crate::skills::Skill;
     use crate::tools::Tool;
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::sync::Arc;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn order_results_sorts_out_of_order_by_index() {
@@ -5346,5 +5401,481 @@ mod tests {
 
         assert!(notice.is_some());
         assert!(notice.unwrap().contains("text-only mode"));
+    }
+
+    // =======================================================================
+    // Mock LLM provider + Agent builders for command-layer and turn-loop tests
+    // =======================================================================
+
+    /// A single scripted reply the [`MockLLMProvider`] will hand back from one
+    /// `complete_with_tools` call.
+    #[derive(Clone)]
+    enum MockReply {
+        /// Final assistant turn: text content, no tool calls (ends the loop).
+        Final(String),
+        /// One tool call (no text). Drives the turn loop's tool-execution path.
+        ToolCall { id: String, name: String, arguments: String },
+    }
+
+    /// A deterministic, network-free [`LLMProvider`] for driving the turn loop.
+    ///
+    /// Successive `complete_with_tools` calls pop from a scripted queue. Once the
+    /// script is exhausted it returns a fixed FINAL text reply, so a loop can
+    /// never hang waiting for more replies. A `repeat_tool_call` mode instead
+    /// returns the SAME tool call every call (bounded by the caller scripting a
+    /// finite number of iterations) to exercise the tool path repeatedly.
+    struct MockLLMProvider {
+        name: String,
+        capabilities: ProviderCapabilities,
+        /// Scripted replies, popped front-to-back on each call.
+        script: Mutex<std::collections::VecDeque<MockReply>>,
+        /// When set, every call returns this tool call (ignoring the script).
+        repeat_tool_call: Option<MockReply>,
+        /// Number of `complete_with_tools` invocations so far.
+        calls: AtomicUsize,
+        /// When in `repeat_tool_call` mode, stop repeating after this many calls
+        /// and return a final text reply instead (keeps tests bounded/fast).
+        repeat_limit: usize,
+    }
+
+    impl MockLLMProvider {
+        /// Returns a single FINAL assistant text reply (no tool calls).
+        fn final_text(text: &str) -> Self {
+            let mut script = std::collections::VecDeque::new();
+            script.push_back(MockReply::Final(text.to_string()));
+            Self {
+                name: "mock".to_string(),
+                capabilities: ProviderCapabilities::openai_compatible(),
+                script: Mutex::new(script),
+                repeat_tool_call: None,
+                calls: AtomicUsize::new(0),
+                repeat_limit: 0,
+            }
+        }
+
+        /// Returns the SAME tool call for the first `repeat_limit` calls, then a
+        /// final text reply. Used to exercise the tool-execution path and prove
+        /// the loop terminates without hanging.
+        fn repeating_tool(name: &str, arguments: &str, repeat_limit: usize) -> Self {
+            Self {
+                name: "mock".to_string(),
+                capabilities: ProviderCapabilities::openai_compatible(),
+                script: Mutex::new(std::collections::VecDeque::new()),
+                repeat_tool_call: Some(MockReply::ToolCall {
+                    id: "mock-call-1".to_string(),
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                }),
+                calls: AtomicUsize::new(0),
+                repeat_limit,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn reply_to_response(reply: MockReply) -> CompletionResponse {
+            match reply {
+                MockReply::Final(text) => CompletionResponse {
+                    content: Some(text),
+                    tool_calls: None,
+                    finish_reason: Some("stop".to_string()),
+                },
+                MockReply::ToolCall { id, name, arguments } => CompletionResponse {
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        thought_signature: None,
+                    }]),
+                    finish_reason: Some("tool_calls".to_string()),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for MockLLMProvider {
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _messages: &[Message],
+            _options: &CompletionOptions,
+            _tools: &[Arc<dyn Tool>],
+        ) -> anyhow::Result<CompletionResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            if let Some(reply) = &self.repeat_tool_call {
+                if n < self.repeat_limit {
+                    return Ok(Self::reply_to_response(reply.clone()));
+                }
+                // Bound reached: end the turn with a final text reply.
+                return Ok(Self::reply_to_response(MockReply::Final(
+                    "done".to_string(),
+                )));
+            }
+
+            let reply = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| MockReply::Final("done".to_string()));
+            Ok(Self::reply_to_response(reply))
+        }
+
+        async fn stream(
+            &self,
+            messages: &[Message],
+            options: &CompletionOptions,
+            tools: &[Arc<dyn Tool>],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<ChatChunk>> + Send>>>
+        {
+            // Minimal real impl built on top of complete_with_tools so the mock
+            // never panics if streaming is exercised: emit the content (if any)
+            // then Done. Tests here drive `think()` (non-streaming), so this is
+            // a safety net rather than a hot path.
+            let resp = self.complete_with_tools(messages, options, tools).await?;
+            let mut chunks: Vec<anyhow::Result<ChatChunk>> = Vec::new();
+            if let Some(content) = resp.content {
+                if !content.is_empty() {
+                    chunks.push(Ok(ChatChunk::Content(content)));
+                }
+            }
+            chunks.push(Ok(ChatChunk::Done));
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// A trivial tool that always succeeds, used so a scripted tool call resolves
+    /// to a real executor in the turn loop.
+    #[derive(Clone)]
+    struct MockTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "mock tool"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(&self, _args: Value) -> anyhow::Result<String> {
+            Ok("mock tool result".to_string())
+        }
+    }
+
+    /// A Skill exposing a single [`MockTool`], so registering it on the agent
+    /// makes that tool resolvable inside `assemble_tools`.
+    struct MockSkill {
+        tool: Arc<dyn Tool>,
+    }
+
+    #[async_trait]
+    impl Skill for MockSkill {
+        fn name(&self) -> &str {
+            "mock-skill"
+        }
+        fn description(&self) -> &str {
+            "mock skill"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.tool.clone()]
+        }
+    }
+
+    /// A minimal `AgentConfig` for tests: no seed instructions (so history starts
+    /// empty), analytics disabled (no disk writes), fixed model name.
+    fn mock_config() -> AgentConfig {
+        AgentConfig {
+            name: Some("test".to_string()),
+            model: Some("mock-model".to_string()),
+            workspace: None,
+            instructions: None,
+            enable_analytics: Some(false),
+            analytics_max_size_mb: Some(1),
+        }
+    }
+
+    /// Build an Agent backed by the given mock provider. Clears any
+    /// environment-derived opt-in flags so behavior is deterministic.
+    fn mock_agent(llm: Arc<dyn LLMProvider>) -> Agent {
+        let mut agent = Agent::new("mock-agent".to_string(), mock_config(), llm);
+        agent.fallback_providers = Vec::new();
+        agent.session_memory = false;
+        agent.self_improve = false;
+        agent
+    }
+
+    /// Build an Agent backed by the given mock provider with a temp workspace.
+    fn mock_agent_with_workspace(llm: Arc<dyn LLMProvider>) -> (Agent, PathBuf) {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = mock_agent(llm).with_workspace_root(dir.clone());
+        (agent, dir)
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "swarmclaw-agent-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    fn message_text(action: &SlashAction) -> &str {
+        match action {
+            SlashAction::Message(s) => s.as_str(),
+            SlashAction::NotHandled => panic!("expected SlashAction::Message, got NotHandled"),
+        }
+    }
+
+    // --- Command layer (run_slash) -----------------------------------------
+
+    #[test]
+    fn run_slash_think_high_and_off_and_invalid() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+
+        let msg = message_text(&agent.run_slash("/think high")).to_string();
+        assert_eq!(agent.think_level, ThinkLevel::High);
+        assert!(msg.contains("High"), "msg: {msg}");
+
+        let msg = message_text(&agent.run_slash("/think off")).to_string();
+        assert_eq!(agent.think_level, ThinkLevel::Off);
+        assert!(msg.contains("Off"), "msg: {msg}");
+
+        // Invalid arg leaves the level unchanged and shows usage.
+        let msg = message_text(&agent.run_slash("/think bogus")).to_string();
+        assert_eq!(agent.think_level, ThinkLevel::Off);
+        assert!(msg.contains("Usage: /think"), "msg: {msg}");
+    }
+
+    #[test]
+    fn run_slash_trace_toggles() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+        assert!(!agent.trace);
+
+        let msg = message_text(&agent.run_slash("/trace on")).to_string();
+        assert!(agent.trace);
+        assert!(msg.contains("ON"), "msg: {msg}");
+
+        let msg = message_text(&agent.run_slash("/trace off")).to_string();
+        assert!(!agent.trace);
+        assert!(msg.contains("OFF"), "msg: {msg}");
+    }
+
+    #[test]
+    fn run_slash_orchestrator_and_multithread_toggle() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+
+        message_text(&agent.run_slash("/orchestrator on"));
+        assert!(agent.use_orchestrator);
+        message_text(&agent.run_slash("/orchestrator off"));
+        assert!(!agent.use_orchestrator);
+
+        message_text(&agent.run_slash("/multithread on"));
+        assert!(agent.use_multithread);
+        message_text(&agent.run_slash("/multithread off"));
+        assert!(!agent.use_multithread);
+    }
+
+    #[test]
+    fn run_slash_fallback_set_clear_and_show() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+        agent.fallback_providers = Vec::new();
+
+        let msg = message_text(&agent.run_slash("/fallback anthropic,openai")).to_string();
+        assert_eq!(
+            agent.fallback_providers,
+            vec!["anthropic".to_string(), "openai".to_string()]
+        );
+        assert!(msg.contains("anthropic -> openai"), "msg: {msg}");
+
+        // Bare /fallback shows the current chain.
+        let shown = message_text(&agent.run_slash("/fallback")).to_string();
+        assert!(shown.contains("anthropic -> openai"), "shown: {shown}");
+
+        // /fallback clear empties it.
+        let cleared = message_text(&agent.run_slash("/fallback clear")).to_string();
+        assert!(agent.fallback_providers.is_empty());
+        assert!(cleared.to_lowercase().contains("disabled"), "cleared: {cleared}");
+    }
+
+    #[test]
+    fn run_slash_usage_reports_provider_and_counts() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+        agent.record_message(Message {
+            role: Role::User,
+            content: "hello".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        let msg = message_text(&agent.run_slash("/usage")).to_string();
+        assert!(msg.contains("mock"), "should mention provider: {msg}");
+        assert!(msg.contains("Messages: 1"), "should count messages: {msg}");
+        assert!(msg.contains("Estimated tokens:"), "should estimate tokens: {msg}");
+    }
+
+    #[test]
+    fn run_slash_skills_without_workspace_returns_notice() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+        let msg = message_text(&agent.run_slash("/skills")).to_string();
+        assert!(
+            msg.contains("no workspace configured"),
+            "expected no-workspace notice: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_slash_skills_with_workspace_lists_empty() {
+        let (mut agent, dir) =
+            mock_agent_with_workspace(Arc::new(MockLLMProvider::final_text("hi")));
+        let msg = message_text(&agent.run_slash("/skills")).to_string();
+        // Empty workspace => the "no learned skills yet" message, no error.
+        assert!(
+            msg.contains("No learned skills") || msg.contains("Learned skills"),
+            "expected an empty/normal list, got: {msg}"
+        );
+        assert!(!msg.contains("Failed"), "should not error: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_slash_non_command_is_not_handled() {
+        let mut agent = mock_agent(Arc::new(MockLLMProvider::final_text("hi")));
+        assert!(matches!(
+            agent.run_slash("just a normal message"),
+            SlashAction::NotHandled
+        ));
+    }
+
+    // --- Turn loop (think) -------------------------------------------------
+
+    #[tokio::test]
+    async fn think_records_final_assistant_message() {
+        let mock = Arc::new(MockLLMProvider::final_text("final answer"));
+        let mut agent = mock_agent(mock.clone());
+        agent.record_message(Message {
+            role: Role::User,
+            content: "question".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        agent.think().await.expect("think should succeed");
+
+        let last = agent
+            .state
+            .history
+            .last()
+            .expect("history should be non-empty");
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "final answer");
+        assert_eq!(mock.call_count(), 1, "exactly one provider call");
+    }
+
+    #[tokio::test]
+    async fn think_executes_tool_then_final() {
+        // The mock returns ONE tool call, then a final text reply. This drives
+        // the tool-execution path and ends on the final assistant message
+        // (a single distinct call never trips the repeated-call guard).
+        let mock = Arc::new(MockLLMProvider::repeating_tool("mock_tool", "{}", 1));
+        let mut agent = mock_agent(mock.clone());
+        agent.add_skill(Arc::new(MockSkill {
+            tool: Arc::new(MockTool {
+                name: "mock_tool".to_string(),
+            }),
+        }));
+        agent.record_message(Message {
+            role: Role::User,
+            content: "do the thing".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        agent.think().await.expect("think should succeed");
+
+        // 1 tool-call reply + 1 final reply.
+        assert_eq!(mock.call_count(), 2, "should stop after the final reply");
+
+        let tool_results: Vec<&Message> = agent
+            .state
+            .history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 1, "one tool execution recorded");
+        assert!(
+            tool_results[0].content.contains("mock tool result"),
+            "tool result should be recorded: {}",
+            tool_results[0].content
+        );
+
+        let last = agent.state.history.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "done");
+    }
+
+    #[tokio::test]
+    async fn think_loop_guard_breaks_on_repeated_tool_call() {
+        // The mock returns the SAME tool call indefinitely (limit far above the
+        // repeat threshold). The loop guard in think() must terminate it rather
+        // than the mock running out — verifying the guard is wired into the
+        // non-streaming loop used by delegated sub-agents.
+        let mock = Arc::new(MockLLMProvider::repeating_tool("mock_tool", "{}", 100));
+        let mut agent = mock_agent(mock.clone());
+        agent.add_skill(Arc::new(MockSkill {
+            tool: Arc::new(MockTool {
+                name: "mock_tool".to_string(),
+            }),
+        }));
+        agent.record_message(Message {
+            role: Role::User,
+            content: "loop forever".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        // Must NOT hang. The guard trips at REPEAT_THRESHOLD identical calls,
+        // long before the mock's limit of 100.
+        agent.think().await.expect("think should succeed");
+        assert!(
+            mock.call_count() <= crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS,
+            "guard should stop well before the mock's limit (calls = {})",
+            mock.call_count()
+        );
+
+        // A repeated-call guard notice was recorded and the loop ended on it.
+        let last = agent.state.history.last().unwrap();
+        assert_eq!(last.role, Role::System);
+        assert!(
+            last.content.contains("repeated tool call"),
+            "expected repeated-call guard notice, got: {}",
+            last.content
+        );
     }
 }
