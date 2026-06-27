@@ -1171,24 +1171,12 @@ use swarmclaw::skills::browser::BrowserSkill;
         }
     }
 
-    // Add Delegation Tool (Next-Gen feature)
-    info!("Adding Delegation tool...");
-    use swarmclaw::tools::delegate::DelegateTaskTool;
-    // We add it as a native skill containing just this tool for now
-    struct DelegateSkill;
-    impl swarmclaw::skills::Skill for DelegateSkill {
-        fn name(&self) -> &str {
-            "delegation"
-        }
-        fn description(&self) -> &str {
-            "Allows delegating tasks to other agents."
-        }
-        fn tools(&self) -> Vec<Arc<dyn swarmclaw::tools::Tool>> {
-            vec![Arc::new(DelegateTaskTool)]
-        }
-    }
-
-    agent.add_skill(Arc::new(DelegateSkill));
+    // Delegation (decompose -> fan-out -> join) is provided by the
+    // orchestrator's `delegate_task` tool, which is appended to the agent's
+    // tool set per turn ONLY when `use_orchestrator == true` (opt-in via
+    // `/orchestrator on`). It spawns real sub-agents (recursive LLM calls), so
+    // it is strictly opt-in and default-off; nothing to register here. See
+    // `core::delegation` and `Agent::assemble_tools`.
 
     let gateway_agent_template = Arc::new(agent.clone());
     let agent_shared = Arc::new(tokio::sync::Mutex::new(agent));
