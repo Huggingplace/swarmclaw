@@ -897,8 +897,35 @@ impl Agent {
             );
         }
 
+        // Loop guards: bound the LLM<->tools turn loop so a runaway model can't
+        // run forever / burn unbounded cost. `step` counts outer-loop
+        // iterations; `tool_call_sigs` accumulates this turn's tool-call
+        // signatures for repeated-call detection. See `core::loop_guard`.
+        let mut step: usize = 0;
+        let mut tool_call_sigs: Vec<String> = Vec::new();
+
         // Outer loop: LLM <-> tools turn loop (mirrors stream_think's outer loop).
         loop {
+            // Max-step guard: stop gracefully if the model keeps reasoning past
+            // the cap. Record a notice the same way other notices are rendered.
+            step += 1;
+            if step > crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS {
+                let notice = format!(
+                    "[Reached the maximum of {} reasoning steps; stopping. Ask me to continue if needed.]",
+                    crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS
+                );
+                self.record_message(Message {
+                    role: Role::System,
+                    content: notice,
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                state.sync_transcript(&self.state.history);
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
+                break;
+            }
+
             let options = CompletionOptions {
                 model: self.config.model.clone(),
                 ..Default::default()
@@ -1051,6 +1078,34 @@ impl Agent {
             }
 
             if tool_calls.is_empty() {
+                break;
+            }
+
+            // Repeated-call guard: if the model is stuck issuing an identical
+            // tool call, stop before executing it again. Detection is done on
+            // signatures accumulated across the whole turn (see core::loop_guard).
+            let mut repeated_tool: Option<String> = None;
+            for tc in &tool_calls {
+                let sig = crate::core::loop_guard::tool_call_signature(&tc.name, &tc.arguments);
+                if crate::core::loop_guard::is_repeated_call(&tool_call_sigs, &sig) {
+                    repeated_tool = Some(tc.name.clone());
+                }
+                tool_call_sigs.push(sig);
+            }
+            if let Some(name) = repeated_tool {
+                let notice = format!(
+                    "[Detected a repeated tool call to '{}'; stopping to avoid an infinite loop.]",
+                    name
+                );
+                self.record_message(Message {
+                    role: Role::System,
+                    content: notice,
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                state.sync_transcript(&self.state.history);
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
                 break;
             }
 
@@ -1213,7 +1268,38 @@ impl Agent {
         let mut stdout = io::stdout();
         let cli_mode = channel_info.is_none();
 
+        // Loop guards: bound the LLM<->tools turn loop so a runaway model can't
+        // run forever / burn unbounded cost. `step` counts outer-loop
+        // iterations; `tool_call_sigs` accumulates this turn's tool-call
+        // signatures for repeated-call detection. See `core::loop_guard`.
+        let mut step: usize = 0;
+        let mut tool_call_sigs: Vec<String> = Vec::new();
+
         loop {
+            // Max-step guard: stop gracefully if the model keeps reasoning past
+            // the cap. Record a notice and render it the same way this loop
+            // renders other notices (CLI line / gateway text).
+            step += 1;
+            if step > crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS {
+                let notice = format!(
+                    "[Reached the maximum of {} reasoning steps; stopping. Ask me to continue if needed.]",
+                    crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS
+                );
+                self.record_message(Message {
+                    role: Role::System,
+                    content: notice.clone(),
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                if cli_mode {
+                    let _ = self.redraw_cli_screen(&mut stdout);
+                } else if let Some(channel_info) = &channel_info {
+                    queue_gateway_text(channel_info, &notice);
+                }
+                break;
+            }
+
             if std::io::stdout().is_terminal() {
                 drain_resize_events(self, &mut stdout, "")?;
             }
@@ -1576,6 +1662,40 @@ impl Agent {
                     if let Some(channel_info) = &channel_info {
                         queue_gateway_text(channel_info, &redacted_content);
                     }
+                }
+            }
+
+            // Repeated-call guard: if the model is stuck issuing an identical
+            // tool call, stop before executing it again. Detection runs on
+            // signatures accumulated across the whole turn (see core::loop_guard).
+            if !tool_calls.is_empty() {
+                let mut repeated_tool: Option<String> = None;
+                for tc in &tool_calls {
+                    let sig =
+                        crate::core::loop_guard::tool_call_signature(&tc.name, &tc.arguments);
+                    if crate::core::loop_guard::is_repeated_call(&tool_call_sigs, &sig) {
+                        repeated_tool = Some(tc.name.clone());
+                    }
+                    tool_call_sigs.push(sig);
+                }
+                if let Some(name) = repeated_tool {
+                    let notice = format!(
+                        "[Detected a repeated tool call to '{}'; stopping to avoid an infinite loop.]",
+                        name
+                    );
+                    self.record_message(Message {
+                        role: Role::System,
+                        content: notice.clone(),
+                        timestamp: now_secs(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    if cli_mode {
+                        let _ = self.redraw_cli_screen(&mut stdout);
+                    } else if let Some(channel_info) = &channel_info {
+                        queue_gateway_text(channel_info, &notice);
+                    }
+                    break;
                 }
             }
 
