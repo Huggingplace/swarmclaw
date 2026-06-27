@@ -173,7 +173,12 @@ impl Agent {
             skills: Vec::new(),
             memory_org_id: None,
             memory_api_key: None,
-            use_orchestrator: true,
+            // SAFETY: the orchestrator (delegate_task) spawns REAL sub-agents
+            // (recursive LLM calls = cost), so it is strictly opt-in and
+            // DEFAULT-OFF. Enable per session via `/orchestrator on`. When
+            // off, the delegate tool is never added to the tool set and
+            // behavior is unchanged.
+            use_orchestrator: false,
             // Parallel tool execution is opt-in via `/multithread on`. It was a
             // dead flag historically, so the safe default keeps today's real
             // behavior (sequential) until parallelism is validated on a real
@@ -192,6 +197,31 @@ impl Agent {
         self.skills.push(skill);
     }
 
+    /// Assemble the tool set for one turn: every skill's tools, plus — only
+    /// when this agent is an opt-in orchestrator (`use_orchestrator == true`)
+    /// — the `delegate_task` tool.
+    ///
+    /// SAFETY / RECURSION GUARD: the delegate tool spawns ephemeral sub-agents
+    /// built with `use_orchestrator = false`, so sub-agents never reach this
+    /// branch and can never re-delegate. The executor/tool are cheap to build
+    /// per turn. When `use_orchestrator == false`, the tool set is exactly the
+    /// skills' tools and behavior is unchanged.
+    fn assemble_tools(&self) -> Vec<Arc<dyn crate::tools::Tool>> {
+        let mut tools: Vec<Arc<dyn crate::tools::Tool>> =
+            self.skills.iter().flat_map(|s| s.tools()).collect();
+        if self.use_orchestrator {
+            let executor = crate::core::delegation::InProcessExecutor::new(
+                self.llm.clone(),
+                self.config.clone(),
+                self.skills.clone(),
+            );
+            tools.push(Arc::new(crate::core::delegation::DelegateTaskTool::new(
+                Arc::new(executor),
+            )));
+        }
+        tools
+    }
+
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = Some(workspace_root);
         self
@@ -199,6 +229,14 @@ impl Agent {
 
     pub fn workspace_root(&self) -> Option<&Path> {
         self.workspace_root.as_deref()
+    }
+
+    /// Test-only accessor for the (private) state-persistence path, so the
+    /// delegation module can assert that ephemeral sub-agents never configure
+    /// one (no disk writes). Returns `None` when the agent is ephemeral.
+    #[cfg(test)]
+    pub(crate) fn state_path_for_test(&self) -> Option<&Path> {
+        self.state_path.as_deref()
     }
 
     pub fn spawn_session(&self, session_id: impl Into<String>) -> Self {
@@ -1065,7 +1103,7 @@ impl Agent {
 
             let prepared = prepare_turn_request(
                 history_to_send,
-                self.skills.iter().flat_map(|s| s.tools()).collect(),
+                self.assemble_tools(),
                 self.llm.provider_name(),
                 capabilities,
                 TurnMode::Streaming,
@@ -1608,7 +1646,7 @@ impl Agent {
 
             let prepared = prepare_turn_request(
                 history_to_send,
-                self.skills.iter().flat_map(|s| s.tools()).collect(),
+                self.assemble_tools(),
                 self.llm.provider_name(),
                 capabilities,
                 TurnMode::Streaming,
@@ -2288,7 +2326,7 @@ impl Agent {
 
             let prepared = prepare_turn_request(
                 history_to_send,
-                self.skills.iter().flat_map(|s| s.tools()).collect(),
+                self.assemble_tools(),
                 self.llm.provider_name(),
                 capabilities,
                 TurnMode::NonStreaming,
