@@ -234,6 +234,16 @@ pub struct Agent {
     /// (`1`/`true`/`on`/`yes`) in [`Agent::new`]. See
     /// [`Agent::maybe_author_skill`].
     pub self_improve: bool,
+    /// Optional Fleet backend for delegated subtasks (PR-10). Strictly OPT-IN
+    /// and DEFAULT-`None`: a Fleet provider is NEVER populated by `Agent::new`,
+    /// so the seam exists but is dormant. When this is `Some` AND the env var
+    /// `SWARMCLAW_DELEGATE_BACKEND == "fleet"`, [`Agent::assemble_tools`] builds
+    /// the delegate tool on a
+    /// [`crate::core::delegation::FleetExecutor`] (distributed jobs) instead of
+    /// the default [`crate::core::delegation::InProcessExecutor`]. Because it
+    /// defaults `None`, delegation always runs in-process today and behavior is
+    /// byte-for-byte unchanged.
+    pub fleet_provider: Option<Arc<dyn crate::fleet::FleetProvider>>,
 }
 
 impl Agent {
@@ -293,6 +303,11 @@ impl Agent {
                     v == "1" || v == "true" || v == "on" || v == "yes"
                 })
                 .unwrap_or(false),
+            // Fleet-backed delegation (PR-10), strictly opt-in. DEFAULT-`None`:
+            // no Fleet provider is wired in here, so delegation always uses the
+            // in-process executor and behavior is byte-for-byte unchanged. This
+            // is a dormant wiring point for a future caller to populate.
+            fleet_provider: None,
         }
     }
 
@@ -331,13 +346,31 @@ impl Agent {
         tools.push(Arc::new(pipeline));
 
         if self.use_orchestrator {
-            let executor = crate::core::delegation::InProcessExecutor::new(
-                self.llm.clone(),
-                self.config.clone(),
-                self.skills.clone(),
-            );
+            // Backend selection (PR-10), additive and DEFAULT in-process:
+            // build a Fleet-backed executor ONLY when a Fleet provider is
+            // configured (`fleet_provider == Some`) AND the env var
+            // `SWARMCLAW_DELEGATE_BACKEND == "fleet"` selects it. Since
+            // `fleet_provider` defaults to `None` and is never populated by
+            // `Agent::new`, this branch is unreachable in the default build and
+            // delegation always uses the in-process executor — unchanged.
+            let use_fleet = self.fleet_provider.is_some()
+                && std::env::var("SWARMCLAW_DELEGATE_BACKEND")
+                    .map(|v| v.trim().eq_ignore_ascii_case("fleet"))
+                    .unwrap_or(false);
+
+            let executor: Arc<dyn crate::core::delegation::SubAgentExecutor> = if use_fleet {
+                // Safe: `use_fleet` is only true when `fleet_provider` is `Some`.
+                let provider = self.fleet_provider.clone().expect("fleet_provider is Some");
+                Arc::new(crate::core::delegation::FleetExecutor::new(provider))
+            } else {
+                Arc::new(crate::core::delegation::InProcessExecutor::new(
+                    self.llm.clone(),
+                    self.config.clone(),
+                    self.skills.clone(),
+                ))
+            };
             tools.push(Arc::new(crate::core::delegation::DelegateTaskTool::new(
-                Arc::new(executor),
+                executor,
             )));
         }
         tools
