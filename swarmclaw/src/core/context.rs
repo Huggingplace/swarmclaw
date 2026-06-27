@@ -24,6 +24,11 @@ const PER_MESSAGE_OVERHEAD_TOKENS: usize = 4;
 /// unbounded growth of very long-lived agents.
 pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 120_000;
 
+/// Number of most-recent messages always kept verbatim (never summarized) when
+/// compacting history. The kept tail may grow beyond this to land on a `User`
+/// boundary, but never shrinks below it.
+pub const DEFAULT_PROTECT_LAST_N: usize = 6;
+
 /// Estimate the token cost of a single message (content + any tool-call JSON).
 pub fn estimate_tokens(message: &Message) -> usize {
     let mut chars = message.content.len();
@@ -107,6 +112,109 @@ pub fn trim_to_budget(history: &[Message], max_tokens: usize) -> Vec<Message> {
     result
 }
 
+/// A plan for compacting an over-budget history by summarizing its middle.
+///
+/// The original history is conceptually split into three contiguous, ordered
+/// segments:
+/// - `head`: messages kept verbatim at the front. Always contains every
+///   `System` message (system prompt, capability notices); these are never
+///   summarized.
+/// - `middle`: the contiguous slice to replace with a single summary message.
+///   May be empty when no compaction is needed.
+/// - `tail`: the most-recent messages kept verbatim. Always begins at a `User`
+///   boundary so a tool-call assistant turn is never split from its `Tool`
+///   result, and always includes the newest message.
+///
+/// `head ++ middle ++ tail` reproduces the original history exactly, so the plan
+/// is fully reconstructable and unit-testable.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    pub head: Vec<Message>,
+    pub middle: Vec<Message>,
+    pub tail: Vec<Message>,
+}
+
+impl CompactionPlan {
+    /// Whether this plan actually requires summarizing anything.
+    pub fn needs_compaction(&self) -> bool {
+        !self.middle.is_empty()
+    }
+}
+
+/// Partition `history` into head / middle / tail for summarization-based
+/// compaction (see [`CompactionPlan`]).
+///
+/// Rules:
+/// - If the whole history already fits `max_tokens`, returns a no-compaction
+///   plan (`head` = full history, empty `middle`/`tail`).
+/// - All `System` messages stay in `head` and are never summarized.
+/// - The last `protect_last_n` messages are always kept verbatim, the newest
+///   message is always kept, and the kept tail is extended (toward older
+///   messages) until it begins at a `User` boundary so tool-call/tool-result
+///   pairs are never split across the middle/tail seam.
+/// - The middle is the contiguous run of non-system messages between the
+///   leading system messages and the kept tail. If that run is empty there is
+///   nothing to summarize and the plan reports no compaction.
+pub fn partition_for_compaction(
+    history: &[Message],
+    max_tokens: usize,
+    protect_last_n: usize,
+) -> CompactionPlan {
+    // Fast path: already within budget -> nothing to compact.
+    if estimate_history_tokens(history) <= max_tokens {
+        return CompactionPlan {
+            head: history.to_vec(),
+            middle: Vec::new(),
+            tail: Vec::new(),
+        };
+    }
+
+    let n = history.len();
+
+    // Leading System messages form the protected head. We only summarize the
+    // contiguous body after them; any System message interleaved later still
+    // lands in the middle and gets folded into the summary, but the canonical
+    // system prompt(s) at the front are preserved verbatim.
+    let mut head_end = 0usize;
+    while head_end < n && history[head_end].role == Role::System {
+        head_end += 1;
+    }
+
+    // Determine where the kept tail begins. Start by protecting the last
+    // `protect_last_n` messages (and always at least the newest one), then walk
+    // backward to the nearest `User` boundary so we never lead the tail with an
+    // orphan Tool result or a bare Assistant turn.
+    let protect = protect_last_n.max(1).min(n);
+    let mut tail_start = n - protect;
+
+    // Snap the tail start to a User boundary by extending toward older messages.
+    while tail_start > head_end && history[tail_start].role != Role::User {
+        tail_start -= 1;
+    }
+
+    // If we walked all the way back into the head without finding a User
+    // boundary, fall back to the most recent User message in the body so the
+    // tail is still valid and non-empty.
+    if tail_start <= head_end || history[tail_start].role != Role::User {
+        if let Some(last_user) = history[head_end..]
+            .iter()
+            .rposition(|m| m.role == Role::User)
+        {
+            tail_start = head_end + last_user;
+        } else {
+            // No User message anywhere in the body: there is no safe summarize
+            // boundary, so keep the whole body as tail (no compaction).
+            tail_start = head_end;
+        }
+    }
+
+    let head: Vec<Message> = history[..head_end].to_vec();
+    let middle: Vec<Message> = history[head_end..tail_start].to_vec();
+    let tail: Vec<Message> = history[tail_start..].to_vec();
+
+    CompactionPlan { head, middle, tail }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +293,98 @@ mod tests {
         let out = trim_to_budget(&history, 5);
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].role, Role::User);
+    }
+
+    #[test]
+    fn partition_under_budget_needs_no_compaction() {
+        let history = vec![
+            m(Role::System, "sys"),
+            m(Role::User, "hi"),
+            m(Role::Assistant, "hello"),
+        ];
+        let plan = partition_for_compaction(&history, 10_000, DEFAULT_PROTECT_LAST_N);
+        assert!(!plan.needs_compaction());
+        assert!(plan.middle.is_empty());
+        assert!(plan.tail.is_empty());
+        // head holds the full history so head++middle++tail reconstructs it.
+        assert_eq!(plan.head.len(), history.len());
+    }
+
+    #[test]
+    fn partition_over_budget_identifies_middle_and_keeps_system_and_user_boundary() {
+        let big = "x".repeat(400); // ~100 tokens each -> forces compaction
+        let history = vec![
+            m(Role::System, "system prompt"),
+            m(Role::User, &big),       // oldest turn -> middle
+            m(Role::Assistant, &big),  // middle
+            m(Role::User, &big),       // middle
+            m(Role::Assistant, &big),  // middle
+            m(Role::User, "recent-1"),
+            m(Role::Assistant, "recent-2"),
+            m(Role::User, "recent-3"),
+            m(Role::Assistant, "newest"),
+        ];
+        // Protect last 4 -> boundary snaps to a User message.
+        let plan = partition_for_compaction(&history, 200, 4);
+        assert!(plan.needs_compaction());
+
+        // Head keeps all leading System messages.
+        assert_eq!(plan.head.len(), 1);
+        assert_eq!(plan.head[0].role, Role::System);
+        // No System message ends up in the middle for this layout.
+        assert!(plan.middle.iter().all(|x| x.role != Role::System));
+        // Tail begins at a User boundary.
+        assert_eq!(plan.tail.first().unwrap().role, Role::User);
+        // Newest message always kept verbatim in the tail.
+        assert_eq!(plan.tail.last().unwrap().content, "newest");
+
+        // head ++ middle ++ tail reconstructs the original history.
+        let mut recon = plan.head.clone();
+        recon.extend(plan.middle.clone());
+        recon.extend(plan.tail.clone());
+        assert_eq!(recon.len(), history.len());
+        assert_eq!(recon[0].content, history[0].content);
+        assert_eq!(recon.last().unwrap().content, "newest");
+    }
+
+    #[test]
+    fn partition_does_not_split_tool_call_pair_across_middle_tail_boundary() {
+        let big = "w".repeat(400);
+        let mut assistant = m(Role::Assistant, "");
+        assistant.tool_calls = Some(vec![serde_json::json!({
+            "id": "t1", "type": "function",
+            "function": {"name": "f", "arguments": "{}"}
+        })]);
+        let mut tool_result = m(Role::Tool, "tool output");
+        tool_result.tool_call_id = Some("t1".to_string());
+
+        let history = vec![
+            m(Role::System, "sys"),
+            m(Role::User, &big),
+            m(Role::Assistant, &big),
+            m(Role::User, "kicks-off-tool"),
+            assistant,            // tool_call
+            tool_result,          // tool_result -- must stay with its assistant
+            m(Role::Assistant, "final answer"),
+        ];
+        // protect_last_n=3 would land the boundary on the Tool result; the
+        // snap-to-User logic must back it up to "kicks-off-tool".
+        let plan = partition_for_compaction(&history, 50, 3);
+        assert!(plan.needs_compaction());
+
+        // Tail must start on a User message, not an orphan Tool/Assistant.
+        assert_eq!(plan.tail.first().unwrap().role, Role::User);
+        assert_eq!(plan.tail.first().unwrap().content, "kicks-off-tool");
+
+        // The tool_call assistant and its Tool result are together in the tail,
+        // never split across the seam (the Tool result is not in the middle).
+        assert!(plan
+            .middle
+            .iter()
+            .all(|x| x.role != Role::Tool && x.tool_calls.is_none()));
+        assert!(plan.tail.iter().any(|x| x.role == Role::Tool));
+
+        // Newest message kept.
+        assert_eq!(plan.tail.last().unwrap().content, "final answer");
     }
 }

@@ -250,6 +250,121 @@ impl Agent {
         self.persist_state_best_effort();
     }
 
+    /// Compact an over-budget history for sending to the model by summarizing
+    /// its middle into a single `System` message, keeping the head (system
+    /// prompts) and the recent tail verbatim.
+    ///
+    /// The stored `self.state.history` is never mutated — this operates on the
+    /// borrowed `history` and returns a fresh, possibly-compacted clone.
+    ///
+    /// On ANY failure (provider error, empty summary, or a summarized result
+    /// that still exceeds `max_tokens`) this falls back to the lossy
+    /// [`crate::core::context::trim_to_budget`] so there is never a regression.
+    async fn compact_history_for_send(
+        &self,
+        history: &[Message],
+        max_tokens: usize,
+    ) -> Vec<Message> {
+        let plan = crate::core::context::partition_for_compaction(
+            history,
+            max_tokens,
+            crate::core::context::DEFAULT_PROTECT_LAST_N,
+        );
+
+        // Within budget (or nothing safe to summarize): send as-is.
+        if !plan.needs_compaction() {
+            return history.to_vec();
+        }
+
+        // Build a plain-text rendering of the middle turns to summarize.
+        let mut excerpt = String::new();
+        for msg in &plan.middle {
+            let role = match msg.role {
+                Role::System => "System",
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+                Role::Tool => "Tool",
+            };
+            excerpt.push_str(role);
+            excerpt.push_str(": ");
+            if !msg.content.is_empty() {
+                excerpt.push_str(&msg.content);
+            }
+            if let Some(tool_calls) = &msg.tool_calls {
+                for tc in tool_calls {
+                    excerpt.push_str("\n[tool_call] ");
+                    excerpt.push_str(&tc.to_string());
+                }
+            }
+            excerpt.push_str("\n\n");
+        }
+
+        let prompt = format!(
+            "Summarize the following earlier conversation excerpt for context \
+             continuity. Preserve facts, decisions, file paths, identifiers, and \
+             open tasks. Be concise.\n\n{excerpt}"
+        );
+
+        let summary_request = vec![Message {
+            role: Role::User,
+            content: prompt,
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let options = CompletionOptions {
+            model: self.config.model.clone(),
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
+
+        // Clone the Arc so the non-streaming call doesn't borrow `self` in a way
+        // that conflicts with the surrounding turn loop.
+        let llm = self.llm.clone();
+        let summary = match llm.complete(&summary_request, &options).await {
+            Ok(resp) => resp.content.unwrap_or_default(),
+            Err(error) => {
+                warn!(
+                    agent_id = %self.id,
+                    "History summarization failed, falling back to lossy trim: {error}"
+                );
+                return crate::core::context::trim_to_budget(history, max_tokens);
+            }
+        };
+
+        if summary.trim().is_empty() {
+            warn!(
+                agent_id = %self.id,
+                "History summarization returned empty content, falling back to lossy trim"
+            );
+            return crate::core::context::trim_to_budget(history, max_tokens);
+        }
+
+        // Reconstruct: head ++ [summary System message] ++ tail.
+        let mut compacted = plan.head;
+        compacted.push(Message {
+            role: Role::System,
+            content: format!("[Earlier conversation summarized]\n{summary}"),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        compacted.extend(plan.tail);
+
+        // If summarization didn't actually bring us under budget, fall back to
+        // the lossy trim so we never send something over the budget.
+        if crate::core::context::estimate_history_tokens(&compacted) > max_tokens {
+            warn!(
+                agent_id = %self.id,
+                "Summarized history still exceeds budget, falling back to lossy trim"
+            );
+            return crate::core::context::trim_to_budget(history, max_tokens);
+        }
+
+        compacted
+    }
+
     fn persist_state_best_effort(&self) {
         let Some(store_path) = &self.state_store_path else {
             return;
@@ -937,10 +1052,15 @@ impl Agent {
 
             let history_to_send = {
                 let history = self.state.history.clone();
-                crate::core::context::trim_to_budget(
+                // Context-pressure: summarize the middle of an over-budget
+                // history (falling back to a lossy trim on failure) so
+                // long-lived agents don't overflow the context window. The
+                // stored history (self.state.history) is untouched.
+                self.compact_history_for_send(
                     &history,
                     crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
                 )
+                .await
             };
 
             let prepared = prepare_turn_request(
@@ -1403,18 +1523,22 @@ impl Agent {
 
             // Context-pressure: bound the history we send to the model so that
             // long-lived agents and chat gateways don't overflow the context
-            // window. The stored history (self.state.history) is untouched.
+            // window. Over-budget history has its middle summarized into a
+            // single System message (falling back to a lossy trim on any
+            // failure). The stored history (self.state.history) is untouched.
             {
                 let before = history_to_send.len();
-                history_to_send = crate::core::context::trim_to_budget(
-                    &history_to_send,
-                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
-                );
+                history_to_send = self
+                    .compact_history_for_send(
+                        &history_to_send,
+                        crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                    )
+                    .await;
                 if history_to_send.len() < before {
                     debug!(
                         kept = history_to_send.len(),
-                        dropped = before - history_to_send.len(),
-                        "Trimmed conversation history to context budget"
+                        compacted_from = before,
+                        "Compacted conversation history to context budget"
                     );
                 }
             }
@@ -2082,18 +2206,22 @@ impl Agent {
 
             // Context-pressure: bound the history we send to the model so that
             // long-lived agents and chat gateways don't overflow the context
-            // window. The stored history (self.state.history) is untouched.
+            // window. Over-budget history has its middle summarized into a
+            // single System message (falling back to a lossy trim on any
+            // failure). The stored history (self.state.history) is untouched.
             {
                 let before = history_to_send.len();
-                history_to_send = crate::core::context::trim_to_budget(
-                    &history_to_send,
-                    crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
-                );
+                history_to_send = self
+                    .compact_history_for_send(
+                        &history_to_send,
+                        crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET,
+                    )
+                    .await;
                 if history_to_send.len() < before {
                     debug!(
                         kept = history_to_send.len(),
-                        dropped = before - history_to_send.len(),
-                        "Trimmed conversation history to context budget"
+                        compacted_from = before,
+                        "Compacted conversation history to context budget"
                     );
                 }
             }
