@@ -5457,6 +5457,36 @@ mod tests {
         /// the stream script) for the first `repeat_limit` calls, then a final
         /// streamed text reply. Exercises the streaming repeated-call guard.
         repeat_stream_tool: Option<MockStreamReply>,
+        /// Scripts the NON-tools `complete` method (used by
+        /// `compact_history_for_send` to summarize history) independently of the
+        /// `complete_with_tools` script. `None` means "delegate to the trait
+        /// default" (i.e. fall through to `complete_with_tools`). When set it
+        /// returns a canned summary string or an error WITHOUT consuming the
+        /// tools script, so compaction tests stay isolated from turn-loop calls.
+        complete_behavior: Option<CompleteBehavior>,
+        /// Number of `complete` (non-tools) invocations so far. Lets compaction
+        /// tests assert the summarizer was (or was NOT) called.
+        complete_calls: AtomicUsize,
+        /// When `Some(n)`, the first `n` `complete_with_tools` calls return a
+        /// context-overflow error (message matching `is_context_overflow_error`)
+        /// before the script/final reply is consumed. Drives the overflow
+        /// recovery loop in `think()`.
+        overflow_errors_before: usize,
+        /// When `Some(msg)`, EVERY `complete_with_tools` call returns an error
+        /// carrying `msg`. With an overflow-matching message this exhausts the
+        /// recovery retries; with a plain message it propagates immediately
+        /// (no retry).
+        always_error: Option<String>,
+    }
+
+    /// How the mock's scripted non-tools `complete` should respond.
+    #[derive(Clone)]
+    enum CompleteBehavior {
+        /// Return a canned summary string as the response content.
+        Summary(String),
+        /// Return an error carrying this message (exercises the lossy-trim
+        /// fallback in `compact_history_for_send`).
+        Error(String),
     }
 
     impl MockLLMProvider {
@@ -5473,6 +5503,10 @@ mod tests {
                 repeat_limit: 0,
                 stream_script: Mutex::new(std::collections::VecDeque::new()),
                 repeat_stream_tool: None,
+                complete_behavior: None,
+                complete_calls: AtomicUsize::new(0),
+                overflow_errors_before: 0,
+                always_error: None,
             }
         }
 
@@ -5493,6 +5527,10 @@ mod tests {
                 repeat_limit,
                 stream_script: Mutex::new(std::collections::VecDeque::new()),
                 repeat_stream_tool: None,
+                complete_behavior: None,
+                complete_calls: AtomicUsize::new(0),
+                overflow_errors_before: 0,
+                always_error: None,
             }
         }
 
@@ -5509,6 +5547,10 @@ mod tests {
                 repeat_limit: 0,
                 stream_script: Mutex::new(replies.into_iter().collect()),
                 repeat_stream_tool: None,
+                complete_behavior: None,
+                complete_calls: AtomicUsize::new(0),
+                overflow_errors_before: 0,
+                always_error: None,
             }
         }
 
@@ -5529,11 +5571,54 @@ mod tests {
                     name: name.to_string(),
                     arguments: arguments.to_string(),
                 }),
+                complete_behavior: None,
+                complete_calls: AtomicUsize::new(0),
+                overflow_errors_before: 0,
+                always_error: None,
             }
+        }
+
+        /// Build a mock whose `complete_with_tools` returns a context-overflow
+        /// error for the first `overflow_errors_before` calls, then hands back a
+        /// final assistant text reply. Drives the overflow recovery loop to a
+        /// successful retry.
+        fn overflow_then_final(overflow_errors_before: usize, final_text: &str) -> Self {
+            let mut base = Self::final_text(final_text);
+            base.overflow_errors_before = overflow_errors_before;
+            base
+        }
+
+        /// Build a mock whose `complete_with_tools` ALWAYS errors with `message`.
+        /// With an overflow-matching message this exercises retry exhaustion;
+        /// with a plain message it exercises immediate propagation.
+        fn always_error(message: &str) -> Self {
+            let mut base = Self::final_text("unused");
+            base.always_error = Some(message.to_string());
+            base
+        }
+
+        /// Build a mock whose non-tools `complete` returns the given canned
+        /// summary string. Used by compaction tests.
+        fn with_summary(summary: &str) -> Self {
+            let mut base = Self::final_text("unused");
+            base.complete_behavior = Some(CompleteBehavior::Summary(summary.to_string()));
+            base
+        }
+
+        /// Build a mock whose non-tools `complete` returns an error, exercising
+        /// the lossy-trim fallback in `compact_history_for_send`.
+        fn with_summary_error(message: &str) -> Self {
+            let mut base = Self::final_text("unused");
+            base.complete_behavior = Some(CompleteBehavior::Error(message.to_string()));
+            base
         }
 
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn complete_call_count(&self) -> usize {
+            self.complete_calls.load(Ordering::SeqCst)
         }
 
         fn reply_to_response(reply: MockReply) -> CompletionResponse {
@@ -5590,6 +5675,35 @@ mod tests {
             self.capabilities
         }
 
+        async fn complete(
+            &self,
+            messages: &[Message],
+            options: &CompletionOptions,
+        ) -> anyhow::Result<CompletionResponse> {
+            // When a scripted `complete` behavior is set, honor it WITHOUT
+            // touching the `complete_with_tools` script/counters, so compaction
+            // tests stay isolated from any turn-loop calls.
+            match &self.complete_behavior {
+                Some(CompleteBehavior::Summary(text)) => {
+                    self.complete_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(CompletionResponse {
+                        content: Some(text.clone()),
+                        tool_calls: None,
+                        finish_reason: Some("stop".to_string()),
+                    })
+                }
+                Some(CompleteBehavior::Error(message)) => {
+                    self.complete_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!(message.clone()))
+                }
+                // No scripted behavior: mirror the trait default.
+                None => {
+                    self.complete_calls.fetch_add(1, Ordering::SeqCst);
+                    self.complete_with_tools(messages, options, &[]).await
+                }
+            }
+        }
+
         async fn complete_with_tools(
             &self,
             _messages: &[Message],
@@ -5597,6 +5711,20 @@ mod tests {
             _tools: &[Arc<dyn Tool>],
         ) -> anyhow::Result<CompletionResponse> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            // Always-error mode: every call fails with the same message. With an
+            // overflow-matching message this exhausts the recovery retries; with
+            // a plain message the loop propagates it immediately.
+            if let Some(message) = &self.always_error {
+                return Err(anyhow::anyhow!(message.clone()));
+            }
+
+            // Overflow-then-succeed mode: the first N calls fail with a
+            // context-overflow error, then the normal script/final reply is
+            // returned so the recovery loop can succeed on retry.
+            if n < self.overflow_errors_before {
+                return Err(anyhow::anyhow!("maximum context length exceeded"));
+            }
 
             if let Some(reply) = &self.repeat_tool_call {
                 if n < self.repeat_limit {
@@ -6129,6 +6257,241 @@ mod tests {
             notice.is_some(),
             "expected a repeated-call Role::System notice; history tail: {:?}",
             agent.state.history.last().map(|m| (&m.role, &m.content))
+        );
+    }
+
+    // --- Compaction (compact_history_for_send) -----------------------------
+
+    /// Helper: a message with the given role + content (no tool calls).
+    fn tmsg(role: Role, content: &str) -> Message {
+        Message {
+            role,
+            content: content.to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Build a System + several User/Assistant turns history whose token
+    /// estimate is comfortably above a small test budget, with each turn large
+    /// enough that summarizing the middle clearly shrinks the result.
+    fn compaction_history() -> Vec<Message> {
+        let body = "x".repeat(200); // ~50 tokens + overhead per message
+        let mut history = vec![tmsg(Role::System, "system prompt")];
+        for i in 0..6 {
+            history.push(tmsg(Role::User, &format!("user turn {i}: {body}")));
+            history.push(tmsg(Role::Assistant, &format!("assistant turn {i}: {body}")));
+        }
+        history
+    }
+
+    #[tokio::test]
+    async fn compact_history_summarizes_middle_when_over_budget() {
+        let mock = Arc::new(MockLLMProvider::with_summary("CANNED SUMMARY TEXT"));
+        let agent = mock_agent(mock.clone());
+
+        let history = compaction_history();
+        let total = crate::core::context::estimate_history_tokens(&history);
+
+        // Choose a budget below the total (forces compaction) but above the
+        // head+tail so a non-empty middle exists to summarize.
+        let plan = crate::core::context::partition_for_compaction(
+            &history,
+            1, // force a full partition so we can size head+tail
+            crate::core::context::DEFAULT_PROTECT_LAST_N,
+        );
+        let head_tail_tokens = crate::core::context::estimate_history_tokens(&plan.head)
+            + crate::core::context::estimate_history_tokens(&plan.tail);
+        let budget = head_tail_tokens + 20; // above head+tail, below total
+        assert!(budget < total, "budget must be below total to trigger compaction");
+        assert!(!plan.middle.is_empty(), "test history must have a middle to summarize");
+
+        let result = agent.compact_history_for_send(&history, budget).await;
+
+        // Leading System message preserved.
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[0].content, "system prompt");
+
+        // Exactly one injected summary System message containing the canned text.
+        let summaries: Vec<&Message> = result
+            .iter()
+            .filter(|m| m.role == Role::System && m.content.contains("summarized"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "exactly one injected summary message");
+        assert!(
+            summaries[0].content.contains("CANNED SUMMARY TEXT"),
+            "summary should embed the mock's canned text: {}",
+            summaries[0].content
+        );
+
+        // Recent tail preserved verbatim (last message is the newest turn).
+        let last = result.last().unwrap();
+        assert_eq!(last.content, history.last().unwrap().content);
+
+        // Result is shorter than input (middle replaced by one message).
+        assert!(
+            result.len() < history.len(),
+            "compacted ({}) should be shorter than input ({})",
+            result.len(),
+            history.len()
+        );
+
+        // The summarizer (non-tools complete) was called; tools path was not.
+        assert_eq!(mock.complete_call_count(), 1, "summarizer called once");
+        assert_eq!(mock.call_count(), 0, "complete_with_tools not called");
+
+        // Stored history is untouched.
+        assert!(
+            agent.state.history.is_empty(),
+            "compaction must not mutate stored history"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_history_no_compaction_under_budget() {
+        let mock = Arc::new(MockLLMProvider::with_summary("UNUSED"));
+        let agent = mock_agent(mock.clone());
+
+        let history = vec![
+            tmsg(Role::System, "sys"),
+            tmsg(Role::User, "hi"),
+            tmsg(Role::Assistant, "hello"),
+        ];
+        let total = crate::core::context::estimate_history_tokens(&history);
+        let budget = total + 1_000; // well above => no compaction
+
+        let result = agent.compact_history_for_send(&history, budget).await;
+
+        // Message has no PartialEq; compare by (role, content).
+        let as_pairs = |v: &[Message]| -> Vec<(Role, String)> {
+            v.iter().map(|m| (m.role.clone(), m.content.clone())).collect()
+        };
+        assert_eq!(
+            as_pairs(&result),
+            as_pairs(&history),
+            "under-budget history returned unchanged"
+        );
+        assert!(
+            !result.iter().any(|m| m.content.contains("summarized")),
+            "no summary injected when under budget"
+        );
+        assert_eq!(mock.complete_call_count(), 0, "summarizer not called");
+    }
+
+    #[tokio::test]
+    async fn compact_history_falls_back_to_trim_on_summarizer_error() {
+        let mock = Arc::new(MockLLMProvider::with_summary_error("summarizer boom"));
+        let agent = mock_agent(mock.clone());
+
+        let history = compaction_history();
+        let plan = crate::core::context::partition_for_compaction(
+            &history,
+            1,
+            crate::core::context::DEFAULT_PROTECT_LAST_N,
+        );
+        let head_tail_tokens = crate::core::context::estimate_history_tokens(&plan.head)
+            + crate::core::context::estimate_history_tokens(&plan.tail);
+        let budget = head_tail_tokens + 20;
+
+        let result = agent.compact_history_for_send(&history, budget).await;
+
+        // On summarizer error, falls back to the lossy trim, matching it exactly.
+        let expected = crate::core::context::trim_to_budget(&history, budget);
+        let as_pairs = |v: &[Message]| -> Vec<(Role, String)> {
+            v.iter().map(|m| (m.role.clone(), m.content.clone())).collect()
+        };
+        assert_eq!(
+            as_pairs(&result),
+            as_pairs(&expected),
+            "should match trim_to_budget output"
+        );
+        assert!(
+            !result.iter().any(|m| m.content.contains("summarized")),
+            "fallback path injects no summary message"
+        );
+        assert_eq!(mock.complete_call_count(), 1, "summarizer was attempted once");
+    }
+
+    // --- Overflow recovery via think() -------------------------------------
+
+    #[tokio::test]
+    async fn think_recovers_from_context_overflow_then_succeeds() {
+        // Call 1 errors with an overflow message; call 2 returns the final reply.
+        let mock = Arc::new(MockLLMProvider::overflow_then_final(1, "recovered answer"));
+        let mut agent = mock_agent(mock.clone());
+        agent.record_message(tmsg(Role::User, "question"));
+
+        agent.think().await.expect("think should recover and succeed");
+
+        let last = agent.state.history.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "recovered answer");
+        assert_eq!(
+            mock.call_count(),
+            2,
+            "overflow recovery retried once (1 error + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    async fn think_overflow_retries_are_bounded_when_exhausted() {
+        // Every call returns an overflow error => the recovery loop must stop
+        // after MAX_OVERFLOW_RETRIES attempts rather than looping forever.
+        // `think()` surfaces an exhausted call by breaking the turn loop (it
+        // prints an error and returns Ok without recording an assistant reply),
+        // so the observable guarantee is the BOUNDED retry count.
+        let mock = Arc::new(MockLLMProvider::always_error(
+            "maximum context length exceeded",
+        ));
+        let mut agent = mock_agent(mock.clone());
+        agent.record_message(tmsg(Role::User, "question"));
+
+        agent.think().await.expect("think breaks rather than panicking");
+
+        assert!(
+            mock.call_count() <= crate::core::context::MAX_OVERFLOW_RETRIES,
+            "overflow recovery must be bounded by MAX_OVERFLOW_RETRIES (calls = {})",
+            mock.call_count()
+        );
+        assert!(
+            mock.call_count() >= 2,
+            "an overflow error should have triggered at least one retry (calls = {})",
+            mock.call_count()
+        );
+        // No successful assistant reply was recorded (the call never succeeded).
+        assert!(
+            !agent
+                .state
+                .history
+                .iter()
+                .any(|m| m.role == Role::Assistant),
+            "no assistant reply should be recorded on exhausted overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn think_non_overflow_error_is_not_retried() {
+        // A plain (non-overflow) error must NOT be retried by the recovery loop:
+        // exactly one provider call is made, then the turn loop breaks.
+        let mock = Arc::new(MockLLMProvider::always_error("boom"));
+        let mut agent = mock_agent(mock.clone());
+        agent.record_message(tmsg(Role::User, "question"));
+
+        agent.think().await.expect("think breaks rather than panicking");
+
+        assert_eq!(
+            mock.call_count(),
+            1,
+            "non-overflow error must not be retried"
+        );
+        assert!(
+            !agent
+                .state
+                .history
+                .iter()
+                .any(|m| m.role == Role::Assistant),
+            "no assistant reply should be recorded on a hard error"
         );
     }
 }
