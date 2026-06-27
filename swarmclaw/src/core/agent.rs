@@ -4961,8 +4961,8 @@ mod tests {
     use super::{
         assistant_skin, now_secs, order_results, parse_fallback_providers, prepare_turn_request,
         provider_from_model, provider_from_name, session_capability_notice, streaming_preview,
-        think_directive, truncate_for_display, usage_summary, wrap_text, Agent, SlashAction,
-        ThinkLevel, TurnMode, MAX_PARALLEL_TOOLS,
+        think_directive, truncate_for_display, usage_summary, wrap_text, Agent, ChannelInfo,
+        SlashAction, ThinkLevel, TurnMode, MAX_PARALLEL_TOOLS,
     };
     use crate::config::AgentConfig;
     use crate::core::state::{Message, Role};
@@ -5417,6 +5417,19 @@ mod tests {
         ToolCall { id: String, name: String, arguments: String },
     }
 
+    /// A single scripted STREAMING reply for [`MockLLMProvider::stream`]. Each
+    /// successive `stream()` call pops one of these, mirroring the non-streaming
+    /// `script` queue. Each variant terminates with a `ChatChunk::Done`.
+    #[derive(Clone)]
+    enum MockStreamReply {
+        /// Emit the given content as one or more `ChatChunk::Content` pieces,
+        /// then `Done` (a plain streamed text reply — ends the turn loop).
+        Content(Vec<String>),
+        /// Emit a `ToolCallStart` + a `ToolCallDelta` (arguments) + `Done`,
+        /// driving the streaming tool-execution path.
+        ToolCall { id: String, name: String, arguments: String },
+    }
+
     /// A deterministic, network-free [`LLMProvider`] for driving the turn loop.
     ///
     /// Successive `complete_with_tools` calls pop from a scripted queue. Once the
@@ -5436,6 +5449,14 @@ mod tests {
         /// When in `repeat_tool_call` mode, stop repeating after this many calls
         /// and return a final text reply instead (keeps tests bounded/fast).
         repeat_limit: usize,
+        /// Scripted STREAMING replies, popped front-to-back on each `stream()`
+        /// call. When set (non-empty constructor), `stream()` is driven by this
+        /// rather than by `complete_with_tools`.
+        stream_script: Mutex<std::collections::VecDeque<MockStreamReply>>,
+        /// When set, every `stream()` call emits this SAME tool call (ignoring
+        /// the stream script) for the first `repeat_limit` calls, then a final
+        /// streamed text reply. Exercises the streaming repeated-call guard.
+        repeat_stream_tool: Option<MockStreamReply>,
     }
 
     impl MockLLMProvider {
@@ -5450,6 +5471,8 @@ mod tests {
                 repeat_tool_call: None,
                 calls: AtomicUsize::new(0),
                 repeat_limit: 0,
+                stream_script: Mutex::new(std::collections::VecDeque::new()),
+                repeat_stream_tool: None,
             }
         }
 
@@ -5468,6 +5491,44 @@ mod tests {
                 }),
                 calls: AtomicUsize::new(0),
                 repeat_limit,
+                stream_script: Mutex::new(std::collections::VecDeque::new()),
+                repeat_stream_tool: None,
+            }
+        }
+
+        /// Build a mock driven entirely by a STREAMING script. Each successive
+        /// `stream()` call pops one [`MockStreamReply`]; when exhausted it emits
+        /// a final streamed text reply so a turn loop can never hang.
+        fn streaming(replies: Vec<MockStreamReply>) -> Self {
+            Self {
+                name: "mock".to_string(),
+                capabilities: ProviderCapabilities::openai_compatible(),
+                script: Mutex::new(std::collections::VecDeque::new()),
+                repeat_tool_call: None,
+                calls: AtomicUsize::new(0),
+                repeat_limit: 0,
+                stream_script: Mutex::new(replies.into_iter().collect()),
+                repeat_stream_tool: None,
+            }
+        }
+
+        /// Build a mock whose `stream()` emits the SAME tool call for the first
+        /// `repeat_limit` calls, then a final streamed text reply. Exercises the
+        /// streaming loop's repeated-call guard without hanging.
+        fn repeating_stream_tool(name: &str, arguments: &str, repeat_limit: usize) -> Self {
+            Self {
+                name: "mock".to_string(),
+                capabilities: ProviderCapabilities::openai_compatible(),
+                script: Mutex::new(std::collections::VecDeque::new()),
+                repeat_tool_call: None,
+                calls: AtomicUsize::new(0),
+                repeat_limit,
+                stream_script: Mutex::new(std::collections::VecDeque::new()),
+                repeat_stream_tool: Some(MockStreamReply::ToolCall {
+                    id: "mock-stream-call-1".to_string(),
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                }),
             }
         }
 
@@ -5493,6 +5554,29 @@ mod tests {
                     finish_reason: Some("tool_calls".to_string()),
                 },
             }
+        }
+
+        /// Expand one scripted streaming reply into the ordered `ChatChunk`
+        /// sequence the streaming turn loop consumes (always ending in `Done`).
+        fn stream_reply_to_chunks(reply: MockStreamReply) -> Vec<anyhow::Result<ChatChunk>> {
+            let mut chunks: Vec<anyhow::Result<ChatChunk>> = Vec::new();
+            match reply {
+                MockStreamReply::Content(pieces) => {
+                    for p in pieces {
+                        chunks.push(Ok(ChatChunk::Content(p)));
+                    }
+                }
+                MockStreamReply::ToolCall { id, name, arguments } => {
+                    chunks.push(Ok(ChatChunk::ToolCallStart {
+                        id,
+                        name,
+                        thought_signature: None,
+                    }));
+                    chunks.push(Ok(ChatChunk::ToolCallDelta { arguments }));
+                }
+            }
+            chunks.push(Ok(ChatChunk::Done));
+            chunks
         }
     }
 
@@ -5540,6 +5624,35 @@ mod tests {
             tools: &[Arc<dyn Tool>],
         ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<ChatChunk>> + Send>>>
         {
+            // Streaming repeated-tool mode: emit the SAME tool call for the
+            // first `repeat_limit` calls, then a final streamed text reply. Each
+            // call counts as one provider invocation (mirrors the non-streaming
+            // side), so `call_count` stays meaningful across both paths.
+            if let Some(reply) = &self.repeat_stream_tool {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = if n < self.repeat_limit {
+                    Self::stream_reply_to_chunks(reply.clone())
+                } else {
+                    Self::stream_reply_to_chunks(MockStreamReply::Content(vec!["done".to_string()]))
+                };
+                return Ok(Box::pin(futures::stream::iter(chunks)));
+            }
+
+            // Scripted streaming mode: pop one streaming reply per call; once the
+            // script is exhausted emit a final streamed text reply so the loop
+            // can never hang waiting for more.
+            {
+                let mut script = self.stream_script.lock().unwrap();
+                if !script.is_empty() {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    let reply = script
+                        .pop_front()
+                        .unwrap_or(MockStreamReply::Content(vec!["done".to_string()]));
+                    let chunks = Self::stream_reply_to_chunks(reply);
+                    return Ok(Box::pin(futures::stream::iter(chunks)));
+                }
+            }
+
             // Minimal real impl built on top of complete_with_tools so the mock
             // never panics if streaming is exercised: emit the content (if any)
             // then Done. Tests here drive `think()` (non-streaming), so this is
@@ -5876,6 +5989,146 @@ mod tests {
             last.content.contains("repeated tool call"),
             "expected repeated-call guard notice, got: {}",
             last.content
+        );
+    }
+
+    // --- stream_think() in GATEWAY (headless) mode -------------------------
+    //
+    // We drive `stream_think` with `Some(channel_info)` so `cli_mode` is false
+    // and the loop runs headlessly (no TTY, no crossterm EventStream). We use
+    // the "internal" platform so `queue_gateway_text` early-returns (no network
+    // / no real outbox enqueue). The robust signal we assert on is the recorded
+    // history (`agent.state.history`), per the task guidance.
+
+    fn internal_channel_info() -> ChannelInfo {
+        ChannelInfo::new("internal", "test-channel", "test-token", None)
+    }
+
+    #[tokio::test]
+    async fn stream_think_gateway_records_plain_streamed_reply() {
+        // A single streamed text reply, delivered as multiple Content pieces, is
+        // recorded as ONE assistant message with the concatenated content, and
+        // the turn ends (no tool calls).
+        let mock = Arc::new(MockLLMProvider::streaming(vec![MockStreamReply::Content(
+            vec!["Hello, ".to_string(), "stream".to_string(), "ed!".to_string()],
+        )]));
+        let mut agent = mock_agent(mock.clone());
+        agent.record_message(Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        agent
+            .stream_think(Some(internal_channel_info()), &mut String::new(), &mut 0)
+            .await
+            .expect("stream_think should succeed");
+
+        assert_eq!(mock.call_count(), 1, "exactly one streamed provider call");
+        let last = agent.state.history.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "Hello, streamed!");
+        assert!(last.tool_calls.is_none(), "plain reply has no tool calls");
+    }
+
+    #[tokio::test]
+    async fn stream_think_gateway_executes_streamed_tool_then_final_reply() {
+        // First stream() call emits a tool call; second emits a final text
+        // reply. The tool must execute (Role::Tool result recorded) and the loop
+        // must end on the final assistant message.
+        let mock = Arc::new(MockLLMProvider::streaming(vec![
+            MockStreamReply::ToolCall {
+                id: "call-1".to_string(),
+                name: "mock_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+            MockStreamReply::Content(vec!["all done".to_string()]),
+        ]));
+        let mut agent = mock_agent(mock.clone());
+        agent.add_skill(Arc::new(MockSkill {
+            tool: Arc::new(MockTool {
+                name: "mock_tool".to_string(),
+            }),
+        }));
+        agent.record_message(Message {
+            role: Role::User,
+            content: "use the tool".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        agent
+            .stream_think(Some(internal_channel_info()), &mut String::new(), &mut 0)
+            .await
+            .expect("stream_think should succeed");
+
+        // One streamed tool-call turn + one streamed final-reply turn.
+        assert_eq!(mock.call_count(), 2);
+
+        let tool_results: Vec<&Message> = agent
+            .state
+            .history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 1, "one tool execution recorded");
+        assert!(
+            tool_results[0].content.contains("mock tool result"),
+            "tool result recorded: {}",
+            tool_results[0].content
+        );
+        assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("call-1"));
+
+        let last = agent.state.history.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "all done");
+    }
+
+    #[tokio::test]
+    async fn stream_think_gateway_loop_guard_breaks_on_repeated_streamed_tool_call() {
+        // The mock streams the SAME tool call indefinitely (limit far above the
+        // repeat threshold). The streaming loop's repeated-call guard must
+        // terminate it (no hang) and record a Role::System notice.
+        let mock = Arc::new(MockLLMProvider::repeating_stream_tool("mock_tool", "{}", 100));
+        let mut agent = mock_agent(mock.clone());
+        agent.add_skill(Arc::new(MockSkill {
+            tool: Arc::new(MockTool {
+                name: "mock_tool".to_string(),
+            }),
+        }));
+        agent.record_message(Message {
+            role: Role::User,
+            content: "loop forever".to_string(),
+            timestamp: now_secs(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        // Must NOT hang: the guard trips well before the mock's limit of 100.
+        agent
+            .stream_think(Some(internal_channel_info()), &mut String::new(), &mut 0)
+            .await
+            .expect("stream_think should succeed");
+        assert!(
+            mock.call_count() <= crate::core::loop_guard::DEFAULT_MAX_REASONING_STEPS,
+            "guard should stop well before the mock's limit (calls = {})",
+            mock.call_count()
+        );
+
+        // A repeated-call guard notice (Role::System) was recorded.
+        let notice = agent
+            .state
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::System && m.content.contains("repeated tool call"));
+        assert!(
+            notice.is_some(),
+            "expected a repeated-call Role::System notice; history tail: {:?}",
+            agent.state.history.last().map(|m| (&m.role, &m.content))
         );
     }
 }
