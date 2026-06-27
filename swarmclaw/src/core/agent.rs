@@ -2351,7 +2351,14 @@ impl Agent {
             let mut spinner_idx = 0;
             let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             
-            let mut event_stream = crossterm::event::EventStream::new();
+            // Only attach to the terminal's event stream in CLI mode. In gateway
+            // mode there is no TTY, and even *constructing* crossterm's
+            // EventStream panics in a headless process (read.rs init).
+            let mut event_stream = if cli_mode {
+                Some(crossterm::event::EventStream::new())
+            } else {
+                None
+            };
             let mut lines_occupied: u16 = 0;
             let start_time = std::time::Instant::now();
             let mut ui_tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -2494,7 +2501,10 @@ impl Agent {
                             }
                         }
                     }
-                    event_opt = event_stream.next() => {
+                    // Only poll the terminal for interactive input in CLI mode.
+                    // In gateway mode there is no TTY, and polling crossterm's
+                    // EventStream panics in a headless process.
+                    event_opt = next_terminal_event(&mut event_stream) => {
                         if let Some(Ok(crossterm::event::Event::Key(key))) = event_opt {
                             if key.kind == crossterm::event::KeyEventKind::Press {
                                 match key.code {
@@ -2720,7 +2730,7 @@ impl Agent {
                     let completed = loop {
                         tokio::select! {
                             done = &mut batch_fut => break done,
-                            event_opt = event_stream.next() => {
+                            event_opt = next_terminal_event(&mut event_stream) => {
                                 if let Some(Ok(crossterm::event::Event::Key(key))) = event_opt {
                                     if key.kind == crossterm::event::KeyEventKind::Press {
                                         if key.code == crossterm::event::KeyCode::Char('c')
@@ -2838,7 +2848,7 @@ impl Agent {
                                             Err(e) => format!("Error: {}", e),
                                         };
                                     }
-                                    event_opt = event_stream.next() => {
+                                    event_opt = next_terminal_event(&mut event_stream) => {
                                         if let Some(Ok(crossterm::event::Event::Key(key))) = event_opt {
                                             if key.kind == crossterm::event::KeyEventKind::Press {
                                                 match key.code {
@@ -3582,6 +3592,23 @@ fn gateway_turn_span(
 
 fn next_turn_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Await the next terminal input event from an optional `EventStream`.
+///
+/// In CLI mode `stream` is `Some` and this resolves to the next crossterm event.
+/// In gateway mode there is no TTY (`stream` is `None`) — this returns a future
+/// that never resolves, so a `tokio::select!` branch using it is effectively
+/// disabled without ever touching crossterm (which panics when constructed or
+/// polled in a headless process). This avoids relying on `select!` precondition
+/// semantics, which still evaluate the branch expression.
+async fn next_terminal_event(
+    stream: &mut Option<crossterm::event::EventStream>,
+) -> Option<std::io::Result<crossterm::event::Event>> {
+    match stream {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 pub(crate) fn now_secs() -> u64 {
