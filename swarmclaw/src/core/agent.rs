@@ -101,6 +101,55 @@ enum TurnMode {
     NonStreaming,
 }
 
+/// Reasoning verbosity selected via the `/think` command. Provider-agnostic:
+/// `/think` injects a system-prompt directive (see [`think_directive`]) into the
+/// SENT history copy rather than setting any provider reasoning parameter. The
+/// default ([`ThinkLevel::Off`]) injects nothing, so behavior is unchanged.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ThinkLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+/// The concise system directive injected for a given [`ThinkLevel`], or `None`
+/// for [`ThinkLevel::Off`] (no injection -> no behavior change). Pure helper so
+/// it can be unit-tested without a provider.
+fn think_directive(level: ThinkLevel) -> Option<&'static str> {
+    match level {
+        ThinkLevel::Off => None,
+        ThinkLevel::Low => Some("Think briefly before answering."),
+        ThinkLevel::Medium => Some("Think step by step before answering."),
+        ThinkLevel::High => Some(
+            "Think carefully and thoroughly step by step, considering edge cases, before answering.",
+        ),
+    }
+}
+
+/// Build a provider-agnostic session usage summary line set: provider, model,
+/// per-role message counts, and an estimated token total for `history`. Pure
+/// helper so it can be unit-tested without a provider.
+fn usage_summary(history: &[Message], provider: &str, model: &str) -> String {
+    let mut system = 0usize;
+    let mut user = 0usize;
+    let mut assistant = 0usize;
+    let mut tool = 0usize;
+    for msg in history {
+        match msg.role {
+            Role::System => system += 1,
+            Role::User => user += 1,
+            Role::Assistant => assistant += 1,
+            Role::Tool => tool += 1,
+        }
+    }
+    let est_tokens = crate::core::context::estimate_history_tokens(history);
+    format!(
+        "Session Usage\n  Provider: {provider}\n  Model: {model}\n  Turns (user messages): {user}\n  Messages: {total} (system {system}, user {user}, assistant {assistant}, tool {tool})\n  Estimated tokens: {est_tokens}",
+        total = history.len(),
+    )
+}
+
 struct TurnPreparation {
     history: Vec<Message>,
     tools: Vec<Arc<dyn crate::tools::Tool>>,
@@ -156,6 +205,11 @@ pub struct Agent {
     pub memory_api_key: Option<String>,
     pub use_orchestrator: bool,
     pub use_multithread: bool,
+    /// Reasoning verbosity (set via `/think`). Default `Off` injects nothing.
+    pub think_level: ThinkLevel,
+    /// When true (set via `/trace`), the turn loops emit extra diagnostic
+    /// lines. Default `false` = no diagnostics, behavior unchanged.
+    pub trace: bool,
 }
 
 impl Agent {
@@ -184,6 +238,11 @@ impl Agent {
             // behavior (sequential) until parallelism is validated on a real
             // terminal. See `MAX_PARALLEL_TOOLS` and `order_results`.
             use_multithread: false,
+            // Reasoning/introspection controls (PR-6), strictly opt-in:
+            // `/think` default Off injects no directive; `/trace` default off
+            // emits no diagnostics. Both keep today's behavior byte-for-byte.
+            think_level: ThinkLevel::Off,
+            trace: false,
         }
     }
 
@@ -424,6 +483,24 @@ impl Agent {
         }
 
         compacted
+    }
+
+    /// Inject the active `/think` directive (if any) into a SENT history copy.
+    ///
+    /// When `think_directive(self.think_level)` is `Some`, append it as an extra
+    /// `System` message to the (already compacted/prepared) `history` that is
+    /// about to be sent to the provider. The stored `self.state.history` is
+    /// never mutated. Default `ThinkLevel::Off` is a no-op (no behavior change).
+    fn inject_think_directive(&self, history: &mut Vec<Message>) {
+        if let Some(directive) = think_directive(self.think_level) {
+            history.push(Message {
+                role: Role::System,
+                content: directive.to_string(),
+                timestamp: now_secs(),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
     }
 
     fn persist_state_best_effort(&self) {
@@ -745,6 +822,9 @@ impl Agent {
                     write_cli_line(&mut stdout, format!("  {} - {}", "/help, /helpp".truecolor(200, 150, 255), "Show this help menu"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/key <API_KEY>".truecolor(200, 150, 255), "Update your API key for the current provider"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "/provider <NAME>".truecolor(200, 150, 255), "Switch AI provider (openai, anthropic, gemini, etc.)"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/think <off|low|medium|high>".truecolor(200, 150, 255), "Set reasoning verbosity (system-prompt directive)"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/trace [on|off]".truecolor(200, 150, 255), "Toggle per-turn diagnostic lines"))?;
+                    write_cli_line(&mut stdout, format!("  {} - {}", "/usage".truecolor(200, 150, 255), "Show session usage summary"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "exit, quit".truecolor(200, 150, 255), "Exit SwarmClaw"))?;
                     write_cli_line(&mut stdout, format!("  {} - {}", "ctrl+c".truecolor(200, 150, 255), "Cancel the current tool execution or LLM response"))?;
                     write_cli_line(&mut stdout, "")?;
@@ -821,6 +901,47 @@ impl Agent {
                     }
                     let state = if self.use_multithread { "ON" } else { "OFF" };
                     write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Multithreaded Execution is now {}", state).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/think") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    let arg = if parts.len() == 2 { parts[1].trim().to_lowercase() } else { String::new() };
+                    match arg.as_str() {
+                        "off" => { self.think_level = ThinkLevel::Off; }
+                        "low" => { self.think_level = ThinkLevel::Low; }
+                        "medium" | "med" => { self.think_level = ThinkLevel::Medium; }
+                        "high" => { self.think_level = ThinkLevel::High; }
+                        _ => {
+                            write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_AMBER_RGB), "Usage: /think <off|low|medium|high>".truecolor(CLI_AMBER_RGB.0, CLI_AMBER_RGB.1, CLI_AMBER_RGB.2)))?;
+                            write_cli_line(&mut stdout, format!("{} {}", cli_chip("INFO", CLI_DEEP_RGB, CLI_CYAN_RGB), format!("Current reasoning level: {:?}", self.think_level).truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
+                            continue;
+                        }
+                    }
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Reasoning level set to {:?}", self.think_level).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/trace") {
+                    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let val = parts[1].trim().to_lowercase();
+                        self.trace = val == "on" || val == "true" || val == "1";
+                    } else {
+                        self.trace = !self.trace;
+                    }
+                    let state = if self.trace { "ON" } else { "OFF" };
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("SYSTEM", CLI_DEEP_RGB, CLI_GREEN_RGB), format!("Trace diagnostics are now {}", state).truecolor(CLI_GREEN_RGB.0, CLI_GREEN_RGB.1, CLI_GREEN_RGB.2)))?;
+                    continue;
+                }
+
+                if input.starts_with("/usage") {
+                    let summary = usage_summary(
+                        &self.state.history,
+                        self.llm.provider_name(),
+                        self.config.model.as_deref().unwrap_or("auto"),
+                    );
+                    write_cli_line(&mut stdout, format!("{} {}", cli_chip("USAGE", CLI_DEEP_RGB, CLI_CYAN_RGB), summary.truecolor(CLI_CYAN_RGB.0, CLI_CYAN_RGB.1, CLI_CYAN_RGB.2)))?;
                     continue;
                 }
 
@@ -1146,6 +1267,27 @@ impl Agent {
                 state.sync_transcript(&self.state.history);
             }
 
+            // `/think` injection: append the active reasoning directive to the
+            // SENT copy only (stored history untouched). Off = no-op.
+            let mut history_to_send = history_to_send;
+            self.inject_think_directive(&mut history_to_send);
+
+            // `/trace` diagnostics: model/provider at turn start.
+            if self.trace {
+                self.record_message(Message {
+                    role: Role::System,
+                    content: format!(
+                        "[trace] step {step} | provider {} | model {}",
+                        self.llm.provider_name(),
+                        self.config.model.as_deref().unwrap_or("auto"),
+                    ),
+                    timestamp: now_secs(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                state.sync_transcript(&self.state.history);
+            }
+
             // Context-overflow recovery: if establishing the stream fails
             // because the prompt is too large, recompact the (already prepared)
             // history at a progressively shrunken budget and retry, up to
@@ -1328,6 +1470,26 @@ impl Agent {
                 state.sync_transcript(&self.state.history);
                 terminal.draw(|frame| crate::tui::draw(frame, state))?;
                 break;
+            }
+
+            // `/trace` diagnostics: each tool call's name + arg byte-size,
+            // before execution. Cheap and fully gated behind `self.trace`.
+            if self.trace {
+                for tc in &tool_calls {
+                    self.record_message(Message {
+                        role: Role::System,
+                        content: format!(
+                            "[trace] tool call '{}' ({} arg bytes)",
+                            tc.name,
+                            tc.arguments.len()
+                        ),
+                        timestamp: now_secs(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                state.sync_transcript(&self.state.history);
+                terminal.draw(|frame| crate::tui::draw(frame, state))?;
             }
 
             // Execute the tool calls, record the results in original order, then
@@ -1727,6 +1889,32 @@ impl Agent {
                 }
             }
 
+            // `/think` injection: append the active reasoning directive to the
+            // SENT copy only (stored history untouched). Off = no-op.
+            let mut history_to_send = history_to_send;
+            self.inject_think_directive(&mut history_to_send);
+
+            // `/trace` diagnostics: model/provider at turn start.
+            if self.trace {
+                let line = format!(
+                    "[trace] step {step} | provider {} | model {}",
+                    self.llm.provider_name(),
+                    self.config.model.as_deref().unwrap_or("auto"),
+                );
+                if cli_mode {
+                    write_cli_line(
+                        &mut stdout,
+                        format!(
+                            "{} {}",
+                            cli_chip("TRACE", CLI_DEEP_RGB, CLI_AMBER_RGB),
+                            line.truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2),
+                        ),
+                    )?;
+                } else if let Some(channel_info) = &channel_info {
+                    queue_gateway_text(channel_info, &line);
+                }
+            }
+
             // Context-overflow recovery: if establishing the stream fails
             // because the prompt is too large, recompact the (already prepared)
             // history at a progressively shrunken budget and retry, up to
@@ -2050,6 +2238,33 @@ impl Agent {
             }
 
             if !tool_calls.is_empty() {
+                // `/trace` diagnostics: each tool call's name + arg byte-size,
+                // before execution. Cheap and fully gated behind `self.trace`.
+                if self.trace {
+                    for tc in &tool_calls {
+                        let line = format!(
+                            "[trace] tool call '{}' ({} arg bytes)",
+                            tc.name,
+                            tc.arguments.len()
+                        );
+                        if cli_mode {
+                            write_cli_line(
+                                &mut stdout,
+                                format!(
+                                    "{} {}",
+                                    cli_chip("TRACE", CLI_DEEP_RGB, CLI_AMBER_RGB),
+                                    line.truecolor(
+                                        CLI_MUTED_RGB.0,
+                                        CLI_MUTED_RGB.1,
+                                        CLI_MUTED_RGB.2
+                                    ),
+                                ),
+                            )?;
+                        } else if let Some(channel_info) = &channel_info {
+                            queue_gateway_text(channel_info, &line);
+                        }
+                    }
+                }
                 if self.use_multithread && tool_calls.len() > 1 {
                     // --- Parallel path -----------------------------------------
                     // Run the independent tool calls concurrently (capped at
@@ -2445,6 +2660,29 @@ impl Agent {
                 apply_cli_palette(&mut stdout)?;
             }
 
+            // `/think` injection: append the active reasoning directive to the
+            // SENT copy only (stored history untouched). Off = no-op.
+            let mut history_to_send = history_to_send;
+            self.inject_think_directive(&mut history_to_send);
+
+            // `/trace` diagnostics: model/provider at turn start.
+            if self.trace {
+                write_cli_line(
+                    &mut stdout,
+                    format!(
+                        "{} {}",
+                        cli_chip("TRACE", CLI_DEEP_RGB, CLI_AMBER_RGB),
+                        format!(
+                            "[trace] provider {} | model {}",
+                            self.llm.provider_name(),
+                            self.config.model.as_deref().unwrap_or("auto"),
+                        )
+                        .truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2),
+                    ),
+                )?;
+                apply_cli_palette(&mut stdout)?;
+            }
+
             // Context-overflow recovery: if the provider rejects the request
             // because the prompt is too large, recompact the (already prepared)
             // history at a progressively shrunken budget and retry, up to
@@ -2538,6 +2776,20 @@ impl Agent {
                         }
 
                         for tc in tool_calls {
+                            // `/trace`: tool name + arg byte-size before exec.
+                            if self.trace {
+                                write_cli_line(&mut stdout, format!(
+                                    "{} {}",
+                                    cli_chip("TRACE", CLI_DEEP_RGB, CLI_AMBER_RGB),
+                                    format!(
+                                        "[trace] tool call '{}' ({} arg bytes)",
+                                        tc.name,
+                                        tc.arguments.len()
+                                    )
+                                    .truecolor(CLI_MUTED_RGB.0, CLI_MUTED_RGB.1, CLI_MUTED_RGB.2),
+                                ))?;
+                                apply_cli_palette(&mut stdout)?;
+                            }
                             write_cli_line(&mut stdout, format!(
                                 "{} {} {}",
                                 cli_chip("TOOL", CLI_FG_RGB, CLI_BORDER_RGB),
@@ -3775,6 +4027,48 @@ impl Agent {
             return SlashAction::Message(format!("Multithreaded Execution is now {state}"));
         }
 
+        if input.starts_with("/think") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let arg = if parts.len() == 2 {
+                parts[1].trim().to_lowercase()
+            } else {
+                String::new()
+            };
+            match arg.as_str() {
+                "off" => self.think_level = ThinkLevel::Off,
+                "low" => self.think_level = ThinkLevel::Low,
+                "medium" | "med" => self.think_level = ThinkLevel::Medium,
+                "high" => self.think_level = ThinkLevel::High,
+                _ => {
+                    return SlashAction::Message(format!(
+                        "Usage: /think <off|low|medium|high>\nCurrent reasoning level: {:?}",
+                        self.think_level
+                    ));
+                }
+            }
+            return SlashAction::Message(format!("Reasoning level set to {:?}", self.think_level));
+        }
+
+        if input.starts_with("/trace") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let val = parts[1].trim().to_lowercase();
+                self.trace = val == "on" || val == "true" || val == "1";
+            } else {
+                self.trace = !self.trace;
+            }
+            let state = if self.trace { "ON" } else { "OFF" };
+            return SlashAction::Message(format!("Trace diagnostics are now {state}"));
+        }
+
+        if input.starts_with("/usage") {
+            return SlashAction::Message(usage_summary(
+                &self.state.history,
+                self.llm.provider_name(),
+                self.config.model.as_deref().unwrap_or("auto"),
+            ));
+        }
+
         SlashAction::NotHandled
     }
 }
@@ -3783,8 +4077,8 @@ impl Agent {
 mod tests {
     use super::{
         assistant_skin, now_secs, order_results, prepare_turn_request, provider_from_model,
-        provider_from_name, session_capability_notice, streaming_preview, truncate_for_display,
-        wrap_text, TurnMode, MAX_PARALLEL_TOOLS,
+        provider_from_name, session_capability_notice, streaming_preview, think_directive,
+        truncate_for_display, usage_summary, wrap_text, ThinkLevel, TurnMode, MAX_PARALLEL_TOOLS,
     };
     use crate::core::state::{Message, Role};
     use crate::llm::ProviderCapabilities;
@@ -3979,6 +4273,68 @@ mod tests {
         assert_eq!(inline_bg, code_bg, "inline code shares the elevated code bg");
         assert_ne!(inline_fg, body_fg, "inline code fg should differ from body fg");
         assert_ne!(inline_fg, code_fg, "inline code fg should differ from block fg");
+    }
+
+    #[test]
+    fn think_directive_off_is_none_and_levels_nonempty() {
+        assert!(think_directive(ThinkLevel::Off).is_none());
+        for level in [ThinkLevel::Low, ThinkLevel::Medium, ThinkLevel::High] {
+            let d = think_directive(level).expect("level should have a directive");
+            assert!(!d.is_empty(), "{level:?} directive should be non-empty");
+        }
+        assert_ne!(
+            think_directive(ThinkLevel::High),
+            think_directive(ThinkLevel::Low),
+            "High and Low directives should differ"
+        );
+    }
+
+    #[test]
+    fn usage_summary_reports_counts_and_tokens() {
+        let history = vec![
+            Message {
+                role: Role::System,
+                content: "system prompt".to_string(),
+                timestamp: now_secs(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "hello there".to_string(),
+                timestamp: now_secs(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: "hi back".to_string(),
+                timestamp: now_secs(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let out = usage_summary(&history, "anthropic", "claude-x");
+        assert!(out.contains("anthropic"), "should name the provider: {out}");
+        assert!(out.contains("claude-x"), "should name the model: {out}");
+        assert!(out.contains("Messages: 3"), "should count messages: {out}");
+        assert!(out.contains("user 1"), "should count by role: {out}");
+        let expected_tokens =
+            crate::core::context::estimate_history_tokens(&history);
+        assert!(
+            out.contains(&expected_tokens.to_string()),
+            "should include estimated tokens ({expected_tokens}): {out}"
+        );
+    }
+
+    #[test]
+    fn usage_summary_handles_empty_history() {
+        let out = usage_summary(&[], "openai", "gpt-4o");
+        assert!(out.contains("openai"));
+        assert!(out.contains("gpt-4o"));
+        assert!(out.contains("Messages: 0"));
+        // Estimated tokens for an empty history is well-defined (0).
+        assert!(out.contains("Estimated tokens: 0"), "{out}");
     }
 
     #[derive(Clone)]
