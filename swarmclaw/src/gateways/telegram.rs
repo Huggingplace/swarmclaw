@@ -367,7 +367,7 @@ fn best_telegram_photo(photos: &[TelegramPhotoSize]) -> Option<&TelegramPhotoSiz
 mod tests {
     use super::*;
     use crate::gateways::test_support::{test_agent_template, wait_for_outbox_message};
-    use crate::outbox::{reset_local_db_for_tests, test_db_lock};
+    use crate::outbox::{list_outbox_messages, reset_local_db_for_tests, test_db_lock};
     use anyhow::Result;
     use axum::body::Body;
     use axum::http::Request;
@@ -406,6 +406,73 @@ mod tests {
 
         let message = wait_for_outbox_message("telegram", "42").await?;
         assert!(message.payload_preview.contains("gateway ok"));
+        Ok(())
+    }
+
+    fn telegram_update_body(update_id: i64) -> String {
+        serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "chat": { "id": 42 },
+                "text": "hello from telegram"
+            }
+        })
+        .to_string()
+    }
+
+    async fn telegram_pending_count() -> Result<usize> {
+        Ok(list_outbox_messages(Some("pending"), 50)?
+            .into_iter()
+            .filter(|message| message.platform == "telegram" && message.channel_id == "42")
+            .count())
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_secret_token_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let response = TelegramWebhookGateway::router(
+            "telegram-token".to_string(),
+            Some("telegram-secret".to_string()),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/telegram/telegram-token")
+                .header("content-type", "application/json")
+                .header("x-telegram-bot-api-secret-token", "wrong-secret")
+                .body(Body::from(telegram_update_body(201)))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(telegram_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_secret_token_header() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        let response = TelegramWebhookGateway::router(
+            "telegram-token".to_string(),
+            Some("telegram-secret".to_string()),
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/telegram/telegram-token")
+                .header("content-type", "application/json")
+                .body(Body::from(telegram_update_body(202)))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(telegram_pending_count().await?, 0);
         Ok(())
     }
 }
