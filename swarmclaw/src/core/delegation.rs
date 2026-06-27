@@ -14,23 +14,27 @@
 //! receive the delegate tool and therefore cannot delegate further.
 //!
 //! The [`SubAgentExecutor`] trait is the seam where execution backends are
-//! swapped. Today only [`InProcessExecutor`] (in-process, same binary) exists;
-//! a future Fleet-backed executor (K8s/Nomad/Docker, e.g. via the
-//! `crate::fleet` provider) can implement the same trait and be dropped in at
-//! the wiring sites without touching the tool or the turn loops.
+//! swapped. [`InProcessExecutor`] (in-process, same binary) is the DEFAULT;
+//! [`FleetExecutor`] is a Fleet-backed backend (distributed jobs via the
+//! `crate::fleet` provider) that implements the same trait. The Fleet backend
+//! is strictly OPT-IN: it is only selected when an `Agent` has a
+//! `fleet_provider` configured AND `SWARMCLAW_DELEGATE_BACKEND == "fleet"`, so
+//! the default path is unchanged.
 
 use crate::config::AgentConfig;
 use crate::core::agent::Agent;
 use crate::core::state::{Message, Role};
+use crate::fleet::{FleetJobRequest, FleetProvider};
 use crate::llm::LLMProvider;
 use crate::skills::Skill;
 use crate::tools::Tool;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Maximum number of subtasks executed concurrently within a single
@@ -137,6 +141,207 @@ impl SubAgentExecutor for InProcessExecutor {
             .unwrap_or_else(|| "[no output]".to_string());
 
         Ok(summary)
+    }
+}
+
+/// Maximum number of `get_job_status` polls a [`FleetExecutor`] performs
+/// before giving up on a single subtask. Bounds the round-trip so a stuck or
+/// never-terminating Fleet job can NEVER hang the delegating turn.
+pub const FLEET_POLL_MAX_ATTEMPTS: usize = 60;
+
+/// Default delay between `get_job_status` polls. Kept as a field on
+/// [`FleetExecutor`] (defaulting to this) so tests can drive it to zero and
+/// avoid real sleeps.
+pub const FLEET_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Default container image used when none is configured. Purely a placeholder
+/// for the seam; real deployments configure this explicitly.
+pub const FLEET_DEFAULT_IMAGE: &str = "swarmclaw/subagent:latest";
+
+/// Case-insensitive check for whether a Fleet job status is TERMINAL (the job
+/// has stopped and will not change again). Terminal states are `"completed"`,
+/// `"succeeded"` (success) and `"failed"` (failure). Everything else
+/// (`"running"`, `"pending"`, `""`, ...) is non-terminal.
+///
+/// Pure helper, unit-tested independently of any provider.
+pub fn is_terminal_status(s: &str) -> bool {
+    let s = s.trim().to_ascii_lowercase();
+    matches!(s.as_str(), "completed" | "succeeded" | "failed")
+}
+
+/// Whether a TERMINAL status represents a FAILURE (as opposed to success).
+fn is_failed_status(s: &str) -> bool {
+    s.trim().eq_ignore_ascii_case("failed")
+}
+
+/// Fleet-backed [`SubAgentExecutor`]: each subtask is dispatched as a
+/// distributed Fleet job via an [`Arc<dyn FleetProvider>`] (the leapfrog from
+/// in-process to distributed execution).
+///
+/// This is strictly OPT-IN and never the default. It is only constructed in
+/// `agent.rs` when an `Agent` has a `fleet_provider` configured AND the
+/// `SWARMCLAW_DELEGATE_BACKEND` env var selects `"fleet"`; otherwise delegation
+/// continues to use [`InProcessExecutor`].
+///
+/// Round-trip (see [`FleetProvider`] for the contract): build a one-shot
+/// [`FleetJobRequest`] from the goal/context, `spawn_agents`, then poll
+/// `get_job_status` (bounded by [`FLEET_POLL_MAX_ATTEMPTS`]) until terminal,
+/// and on success `get_job_result`. Because the reference Mothership provider
+/// does not return results yet (inherits the `Ok(None)` default), a real
+/// round-trip currently surfaces a clear "provider does not return results yet"
+/// error — the seam is ready for future infra that does.
+pub struct FleetExecutor {
+    provider: Arc<dyn FleetProvider>,
+    /// Container image for spawned sub-agent jobs.
+    image: String,
+    /// Optional command template. When `Some`, occurrences of `{goal}` and
+    /// `{context}` are substituted; when `None`, a default command is used and
+    /// the goal/context are passed via `env_vars`.
+    command_template: Option<String>,
+    /// Delay between status polls. Defaults to [`FLEET_POLL_INTERVAL`]; tests
+    /// set it to `Duration::ZERO` to avoid real sleeps.
+    poll_interval: Duration,
+    /// Max number of status polls before timing out. Defaults to
+    /// [`FLEET_POLL_MAX_ATTEMPTS`].
+    max_attempts: usize,
+}
+
+impl FleetExecutor {
+    /// Build a Fleet executor from a provider, using default image, command and
+    /// poll bounds.
+    pub fn new(provider: Arc<dyn FleetProvider>) -> Self {
+        Self {
+            provider,
+            image: FLEET_DEFAULT_IMAGE.to_string(),
+            command_template: None,
+            poll_interval: FLEET_POLL_INTERVAL,
+            max_attempts: FLEET_POLL_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Override the container image.
+    pub fn with_image(mut self, image: impl Into<String>) -> Self {
+        self.image = image.into();
+        self
+    }
+
+    /// Override the command template (`{goal}` / `{context}` are substituted).
+    pub fn with_command_template(mut self, template: impl Into<String>) -> Self {
+        self.command_template = Some(template.into());
+        self
+    }
+
+    /// Override the poll interval (used by tests to disable real sleeps).
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// Override the max number of status polls.
+    pub fn with_max_attempts(mut self, attempts: usize) -> Self {
+        self.max_attempts = attempts;
+        self
+    }
+
+    /// Build a one-shot [`FleetJobRequest`] for a subtask. Pure helper (no I/O)
+    /// so request construction is unit-testable.
+    ///
+    /// The `job_id` is supplied by the caller (derived from a UUID at call
+    /// time) so this stays deterministic given its inputs. The goal and context
+    /// are always encoded into `env_vars` (`SWARMCLAW_SUBTASK_GOAL` /
+    /// `SWARMCLAW_SUBTASK_CONTEXT`); when a `command_template` is set, `{goal}`
+    /// and `{context}` are additionally substituted into the command.
+    pub fn build_request(&self, job_id: &str, goal: &str, context: &str) -> FleetJobRequest {
+        let command = match &self.command_template {
+            Some(t) => t.replace("{goal}", goal).replace("{context}", context),
+            None => "run-subtask".to_string(),
+        };
+
+        let mut env_vars: HashMap<String, String> = HashMap::new();
+        env_vars.insert("SWARMCLAW_SUBTASK_GOAL".to_string(), goal.to_string());
+        env_vars.insert(
+            "SWARMCLAW_SUBTASK_CONTEXT".to_string(),
+            context.to_string(),
+        );
+
+        FleetJobRequest {
+            job_id: job_id.to_string(),
+            image: self.image.clone(),
+            command,
+            env_vars,
+            min_vcpu: 1.0,
+            min_memory_gb: 1.0,
+            count: 1,
+        }
+    }
+}
+
+#[async_trait]
+impl SubAgentExecutor for FleetExecutor {
+    async fn run_subtask(&self, goal: &str, context: &str) -> Result<String> {
+        let job_id = format!("subtask-{}", Uuid::new_v4());
+        let request = self.build_request(&job_id, goal, context);
+
+        // Phase 1: spawn.
+        self.provider
+            .spawn_agents(request)
+            .await
+            .map_err(|e| anyhow!("fleet spawn failed for job {job_id}: {e}"))?;
+
+        // Phase 2: poll status until terminal (bounded — never hang).
+        let mut last_status = String::new();
+        let mut terminal = false;
+        for attempt in 0..self.max_attempts {
+            let status = self
+                .provider
+                .get_job_status(&job_id)
+                .await
+                .map_err(|e| anyhow!("fleet status poll failed for job {job_id}: {e}"))?;
+            last_status = status.status.clone();
+
+            if is_terminal_status(&last_status) {
+                terminal = true;
+                break;
+            }
+
+            // Sleep between polls (zero in tests). Skip the final sleep since
+            // we're about to exit the loop.
+            if attempt + 1 < self.max_attempts && !self.poll_interval.is_zero() {
+                tokio::time::sleep(self.poll_interval).await;
+            }
+        }
+
+        if !terminal {
+            return Err(anyhow!(
+                "fleet job {job_id} did not reach a terminal status within \
+                 {} polls (last status: {:?})",
+                self.max_attempts,
+                last_status
+            ));
+        }
+
+        if is_failed_status(&last_status) {
+            return Err(anyhow!(
+                "fleet job {job_id} reported a failed status ({last_status})"
+            ));
+        }
+
+        // Phase 3: fetch result on success.
+        let result = self
+            .provider
+            .get_job_result(&job_id)
+            .await
+            .map_err(|e| anyhow!("fleet result fetch failed for job {job_id}: {e}"))?;
+
+        match result {
+            Some(summary) => Ok(summary),
+            None => Err(anyhow!(
+                "fleet job {job_id} completed but provider '{}' does not return \
+                 results yet (get_job_result -> None); result-return is future \
+                 infra work",
+                self.provider.name()
+            )),
+        }
     }
 }
 
@@ -445,5 +650,166 @@ mod tests {
         assert_eq!(results[0]["summary"], "done: first");
         assert_eq!(results[1]["goal"], "second");
         assert_eq!(results[2]["goal"], "third");
+    }
+
+    // Regression: the delegate tool still works against an in-process-style
+    // executor (here the canned EchoExecutor) — no behavior change from the
+    // Fleet seam.
+    #[tokio::test]
+    async fn delegate_tool_regression_with_inprocess_style_executor() {
+        let tool = DelegateTaskTool::new(Arc::new(EchoExecutor));
+        let out = tool
+            .execute(json!({ "tasks": [{ "goal": "only" }] }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["summary"], "done: only");
+    }
+
+    // ---- Fleet executor tests (mock provider, no real infra, no real sleeps) ----
+
+    use crate::fleet::{FleetError, FleetJobStatus};
+
+    /// Configurable mock Fleet provider. `status` is returned by every
+    /// `get_job_status` call (so it's terminal on the FIRST poll -> tests never
+    /// sleep meaningfully), and `result` is returned by `get_job_result`.
+    struct MockFleetProvider {
+        status: String,
+        result: Option<String>,
+    }
+
+    #[async_trait]
+    impl FleetProvider for MockFleetProvider {
+        fn name(&self) -> &str {
+            "MockFleet"
+        }
+        async fn spawn_agents(&self, _request: FleetJobRequest) -> Result<(), FleetError> {
+            Ok(())
+        }
+        async fn terminate_job(&self, _job_id: &str) -> Result<(), FleetError> {
+            Ok(())
+        }
+        async fn get_job_status(&self, job_id: &str) -> Result<FleetJobStatus, FleetError> {
+            Ok(FleetJobStatus {
+                job_id: job_id.to_string(),
+                status: self.status.clone(),
+                active_nodes: 1,
+            })
+        }
+        async fn get_job_result(&self, _job_id: &str) -> Result<Option<String>, FleetError> {
+            Ok(self.result.clone())
+        }
+    }
+
+    fn fleet_executor(provider: Arc<dyn FleetProvider>) -> FleetExecutor {
+        // Zero poll interval so the bounded poll loop never actually sleeps.
+        FleetExecutor::new(provider).with_poll_interval(Duration::ZERO)
+    }
+
+    #[test]
+    fn is_terminal_status_classifies_states() {
+        for ok in ["completed", "COMPLETED", "Completed", "succeeded", "FAILED", "failed"] {
+            assert!(is_terminal_status(ok), "{ok} should be terminal");
+        }
+        for non in ["running", "PENDING", "pending", "", "   ", "queued"] {
+            assert!(!is_terminal_status(non), "{non:?} should NOT be terminal");
+        }
+    }
+
+    #[test]
+    fn build_request_encodes_goal_and_context() {
+        let exec = FleetExecutor::new(Arc::new(MockFleetProvider {
+            status: "completed".into(),
+            result: None,
+        }))
+        .with_command_template("do {goal} :: {context}");
+        let req = exec.build_request("job-1", "the goal", "the ctx");
+        assert_eq!(req.job_id, "job-1");
+        assert_eq!(req.count, 1);
+        assert_eq!(req.command, "do the goal :: the ctx");
+        assert_eq!(
+            req.env_vars.get("SWARMCLAW_SUBTASK_GOAL").map(|s| s.as_str()),
+            Some("the goal")
+        );
+        assert_eq!(
+            req.env_vars
+                .get("SWARMCLAW_SUBTASK_CONTEXT")
+                .map(|s| s.as_str()),
+            Some("the ctx")
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_run_subtask_returns_summary_on_completed_with_result() {
+        let exec = fleet_executor(Arc::new(MockFleetProvider {
+            status: "completed".into(),
+            result: Some("the summary".into()),
+        }));
+        let out = exec.run_subtask("goal", "ctx").await.unwrap();
+        assert_eq!(out, "the summary");
+    }
+
+    #[tokio::test]
+    async fn fleet_run_subtask_errors_when_provider_returns_no_result() {
+        // Completed, but provider returns None (the Mothership default style).
+        let exec = fleet_executor(Arc::new(MockFleetProvider {
+            status: "completed".into(),
+            result: None,
+        }));
+        let err = exec.run_subtask("goal", "ctx").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not return results yet"),
+            "expected a clear no-result error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_run_subtask_errors_on_failed_status() {
+        let exec = fleet_executor(Arc::new(MockFleetProvider {
+            status: "failed".into(),
+            result: Some("ignored".into()),
+        }));
+        let err = exec.run_subtask("goal", "ctx").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed status"),
+            "expected a descriptive failure error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_run_subtask_times_out_when_never_terminal() {
+        // Never-terminal status + tiny bound -> bounded timeout, never hangs.
+        let exec = FleetExecutor::new(Arc::new(MockFleetProvider {
+            status: "running".into(),
+            result: None,
+        }))
+        .with_poll_interval(Duration::ZERO)
+        .with_max_attempts(3);
+        let err = exec.run_subtask("goal", "ctx").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not reach a terminal status"),
+            "expected a timeout error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mothership_inherits_none_default_so_executor_reports_no_result() {
+        // The reference Mothership provider returns status "running" forever and
+        // inherits get_job_result -> None. With a tiny bound it times out (it
+        // never completes), which still proves the default contract: no panic,
+        // no empty success.
+        use crate::fleet::MothershipFleetProvider;
+        let exec = FleetExecutor::new(Arc::new(MothershipFleetProvider::new(
+            "http://localhost".into(),
+        )))
+        .with_poll_interval(Duration::ZERO)
+        .with_max_attempts(2);
+        let err = exec.run_subtask("goal", "ctx").await.unwrap_err();
+        assert!(err.to_string().contains("did not reach a terminal status"));
     }
 }
