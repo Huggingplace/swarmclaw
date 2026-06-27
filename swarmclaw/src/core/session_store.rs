@@ -2,7 +2,7 @@ use crate::core::state::{Message, Role, State};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
@@ -302,7 +302,166 @@ fn init_store(conn: &Connection, store_path: &Path) -> Result<()> {
     )
     .with_context(|| format!("unable to initialize {}", store_path.display()))?;
 
+    // Cross-session retrieval (PR-8): an FTS5 full-text index over message
+    // content. This is BEST-EFFORT: if the bundled SQLite was compiled without
+    // the FTS5 module the CREATE will fail, but the core store must keep
+    // working. We only log a warning and continue. `search_messages` returns an
+    // empty result when the table is absent, and `index_message_fts` is a
+    // no-op on error, so the rest of the application is unaffected.
+    if let Err(error) = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+             session_id UNINDEXED,
+             role UNINDEXED,
+             content,
+             ts UNINDEXED
+         );",
+    ) {
+        warn!(
+            store_path = %store_path.display(),
+            "FTS5 unavailable; cross-session retrieval disabled: {error}"
+        );
+    }
+
     Ok(())
+}
+
+/// Whether the FTS5 `messages_fts` table exists in this connection's database.
+/// Used so `search_messages` can short-circuit (and tests can detect whether
+/// FTS5 was actually available in the bundled SQLite).
+fn fts_table_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts' LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Insert one message into the FTS5 index. BEST-EFFORT: any error (e.g. FTS5
+/// unavailable) is logged and swallowed so that message persistence is never
+/// broken by retrieval indexing.
+fn index_message_fts(conn: &Connection, session_id: &str, message: &Message) {
+    // Only index human-readable conversational text. Skip empty bodies.
+    if message.content.trim().is_empty() {
+        return;
+    }
+    let result = conn.execute(
+        "INSERT INTO messages_fts (session_id, role, content, ts)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            session_id,
+            role_as_str(&message.role),
+            message.content.as_str(),
+            message.timestamp as i64,
+        ],
+    );
+    if let Err(error) = result {
+        warn!(
+            session_id = %session_id,
+            "Failed to index message into FTS5 (continuing): {error}"
+        );
+    }
+}
+
+/// Build a SAFE FTS5 `MATCH` query string from arbitrary user input.
+///
+/// FTS5's MATCH syntax has its own operators (`AND`, `OR`, `NOT`, `*`, `:`,
+/// `"..."`, `(`, `)`, etc.), so passing raw user text straight in can cause a
+/// syntax error or behave surprisingly. The robust approach used here is to
+/// tokenize the input into alphanumeric words, drop everything else, quote each
+/// word, and join them with `OR`. This means any arbitrary string is reduced to
+/// a harmless disjunction of literal terms — no injection, no syntax errors.
+///
+/// Returns an empty string when there are no usable terms (callers treat an
+/// empty query as "no search").
+pub fn build_fts_query(raw: &str) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+
+    terms
+        .into_iter()
+        // Drop single-character noise tokens to reduce useless matches.
+        .filter(|term| term.chars().count() >= 2)
+        // Quote each term so it is treated as a literal string token by FTS5.
+        .map(|term| format!("\"{term}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Search past session messages by relevance using the FTS5 index.
+///
+/// - `query` is arbitrary user text; it is sanitized via [`build_fts_query`].
+/// - `limit` caps the number of returned hits (most relevant first, by `rank`).
+/// - `exclude_session`, when set, filters out matches from that session id
+///   (so a session does not retrieve its own current messages).
+///
+/// Returns an empty vec for an empty/too-short query, when the store does not
+/// exist, or when FTS5 is unavailable. Returned `IndexedMessage` entries carry
+/// the matched message; `message_index` is set to 0 (the FTS row is content
+/// only and not tied back to the ordered transcript index).
+pub fn search_messages(
+    store_path: &Path,
+    query: &str,
+    limit: usize,
+    exclude_session: Option<&str>,
+) -> Result<Vec<IndexedMessage>> {
+    if !store_path.exists() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let match_query = build_fts_query(query);
+    if match_query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = open_store(store_path)?;
+    if !fts_table_exists(&conn)? {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT session_id, role, content, ts
+         FROM messages_fts
+         WHERE messages_fts MATCH ?1
+           AND (?3 IS NULL OR session_id <> ?3)
+         ORDER BY rank
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(
+        params![match_query, limit.max(1) as i64, exclude_session],
+        |row| {
+            let role_raw: String = row.get(1)?;
+            Ok(IndexedMessage {
+                message_index: 0,
+                message: Message {
+                    role: role_from_str(&role_raw).map_err(to_sql_conversion_error)?,
+                    content: row.get(2)?,
+                    timestamp: row.get::<_, i64>(3)? as u64,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            })
+        },
+    )?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        hits.push(row?);
+    }
+    Ok(hits)
 }
 
 fn load_state_from_db(conn: &Connection, session_id: &str) -> Result<Option<State>> {
@@ -352,6 +511,12 @@ fn persist_full_state(conn: &mut Connection, session_id: &str, state: &State) ->
         "DELETE FROM session_messages WHERE session_id = ?1",
         params![session_id],
     )?;
+    // Clear any prior FTS rows for this session so a full re-persist does not
+    // duplicate them. Best-effort: ignore failure / missing FTS table.
+    let _ = tx.execute(
+        "DELETE FROM messages_fts WHERE session_id = ?1",
+        params![session_id],
+    );
 
     for (index, message) in state.history.iter().enumerate() {
         insert_message_row(&tx, session_id, index, message)?;
@@ -415,6 +580,9 @@ fn insert_message_row(
         "UPDATE sessions SET updated_at = ?2 WHERE session_id = ?1",
         params![session_id, now_millis()],
     )?;
+
+    // Cross-session retrieval index (PR-8). Best-effort: never fail persistence.
+    index_message_fts(conn, session_id, message);
 
     Ok(())
 }
@@ -502,6 +670,117 @@ mod tests {
             load_session_state(&store_path, "default", &legacy_state_path)?.expect("state");
         assert_eq!(reloaded.history.len(), 2);
         assert_eq!(reloaded.history[1].content, "hello");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn build_fts_query_tokenizes_and_quotes_words() {
+        assert_eq!(build_fts_query("hello world"), "\"hello\" OR \"world\"");
+        // Punctuation / FTS operators are stripped, never passed through.
+        assert_eq!(
+            build_fts_query("  rust's  (AND) foo-bar! "),
+            "\"rust\" OR \"AND\" OR \"foo\" OR \"bar\""
+        );
+        // Single-character noise tokens are dropped.
+        assert_eq!(build_fts_query("a bб x deployment"), "\"bб\" OR \"deployment\"");
+    }
+
+    #[test]
+    fn build_fts_query_empty_for_garbage() {
+        assert_eq!(build_fts_query(""), "");
+        assert_eq!(build_fts_query("   "), "");
+        assert_eq!(build_fts_query("!!! @#$ ()"), "");
+        // All tokens single-char -> dropped -> empty.
+        assert_eq!(build_fts_query("a b c"), "");
+    }
+
+    #[test]
+    fn fts5_is_available_in_bundled_sqlite() {
+        // Documents which path PR-8 took: FTS5 vs LIKE fallback.
+        let conn = Connection::open_in_memory().expect("in-memory conn");
+        let created = conn
+            .execute_batch("CREATE VIRTUAL TABLE t USING fts5(x);")
+            .is_ok();
+        assert!(
+            created,
+            "bundled SQLite lacks FTS5; PR-8 expects FTS5 to be available"
+        );
+    }
+
+    fn msg(role: Role, content: &str, ts: u64) -> Message {
+        Message {
+            role,
+            content: content.to_string(),
+            timestamp: ts,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn search_messages_round_trips_across_sessions() -> Result<()> {
+        let root = std::env::temp_dir()
+            .join(format!("swarmclaw-fts-search-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let store_path = root.join("sessions.sqlite");
+
+        // Session A: talks about kubernetes deployment.
+        persist_message(&store_path, "sess-a", 0, &msg(Role::User, "How do I configure a kubernetes deployment manifest?", 1))?;
+        persist_message(&store_path, "sess-a", 1, &msg(Role::Assistant, "Use a Deployment YAML with replicas.", 2))?;
+        // Session B: talks about something unrelated (pancakes).
+        persist_message(&store_path, "sess-b", 0, &msg(Role::User, "What is the best pancake recipe?", 3))?;
+
+        // Search for a term only present in session A.
+        let hits = search_messages(&store_path, "kubernetes deployment", 5, None)?;
+        assert!(!hits.is_empty(), "expected at least one kubernetes hit");
+        assert!(
+            hits.iter().all(|h| h.message.content.to_lowercase().contains("deployment")
+                || h.message.content.to_lowercase().contains("kubernetes")),
+            "all hits should be relevant: {:?}",
+            hits.iter().map(|h| &h.message.content).collect::<Vec<_>>()
+        );
+
+        // limit is respected.
+        let limited = search_messages(&store_path, "kubernetes deployment", 1, None)?;
+        assert_eq!(limited.len(), 1);
+
+        // exclude_session filters out the excluded session entirely.
+        let excluded = search_messages(&store_path, "kubernetes deployment", 5, Some("sess-a"))?;
+        assert!(
+            excluded.is_empty(),
+            "excluding sess-a should drop all kubernetes hits: {:?}",
+            excluded.iter().map(|h| &h.message.content).collect::<Vec<_>>()
+        );
+
+        // A term that exists only in session B.
+        let pancakes = search_messages(&store_path, "pancake", 5, None)?;
+        assert!(pancakes.iter().any(|h| h.message.content.contains("pancake")));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn search_messages_no_match_is_empty() -> Result<()> {
+        let root = std::env::temp_dir()
+            .join(format!("swarmclaw-fts-nomatch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let store_path = root.join("sessions.sqlite");
+
+        persist_message(&store_path, "sess-a", 0, &msg(Role::User, "hello there general", 1))?;
+
+        let hits = search_messages(&store_path, "zznonexistentterm", 5, None)?;
+        assert!(hits.is_empty(), "no documents should match a nonsense term");
+
+        // Empty / garbage query -> empty.
+        assert!(search_messages(&store_path, "", 5, None)?.is_empty());
+        assert!(search_messages(&store_path, "!!!", 5, None)?.is_empty());
+
+        // Nonexistent store -> empty, no error.
+        let missing = root.join("does-not-exist.sqlite");
+        assert!(search_messages(&missing, "hello", 5, None)?.is_empty());
 
         std::fs::remove_dir_all(root)?;
         Ok(())
