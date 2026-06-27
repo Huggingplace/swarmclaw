@@ -288,6 +288,17 @@ impl Agent {
         self.persist_state_best_effort();
     }
 
+    /// Cap a (already-redacted) tool result before it is stored in history, so a
+    /// single giant result can't dominate or overflow the context window. The
+    /// displayed/rendered result is unaffected; this only bounds what is
+    /// persisted. Shared by every `Role::Tool` record site for consistency.
+    fn cap_tool_result_for_history(result: String) -> String {
+        crate::core::context::cap_tool_result(
+            &result,
+            crate::core::context::MAX_TOOL_RESULT_TOKENS,
+        )
+    }
+
     /// Compact an over-budget history for sending to the model by summarizing
     /// its middle into a single `System` message, keeping the head (system
     /// prompts) and the recent tail verbatim.
@@ -1123,7 +1134,43 @@ impl Agent {
                 state.sync_transcript(&self.state.history);
             }
 
-            let mut stream = self.llm.stream(&history_to_send, &options, &tools).await?;
+            // Context-overflow recovery: if establishing the stream fails
+            // because the prompt is too large, recompact the (already prepared)
+            // history at a progressively shrunken budget and retry, up to
+            // MAX_OVERFLOW_RETRIES attempts total. Overflow that only surfaces
+            // mid-stream (after chunks have started) is not retried here, since
+            // partial output has already been consumed; that case propagates
+            // as before. The at-stream-start case (the common one) is covered.
+            let mut stream = {
+                let base_history = history_to_send.clone();
+                let mut current_history = history_to_send;
+                let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    match self.llm.stream(&current_history, &options, &tools).await {
+                        Ok(s) => break s,
+                        Err(e) => {
+                            if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
+                                && crate::core::context::is_context_overflow_error(&e)
+                            {
+                                budget = (budget as f64 * 0.6) as usize;
+                                warn!(
+                                    agent_id = %self.id,
+                                    attempt,
+                                    new_budget = budget,
+                                    "Context overflow establishing stream; recompacting harder and retrying"
+                                );
+                                current_history = self
+                                    .compact_history_for_send(&base_history, budget)
+                                    .await;
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            };
 
             let mut full_content = String::new();
             let mut tool_calls: Vec<crate::llm::ToolCall> = Vec::new();
@@ -1344,7 +1391,7 @@ impl Agent {
                     let redacted_result = Redactor::redact(&result);
                     self.record_message(Message {
                         role: Role::Tool,
-                        content: redacted_result,
+                        content: Self::cap_tool_result_for_history(redacted_result),
                         timestamp: now_secs(),
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
@@ -1393,7 +1440,7 @@ impl Agent {
                     let redacted_result = Redactor::redact(&result);
                     self.record_message(Message {
                         role: Role::Tool,
-                        content: redacted_result,
+                        content: Self::cap_tool_result_for_history(redacted_result),
                         timestamp: now_secs(),
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
@@ -1668,7 +1715,49 @@ impl Agent {
                 }
             }
 
-            let mut stream = self.llm.stream(&history_to_send, &options, &tools).await?;
+            // Context-overflow recovery: if establishing the stream fails
+            // because the prompt is too large, recompact the (already prepared)
+            // history at a progressively shrunken budget and retry, up to
+            // MAX_OVERFLOW_RETRIES attempts total. Overflow that only surfaces
+            // mid-stream (handled by the Err(error) chunk arm below) is not
+            // retried, since partial output has already been consumed; that
+            // case propagates as before. The at-stream-start case is covered.
+            let mut stream = {
+                let base_history = history_to_send.clone();
+                let mut current_history = history_to_send;
+                let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    match self.llm.stream(&current_history, &options, &tools).await {
+                        Ok(s) => break s,
+                        Err(e) => {
+                            if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
+                                && crate::core::context::is_context_overflow_error(&e)
+                            {
+                                budget = (budget as f64 * 0.6) as usize;
+                                warn!(
+                                    agent_id = %self.id,
+                                    attempt,
+                                    new_budget = budget,
+                                    "Context overflow establishing stream; recompacting harder and retrying"
+                                );
+                                current_history = self
+                                    .compact_history_for_send(&base_history, budget)
+                                    .await;
+                                continue;
+                            }
+                            if let Some(channel_info) = &channel_info {
+                                queue_gateway_text(
+                                    channel_info,
+                                    &format!("SwarmClaw engine error: {e}"),
+                                );
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            };
 
             let mut full_content = String::new();
             let mut tool_calls = Vec::new();
@@ -2066,7 +2155,7 @@ impl Agent {
                         }
                         self.record_message(Message {
                             role: Role::Tool,
-                            content: redacted_result,
+                            content: Self::cap_tool_result_for_history(redacted_result),
                             timestamp: now_secs(),
                             tool_calls: None,
                             tool_call_id: Some(tc.id.clone()),
@@ -2195,7 +2284,7 @@ impl Agent {
 
                     self.record_message(Message {
                         role: Role::Tool,
-                        content: redacted_result,
+                        content: Self::cap_tool_result_for_history(redacted_result),
                         timestamp: now_secs(),
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
@@ -2344,11 +2433,46 @@ impl Agent {
                 apply_cli_palette(&mut stdout)?;
             }
 
-            match self
-                .llm
-                .complete_with_tools(&history_to_send, &options, &tools)
-                .await
-            {
+            // Context-overflow recovery: if the provider rejects the request
+            // because the prompt is too large, recompact the (already prepared)
+            // history at a progressively shrunken budget and retry, up to
+            // MAX_OVERFLOW_RETRIES attempts total, before surfacing the error.
+            let call_result = {
+                let base_history = history_to_send.clone();
+                let mut current_history = history_to_send;
+                let mut budget = crate::core::context::DEFAULT_CONTEXT_TOKEN_BUDGET;
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    match self
+                        .llm
+                        .complete_with_tools(&current_history, &options, &tools)
+                        .await
+                    {
+                        Ok(resp) => break Ok(resp),
+                        Err(e) => {
+                            if attempt < crate::core::context::MAX_OVERFLOW_RETRIES
+                                && crate::core::context::is_context_overflow_error(&e)
+                            {
+                                budget = (budget as f64 * 0.6) as usize;
+                                warn!(
+                                    agent_id = %self.id,
+                                    attempt,
+                                    new_budget = budget,
+                                    "Context overflow on provider call; recompacting harder and retrying"
+                                );
+                                current_history = self
+                                    .compact_history_for_send(&base_history, budget)
+                                    .await;
+                                continue;
+                            }
+                            break Err(e);
+                        }
+                    }
+                }
+            };
+
+            match call_result {
                 Ok(response) => {
                     print!("\r\x1b[K");
                     stdout.flush()?;
@@ -2447,7 +2571,7 @@ impl Agent {
 
                             self.record_message(Message {
                                 role: Role::Tool,
-                                content: redacted_result,
+                                content: Self::cap_tool_result_for_history(redacted_result),
                                 timestamp: now_secs(),
                                 tool_calls: None,
                                 tool_call_id: Some(tc.id.clone()),

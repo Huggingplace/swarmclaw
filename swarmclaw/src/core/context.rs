@@ -29,6 +29,96 @@ pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 120_000;
 /// boundary, but never shrinks below it.
 pub const DEFAULT_PROTECT_LAST_N: usize = 6;
 
+/// Maximum estimated token size of a single tool result that may be stored in
+/// history. A single giant tool result (a huge file dump, a verbose command
+/// output) can otherwise dominate or overflow the entire context window, so we
+/// cap each one at ~30% of the default budget (mirroring OpenClaw) before
+/// storing it. The rendered/displayed result is unaffected; this only bounds
+/// what is persisted into conversation history.
+pub const MAX_TOOL_RESULT_TOKENS: usize = DEFAULT_CONTEXT_TOKEN_BUDGET * 30 / 100;
+
+/// Cap a single tool-result string to roughly `max_tokens` worth of content
+/// before it is stored in history.
+///
+/// If the content already fits within `max_tokens` (per [`estimate_tokens`]'s
+/// chars-per-token ratio) it is returned unchanged. Otherwise it is truncated
+/// to approximately `max_tokens` worth of characters and a clear marker noting
+/// how many characters were omitted is appended.
+///
+/// We keep the HEAD of the result (most tool output is most useful at the
+/// start) plus a small TAIL (the end of command output / error footers are
+/// often the actionable part), with the marker in between. All slicing is done
+/// on UTF-8 char boundaries so multibyte content never causes a panic.
+pub fn cap_tool_result(content: &str, max_tokens: usize) -> String {
+    // Budget in characters, matching estimate_tokens' ratio. estimate_tokens
+    // also adds PER_MESSAGE_OVERHEAD_TOKENS, so a content of exactly
+    // max_tokens * CHARS_PER_TOKEN chars estimates slightly over budget; we
+    // compare on the raw char-budget here, which is the quantity we truncate
+    // to, keeping the helper self-consistent.
+    let char_budget = max_tokens.saturating_mul(CHARS_PER_TOKEN);
+
+    // Count chars (not bytes) so multibyte content is measured correctly.
+    let total_chars = content.chars().count();
+    if total_chars <= char_budget {
+        return content.to_string();
+    }
+
+    // Reserve ~20% of the budget for a tail, the rest for the head.
+    let tail_chars = char_budget / 5;
+    let head_chars = char_budget.saturating_sub(tail_chars);
+    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
+
+    // Collect char indices (byte offsets) so we slice on boundaries safely.
+    let mut char_indices: Vec<usize> = content.char_indices().map(|(i, _)| i).collect();
+    char_indices.push(content.len()); // sentinel = end byte offset
+
+    let head_end = char_indices[head_chars];
+    let tail_start = char_indices[total_chars - tail_chars];
+
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
+
+    let marker = format!("\n[... tool result truncated: {omitted} characters omitted to fit context ...]\n");
+
+    if tail_chars == 0 {
+        format!("{head}{marker}")
+    } else {
+        format!("{head}{marker}{tail}")
+    }
+}
+
+/// Maximum number of attempts (initial try + retries) for a single provider
+/// call when recovering from a context-overflow error by recompacting harder.
+pub const MAX_OVERFLOW_RETRIES: usize = 3;
+
+/// Heuristically detect whether a provider error indicates the prompt exceeded
+/// the model's context window (as opposed to auth, rate-limit, network, etc.).
+///
+/// Different providers phrase this differently, so we match a set of common
+/// substrings case-insensitively against the error's string form. Used to
+/// decide whether a failed provider call is worth retrying after shrinking the
+/// effective context budget.
+pub fn is_context_overflow_error(err: &anyhow::Error) -> bool {
+    let s = err.to_string().to_lowercase();
+    const SIGNALS: &[&str] = &[
+        "context length",
+        "maximum context",
+        "context window",
+        "context_length_exceeded",
+        "too many tokens",
+        "maximum_tokens",
+        "max_tokens",
+        "reduce the length",
+        "prompt is too long",
+        "prompt too long",
+        "input is too long",
+        "too large",
+        "exceeds the maximum",
+        "string too long",
+    ];
+    SIGNALS.iter().any(|sig| s.contains(sig))
+}
+
 /// Estimate the token cost of a single message (content + any tool-call JSON).
 pub fn estimate_tokens(message: &Message) -> usize {
     let mut chars = message.content.len();
@@ -386,5 +476,85 @@ mod tests {
 
         // Newest message kept.
         assert_eq!(plan.tail.last().unwrap().content, "final answer");
+    }
+
+    #[test]
+    fn cap_tool_result_under_cap_is_unchanged() {
+        let content = "small tool output";
+        let out = cap_tool_result(content, 1000);
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn cap_tool_result_over_cap_truncates_with_marker_and_bounds_length() {
+        // 10_000 chars, cap at 10 tokens => ~40 char budget. Use 'Z' as the
+        // content marker char since it never appears in the truncation notice,
+        // so counting 'Z's measures exactly the kept original content.
+        let content = "Z".repeat(10_000);
+        let max_tokens = 10usize;
+        let out = cap_tool_result(&content, max_tokens);
+
+        assert_ne!(out, content);
+        assert!(out.contains("tool result truncated"));
+        assert!(out.contains("characters omitted"));
+
+        // The kept content (head + tail, excluding the marker) is bounded by the
+        // char budget. Estimate via the same ratio used internally.
+        let char_budget = max_tokens * CHARS_PER_TOKEN;
+        let kept = out.chars().filter(|c| *c == 'Z').count();
+        assert!(
+            kept <= char_budget,
+            "kept {kept} content chars exceeds budget {char_budget}"
+        );
+        assert!(out.len() < content.len());
+    }
+
+    #[test]
+    fn cap_tool_result_is_multibyte_safe() {
+        // Each emoji/char is multibyte; truncation must never split a char.
+        let content = "héllo🌍".repeat(2_000); // well over a tiny budget
+        let out = cap_tool_result(&content, 5);
+        // Must be valid UTF-8 (guaranteed by &str) and contain the marker.
+        assert!(out.contains("tool result truncated"));
+        // Round-trip through chars to confirm no broken boundaries / panics.
+        assert!(out.chars().count() > 0);
+    }
+
+    #[test]
+    fn is_context_overflow_error_positive_matches() {
+        let cases = [
+            "This model's maximum context length is 8192 tokens",
+            "Error: context window exceeded",
+            "Please reduce the length of the messages",
+            "prompt is too long: 200000 tokens > 100000",
+            "too many tokens in request",
+            "context_length_exceeded",
+            "input is too long for requested model",
+        ];
+        for c in cases {
+            let err = anyhow::anyhow!("{c}");
+            assert!(
+                is_context_overflow_error(&err),
+                "expected overflow match for: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_context_overflow_error_negatives() {
+        let cases = [
+            "401 Unauthorized: invalid api_key",
+            "429 rate limit exceeded",
+            "connection reset by peer",
+            "the model returned an empty response",
+            "tool 'foo' not found",
+        ];
+        for c in cases {
+            let err = anyhow::anyhow!("{c}");
+            assert!(
+                !is_context_overflow_error(&err),
+                "did not expect overflow match for: {c}"
+            );
+        }
     }
 }
