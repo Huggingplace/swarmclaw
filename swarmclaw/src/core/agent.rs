@@ -1705,22 +1705,7 @@ impl Agent {
             }
 
             // Build assistant tool_calls payload (same shape as stream_think).
-            let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
-            if !tool_calls.is_empty() {
-                let mut tc_vec = Vec::new();
-                for tc in &tool_calls {
-                    tc_vec.push(serde_json::json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                            "thought_signature": tc.thought_signature,
-                        }
-                    }));
-                }
-                assistant_tool_calls = Some(tc_vec);
-            }
+            let assistant_tool_calls = build_assistant_tool_calls_payload(&tool_calls);
 
             if !full_content.is_empty() || assistant_tool_calls.is_some() {
                 let redacted_content = Redactor::redact(&full_content);
@@ -2553,22 +2538,7 @@ impl Agent {
                 }
             }
 
-            let mut assistant_tool_calls: Option<Vec<serde_json::Value>> = None;
-            if !tool_calls.is_empty() {
-                let mut tc_vec = Vec::new();
-                for tc in &tool_calls {
-                    tc_vec.push(serde_json::json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                            "thought_signature": tc.thought_signature,
-                        }
-                    }));
-                }
-                assistant_tool_calls = Some(tc_vec);
-            }
+            let assistant_tool_calls = build_assistant_tool_calls_payload(&tool_calls);
 
             if !full_content.is_empty() || assistant_tool_calls.is_some() {
                 // Final redaction for history
@@ -3682,6 +3652,35 @@ pub const MAX_PARALLEL_TOOLS: usize = 8;
 fn order_results(mut completed: Vec<(usize, String)>) -> Vec<String> {
     completed.sort_by_key(|(idx, _)| *idx);
     completed.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Build the `tool_calls` JSON payload stored on an assistant [`Message`] from a
+/// slice of accumulated [`ToolCall`]s.
+///
+/// Returns `None` when there are no tool calls (so the assistant message records
+/// `tool_calls: None`), and otherwise the OpenAI-style `function` objects. This
+/// is the exact shape previously built inline in both `stream_think` and
+/// `run_fullscreen_turn`; extracting it removes the duplication and makes the
+/// assistant-recording shape unit-testable without a terminal or `EventStream`.
+fn build_assistant_tool_calls_payload(
+    tool_calls: &[crate::llm::ToolCall],
+) -> Option<Vec<serde_json::Value>> {
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let mut tc_vec = Vec::new();
+    for tc in tool_calls {
+        tc_vec.push(serde_json::json!({
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "thought_signature": tc.thought_signature,
+            }
+        }));
+    }
+    Some(tc_vec)
 }
 
 fn seeded_state(config: &AgentConfig) -> State {
@@ -4959,10 +4958,11 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_skin, now_secs, order_results, parse_fallback_providers, prepare_turn_request,
-        provider_from_model, provider_from_name, session_capability_notice, streaming_preview,
-        think_directive, truncate_for_display, usage_summary, wrap_text, Agent, ChannelInfo,
-        SlashAction, ThinkLevel, TurnMode, MAX_PARALLEL_TOOLS,
+        assistant_skin, build_assistant_tool_calls_payload, now_secs, order_results,
+        parse_fallback_providers, prepare_turn_request, provider_from_model, provider_from_name,
+        session_capability_notice, streaming_preview, think_directive, truncate_for_display,
+        usage_summary, wrap_text, Agent, ChannelInfo, SlashAction, ThinkLevel, TurnMode,
+        MAX_PARALLEL_TOOLS,
     };
     use crate::config::AgentConfig;
     use crate::core::state::{Message, Role};
@@ -4997,6 +4997,57 @@ mod tests {
             (2, "c".to_string()),
         ];
         assert_eq!(order_results(completed), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn build_assistant_tool_calls_payload_empty_is_none() {
+        // No accumulated tool calls => the assistant message records `None`,
+        // matching the pre-extraction inline behavior.
+        assert!(build_assistant_tool_calls_payload(&[]).is_none());
+    }
+
+    #[test]
+    fn build_assistant_tool_calls_payload_builds_openai_function_shape() {
+        // A single tool call must serialize to the exact OpenAI-style `function`
+        // object shape the fullscreen/stream turn loops record on history.
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "do_thing".to_string(),
+            arguments: "{\"x\":1}".to_string(),
+            thought_signature: Some("sig-1".to_string()),
+        }];
+        let payload = build_assistant_tool_calls_payload(&calls).expect("Some payload");
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0]["id"], "call-1");
+        assert_eq!(payload[0]["type"], "function");
+        assert_eq!(payload[0]["function"]["name"], "do_thing");
+        assert_eq!(payload[0]["function"]["arguments"], "{\"x\":1}");
+        assert_eq!(payload[0]["function"]["thought_signature"], "sig-1");
+    }
+
+    #[test]
+    fn build_assistant_tool_calls_payload_preserves_order_and_null_signature() {
+        // Multiple calls keep their order; a missing thought_signature serializes
+        // to JSON null (the inline code used `tc.thought_signature` directly).
+        let calls = vec![
+            ToolCall {
+                id: "a".to_string(),
+                name: "first".to_string(),
+                arguments: "{}".to_string(),
+                thought_signature: None,
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "second".to_string(),
+                arguments: "{}".to_string(),
+                thought_signature: None,
+            },
+        ];
+        let payload = build_assistant_tool_calls_payload(&calls).expect("Some payload");
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0]["function"]["name"], "first");
+        assert_eq!(payload[1]["function"]["name"], "second");
+        assert!(payload[0]["function"]["thought_signature"].is_null());
     }
 
     #[test]

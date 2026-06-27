@@ -937,6 +937,28 @@ mod tests {
     }
 
     #[test]
+    fn transcript_renders_system_and_tool_chips() {
+        // The two role chips not covered by `transcript_shows_labels_and_text`.
+        let history = vec![
+            msg(Role::System, "system notice"),
+            msg(Role::Tool, "tool output"),
+        ];
+        let state = TuiState::from_history(&history);
+        let rows = render_rows(80, 24, &state);
+
+        assert!(buffer_contains(&rows, "SYSTEM"), "SYSTEM chip missing");
+        assert!(buffer_contains(&rows, "TOOL"), "TOOL chip missing");
+        assert!(
+            buffer_contains(&rows, "system notice"),
+            "system message text missing"
+        );
+        assert!(
+            buffer_contains(&rows, "tool output"),
+            "tool message text missing"
+        );
+    }
+
+    #[test]
     fn input_box_renders_title_and_text() {
         let mut state = TuiState::default();
         state.input = "draft reply".to_string();
@@ -1080,6 +1102,66 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_printable_char_inserts_and_advances_cursor() {
+        let mut s = TuiState::default();
+        let action = handle_key(&mut s, KeyCode::Char('x'), KeyModifiers::NONE, false);
+        assert_eq!(action, LoopAction::Continue);
+        assert_eq!(s.input, "x");
+        assert_eq!(s.cursor, 1);
+        // A second printable char advances again.
+        handle_key(&mut s, KeyCode::Char('y'), KeyModifiers::NONE, false);
+        assert_eq!(s.input, "xy");
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn handle_key_backspace_deletes_before_cursor() {
+        let mut s = TuiState::default();
+        for c in "abc".chars() {
+            s.insert_char(c);
+        }
+        let action = handle_key(&mut s, KeyCode::Backspace, KeyModifiers::NONE, false);
+        assert_eq!(action, LoopAction::Continue);
+        assert_eq!(s.input, "ab");
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn handle_key_left_and_right_move_cursor() {
+        let mut s = TuiState::default();
+        for c in "ab".chars() {
+            s.insert_char(c);
+        }
+        assert_eq!(s.cursor, 2);
+        let left = handle_key(&mut s, KeyCode::Left, KeyModifiers::NONE, false);
+        assert_eq!(left, LoopAction::Continue);
+        assert_eq!(s.cursor, 1);
+        let right = handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE, false);
+        assert_eq!(right, LoopAction::Continue);
+        assert_eq!(s.cursor, 2);
+        // Right at end is a clamped no-op (still Continue).
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE, false);
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn handle_key_pageup_pagedown_adjust_scroll() {
+        let mut s = TuiState::default();
+        // Tall content so there is room to scroll.
+        s.transcript = vec![MessageView {
+            role: Role::Assistant,
+            content: "z".repeat(4000),
+        }];
+        let down = handle_key(&mut s, KeyCode::PageDown, KeyModifiers::NONE, false);
+        assert_eq!(down, LoopAction::Continue);
+        assert!(s.scroll > 0, "PageDown should increase scroll from 0");
+        let before_up = s.scroll;
+        let up = handle_key(&mut s, KeyCode::PageUp, KeyModifiers::NONE, false);
+        assert_eq!(up, LoopAction::Continue);
+        assert!(s.scroll <= before_up, "PageUp should not increase scroll");
+    }
+
+    #[test]
     fn handle_key_esc_clears_input() {
         let mut s = TuiState::default();
         for c in "draft".chars() {
@@ -1088,6 +1170,39 @@ mod tests {
         let action = handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE, false);
         assert_eq!(action, LoopAction::Continue);
         assert_eq!(s.input, "");
+    }
+
+    #[test]
+    fn scroll_edges_empty_transcript_stay_at_zero() {
+        // Empty transcript => no content rows => every scroll attempt clamps to 0.
+        let s = TuiState::default();
+        assert_eq!(estimate_content_rows(&s), 0);
+        let up = handle_mouse_scroll(&s, MouseEventKind::ScrollUp, 10);
+        assert_eq!(up, 0, "scroll up on empty transcript stays at 0");
+        let down = handle_mouse_scroll(&s, MouseEventKind::ScrollDown, 10);
+        assert_eq!(down, 0, "scroll down on empty transcript stays at 0");
+    }
+
+    #[test]
+    fn scroll_clamps_at_top_and_bottom() {
+        let mut s = TuiState::default();
+        s.transcript = vec![MessageView {
+            role: Role::User,
+            content: "c".repeat(800),
+        }];
+        let content = estimate_content_rows(&s);
+        let viewport = 4u16;
+        let max = content.saturating_sub(viewport);
+        // At the top: scrolling up cannot go below 0.
+        s.scroll = 0;
+        assert_eq!(handle_mouse_scroll(&s, MouseEventKind::ScrollUp, viewport), 0);
+        // At the bottom: scrolling down cannot exceed max.
+        s.scroll = max;
+        assert_eq!(
+            handle_mouse_scroll(&s, MouseEventKind::ScrollDown, viewport),
+            max,
+            "scroll down at bottom must clamp to max"
+        );
     }
 
     #[test]
