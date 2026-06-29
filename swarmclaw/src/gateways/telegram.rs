@@ -17,7 +17,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{error, info, info_span, Instrument};
+use tracing::{error, info, info_span, warn, Instrument};
 
 #[derive(Deserialize, Debug)]
 pub struct TelegramUpdate {
@@ -106,6 +106,14 @@ impl TelegramWebhookGateway {
         let token = std::env::var("TELEGRAM_TOKEN").context("TELEGRAM_TOKEN not set")?;
         let secret_token = std::env::var("TELEGRAM_WEBHOOK_SECRET").ok();
 
+        if secret_token.is_none() {
+            warn!(
+                "TELEGRAM_WEBHOOK_SECRET is not set; the Telegram webhook will REJECT all inbound \
+                 updates (fail closed). Set TELEGRAM_WEBHOOK_SECRET to the secret token configured \
+                 with Telegram's setWebhook so incoming updates can be authenticated and accepted."
+            );
+        }
+
         let addr = format!("0.0.0.0:{}", self.port);
         info!("Starting Telegram webhook server on {}", addr);
 
@@ -149,15 +157,24 @@ async fn handle_update(
         chat_id = %chat_id_for_span
     );
 
-    if let Some(expected_secret) = state.secret_token.as_deref() {
-        let header_secret = headers
-            .get("x-telegram-bot-api-secret-token")
-            .and_then(|value| value.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+    // Fail closed: a request is processed ONLY when a configured secret matches the header.
+    // If no secret is configured, reject every inbound update rather than processing it.
+    let Some(expected_secret) = state.secret_token.as_deref() else {
+        let _guard = request_span.enter();
+        warn!(
+            "Rejecting Telegram update: TELEGRAM_WEBHOOK_SECRET is not configured, so inbound \
+             updates cannot be authenticated. Set TELEGRAM_WEBHOOK_SECRET to accept updates."
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    };
 
-        if header_secret != expected_secret {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+    let header_secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if header_secret != expected_secret {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     let is_new_event = mark_webhook_event_once("telegram", &update.update_id.to_string())
@@ -468,6 +485,33 @@ mod tests {
                 .uri("/telegram/telegram-token")
                 .header("content-type", "application/json")
                 .body(Body::from(telegram_update_body(202)))?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(telegram_pending_count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_when_no_secret_configured() -> Result<()> {
+        let _lock = test_db_lock();
+        reset_local_db_for_tests()?;
+
+        // Fail-closed regression guard: with no secret configured, a well-formed update
+        // (even carrying a secret header) must be rejected and never enqueued.
+        let response = TelegramWebhookGateway::router(
+            "telegram-token".to_string(),
+            None,
+            test_agent_template(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/telegram/telegram-token")
+                .header("content-type", "application/json")
+                .header("x-telegram-bot-api-secret-token", "telegram-secret")
+                .body(Body::from(telegram_update_body(203)))?,
         )
         .await?;
 
