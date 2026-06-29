@@ -223,16 +223,47 @@ pub struct DesktopSkill {
 
 impl DesktopSkill {
     pub fn new() -> Self {
-        let enigo = Arc::new(Mutex::new(Enigo::new(&Settings::default()).unwrap()));
-        
-        Self {
-            tools: vec![
-                Arc::new(DesktopScreenshotTool),
-                Arc::new(DesktopClickTool { enigo: enigo.clone() }),
-                Arc::new(DesktopTypeTool { enigo: enigo.clone() }),
-                Arc::new(DesktopHotkeyTool { enigo }),
-            ],
+        // Screenshots need no input device. The mouse/keyboard tools require an
+        // Enigo connection, which fails on headless hosts (e.g. no DISPLAY).
+        // Degrade gracefully — register what's available — instead of
+        // `.unwrap()`-panicking, which previously crashed the whole agent at
+        // startup in any non-display environment.
+        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(DesktopScreenshotTool)];
+
+        match Enigo::new(&Settings::default()) {
+            Ok(e) => {
+                let enigo = Arc::new(Mutex::new(e));
+                tools.push(Arc::new(DesktopClickTool { enigo: enigo.clone() }));
+                tools.push(Arc::new(DesktopTypeTool { enigo: enigo.clone() }));
+                tools.push(Arc::new(DesktopHotkeyTool { enigo }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Desktop input control unavailable (no display?); mouse/keyboard tools disabled, screenshot still available"
+                );
+            }
         }
+
+        Self { tools }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_does_not_panic_without_input_device() {
+        // Regression: DesktopSkill::new() used to `Enigo::new().unwrap()`, which
+        // panics with no DISPLAY and crashed the agent on launch in headless
+        // environments. It must now construct without panicking and always
+        // expose at least the screenshot tool.
+        let skill = DesktopSkill::new();
+        assert!(
+            !skill.tools().is_empty(),
+            "screenshot tool should always be registered"
+        );
     }
 }
 
