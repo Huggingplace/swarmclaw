@@ -837,18 +837,22 @@ use crate::core::agent::now_secs;
 // Feature gate
 // ---------------------------------------------------------------------------
 
-/// Whether the opt-in fullscreen TUI is enabled.
+/// Whether the fullscreen ratatui TUI is enabled.
 ///
-/// Gated on the `SWARMCLAW_FULLSCREEN_TUI` environment variable (`"1"` or
-/// `"true"`, case-insensitive). This is a stub for later live-loop wiring; it is
-/// intentionally **not** called from the interactive loop in this PR.
+/// The fullscreen TUI is now the DEFAULT for interactive sessions. It can be
+/// disabled (falling back to the classic line-based CLI) by setting
+/// `SWARMCLAW_FULLSCREEN_TUI` to a falsey value (`"0"`, `"false"`, `"off"`,
+/// `"no"`, case-insensitive). Any other value — or leaving it unset — keeps
+/// fullscreen on.
 pub fn supported() -> bool {
     match std::env::var("SWARMCLAW_FULLSCREEN_TUI") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true"
+            // Opt-out: only explicit falsey values disable fullscreen.
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        // Unset => default ON.
+        Err(_) => true,
     }
 }
 
@@ -1388,17 +1392,20 @@ mod tests {
         let key = "SWARMCLAW_FULLSCREEN_TUI";
         let original = std::env::var(key).ok();
 
+        // Fullscreen is the DEFAULT: on unless explicitly opted out.
         std::env::set_var(key, "1");
         assert!(supported(), "expected supported() == true for \"1\"");
 
         std::env::set_var(key, "true");
         assert!(supported(), "expected supported() == true for \"true\"");
 
-        std::env::set_var(key, "0");
-        assert!(!supported(), "expected supported() == false for \"0\"");
-
         std::env::remove_var(key);
-        assert!(!supported(), "expected supported() == false when unset");
+        assert!(supported(), "expected supported() == true by default when unset");
+
+        for off in ["0", "false", "off", "no", "OFF", " False "] {
+            std::env::set_var(key, off);
+            assert!(!supported(), "expected supported() == false for opt-out {off:?}");
+        }
 
         // Restore.
         match original {
